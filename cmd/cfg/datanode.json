@@ -1,0 +1,22 @@
+{
+  "role": "datanode",
+  "port": "6000",
+  "prof": "6001",
+  "logDir": "/export/Logs/datanode",
+  "logLevel": "info",
+  "raftHeartbeat": "9095",
+  "raftReplica": "9096",
+  "warnLogDir":"/export/home/tomcat/UMP-Monitor/logs/",
+  "consulAddr": "http://consul.prometheus-cfs.local",
+  "exporterPort": 9512,
+  "masterAddr": [
+    "192.168.31.173:80",
+    "192.168.31.141:80",
+    "192.168.30.200:80"
+  ],
+  "zone": "",
+  "disks": [
+    "/data0:21474836480",
+    "/data1:21474836480"
+  ]
+}
