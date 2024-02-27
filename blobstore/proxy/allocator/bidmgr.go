@@ -120,6 +120,18 @@ func (b *bidMgr) allocBid(ctx context.Context) (err error) {
 	return
 }
 
+/*
+Alloc `count` Bid
+- nếu count >= (b.current.max - b.current.minId) -> b.current vẫn đủ ID để cấp:
+  - return [b.current.minBid, b.current.minBid + count - 1]
+
+- nếu b.current ko đủ để cấp:
+  - cấp phần còn lại b.current vào return
+  - b.current = b.backup
+  - cấp tiếp từ b.current
+
+??? TODO: Nếu b.backup + b.current ko đủ để cấp
+*/
 func (b *bidMgr) Alloc(ctx context.Context, count uint64) (bidRange []BidRange, err error) {
 	span := trace.SpanFromContextSafe(ctx)
 	bidRange = make([]BidRange, 0)

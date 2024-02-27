@@ -17,11 +17,12 @@ package blobstore
 import (
 	"context"
 	"fmt"
-	"github.com/cubefs/cubefs/sdk/data/manager"
-	"github.com/cubefs/cubefs/util/buf"
 	"sync"
 	"sync/atomic"
 	"syscall"
+
+	"github.com/cubefs/cubefs/sdk/data/manager"
+	"github.com/cubefs/cubefs/util/buf"
 
 	"github.com/cubefs/cubefs/util/stat"
 
@@ -96,6 +97,10 @@ func (writer *Writer) String() string {
 		&writer, writer.volName, writer.volType, writer.ino, writer.blockSize, writer.fileSize, writer.enableBcache, writer.cacheAction, writer.fileCache, writer.cacheThreshold, writer.wConcurrency)
 }
 
+/*
+- if FlagsSyncWrite: doParallelWrite
+- else: doBufferWrite
+*/
 func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags int) (size int, err error) {
 	//atomic.StoreInt32(&writer.idle, 0)
 	if writer == nil {
@@ -110,7 +115,7 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 	}
 	//write buffer
 	log.LogDebugf("TRACE blobStore Write: ino(%v) offset(%v) len(%v) flags&proto.FlagsSyncWrite(%v)", writer.ino, offset, len(data), flags&proto.FlagsSyncWrite)
-	if flags&proto.FlagsSyncWrite == 0 {
+	if flags&proto.FlagsSyncWrite == 0 { // flag proto.FlagsSyncWrite is off
 		size, err = writer.doBufferWrite(ctx, data, offset)
 		return
 	}
@@ -119,10 +124,13 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 	return
 }
 
+/*
+ */
 func (writer *Writer) doParallelWrite(ctx context.Context, data []byte, offset int) (size int, err error) {
 	log.LogDebugf("TRACE blobStore doDirectWrite: ino(%v) offset(%v) len(%v)", writer.ino, offset, len(data))
 	writer.Lock()
 	defer writer.Unlock()
+	// preprare
 	wSlices := writer.prepareWriteSlice(offset, data)
 	log.LogDebugf("TRACE blobStore prepareWriteSlice: wSlices(%v)", wSlices)
 	sliceSize := len(wSlices)
@@ -131,6 +139,7 @@ func (writer *Writer) doParallelWrite(ctx context.Context, data []byte, offset i
 	writer.err = make(chan error, sliceSize)
 	pool := New(writer.wConcurrency, sliceSize)
 	defer pool.Close()
+	// writeSlice parallelly
 	for _, wSlice := range wSlices {
 		pool.Execute(wSlice, func(param *rwSlice) {
 			writer.writeSlice(ctx, param, true)
@@ -173,6 +182,10 @@ func (writer *Writer) cacheLevel2(wSlice *rwSlice) {
 	}
 }
 
+/*
+- copy input data vào writer.buf
+- writer.flush
+*/
 func (writer *Writer) doBufferWrite(ctx context.Context, data []byte, offset int) (size int, err error) {
 	log.LogDebugf("TRACE blobStore doBufferWrite Enter: ino(%v) offset(%v) len(%v)", writer.ino, offset, len(data))
 
@@ -228,6 +241,9 @@ func (writer *Writer) shouldCacheCfs() bool {
 	return writer.cacheAction == proto.RWCache
 }
 
+/*
+tạo []*rwSlice gồm các data write slice với size= = writer.blockSize
+*/
 func (writer *Writer) prepareWriteSlice(offset int, data []byte) []*rwSlice {
 	size := len(data)
 	wSlices := make([]*rwSlice, 0)
@@ -257,6 +273,10 @@ func (writer *Writer) prepareWriteSlice(offset int, data []byte) []*rwSlice {
 	return wSlices
 }
 
+/*
+write 1 wSlice:
+  - gọi hàm BlobStoreClient.Write()
+*/
 func (writer *Writer) writeSlice(ctx context.Context, wSlice *rwSlice, wg bool) (err error) {
 	if wg {
 		defer writer.wg.Done()
@@ -316,6 +336,8 @@ func (writer *Writer) resetBuffer() {
 	writer.blockPosition = 0
 }
 
+/*
+ */
 func (writer *Writer) flush(inode uint64, ctx context.Context, flushFlag bool) (err error) {
 	bgTime := stat.BeginStat()
 	defer func() {

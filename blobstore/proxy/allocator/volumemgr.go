@@ -189,6 +189,10 @@ func (v *volumeMgr) initModeInfo(ctx context.Context) (err error) {
 	return
 }
 
+/*
+-	call BidMgr.Alloc()
+- allocVid()
+*/
 func (v *volumeMgr) Alloc(ctx context.Context, args *proxy.AllocVolsArgs) (allocRets []proxy.AllocRet, err error) {
 	allocBidScopes, err := v.BidMgr.Alloc(ctx, args.BidCount)
 	if err != nil {
@@ -230,6 +234,12 @@ func (v *volumeMgr) List(ctx context.Context, codeMode codemode.CodeMode) (vids 
 	return
 }
 
+/*
+choose next available VolumeID:
+  - v.preIdx++
+  - curIdx = preIdx % vols
+  - duyệt 1 vòng các vols bắt đầu từ curIdx: nếu modifySpace(vols[i]) = true -> vols[i] vẫn còn available: return vols[i].Vid
+*/
 func (v *volumeMgr) getNextVid(ctx context.Context, vols []*volume, modeInfo *ModeInfo, args *proxy.AllocVolsArgs) (proto.Vid, error) {
 	curIdx := int(atomic.AddUint64(&v.preIdx, uint64(1)) % uint64(len(vols)))
 	l := len(vols) + curIdx
@@ -242,6 +252,20 @@ func (v *volumeMgr) getNextVid(ctx context.Context, vols []*volume, modeInfo *Mo
 	return 0, errcode.ErrNoAvailableVolume
 }
 
+/*
+kiểm tra 1 volume có available hay ko; nếu có: modifySpace cho volume
+-	false nếu:
+  - thuộc args.Excludes
+  - bị gắn tag deleted
+  - không đủ dung lượng để cấp mới
+
+- modifySpace:
+  - tăng Used giảm Free
+  - Nếu Free < v.VolumeReserveSize -> volume bị full:
+    -- gắn cờ volume bị deleted
+    -- modeInfo.totalFree -= volInfo.Free
+    -- xóa volume: modeInfo.volumes.Delete(volID)
+*/
 func (v *volumeMgr) modifySpace(ctx context.Context, volInfo *volume, modeInfo *ModeInfo, args *proxy.AllocVolsArgs) bool {
 	span := trace.SpanFromContextSafe(ctx)
 	for _, id := range args.Excludes {
@@ -273,6 +297,10 @@ func (v *volumeMgr) modifySpace(ctx context.Context, volInfo *volume, modeInfo *
 	return true
 }
 
+/*
+cấp VolumeID
+  - call getNextVid()
+*/
 func (v *volumeMgr) allocVid(ctx context.Context, args *proxy.AllocVolsArgs) (proto.Vid, error) {
 	span := trace.SpanFromContextSafe(ctx)
 	modeInfo := v.modeInfos[args.CodeMode]

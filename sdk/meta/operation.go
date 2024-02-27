@@ -30,6 +30,7 @@ import (
 // API implementations
 //
 
+// gui request to Meta Partition de tao inode; op = proto.OpMetaCreateInode
 func (mw *MetaWrapper) icreate(mp *MetaPartition, mode, uid, gid uint32, target []byte) (status int, info *proto.InodeInfo, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {

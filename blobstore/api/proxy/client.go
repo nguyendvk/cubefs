@@ -37,8 +37,11 @@ func New(cfg *Config) Client {
 	return &client{rpc.NewClient(&cfg.Config)}
 }
 
+// gửi request đến proxy (địa chỉ `host`)
+
 func (c *client) VolumeAlloc(ctx context.Context, host string, args *AllocVolsArgs) (ret []AllocRet, err error) {
 	ret = make([]AllocRet, 0)
+	// api handler của server tại: blobstore/proxy/allocator.go: func (s *Service) Alloc(c *rpc.Context)
 	err = c.PostWith(ctx, host+"/volume/alloc", &ret, args)
 	return
 }

@@ -68,6 +68,8 @@ var (
 )
 
 // NewFile returns a new file.
+// - Nếu volume là Cold: có khởi tạo fReader và fWriter
+// - Nếu volume là Hot: không khởi tạo fReader và fWriter
 func NewFile(s *Super, i *proto.InodeInfo, flag uint32, pino uint64) fs.Node {
 	if proto.IsCold(s.volType) {
 		var (
@@ -111,7 +113,7 @@ func NewFile(s *Super, i *proto.InodeInfo, flag uint32, pino uint64) fs.Node {
 	return &File{super: s, info: i, parentIno: pino}
 }
 
-//get file parentPath
+// get file parentPath
 func (f *File) getParentPath() string {
 	filepath := ""
 	if f.parentIno == f.super.rootIno {
@@ -362,7 +364,14 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 	return nil
 }
 
-// Write handles the write request.
+/*
+Write handles the write request.
+  - if isHot():
+    super.extentClient.Truncate()
+    super.extentClient.Write()
+  - if isCold():
+    fWriter.Write()
+*/
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) (err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
@@ -419,7 +428,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	if proto.IsHot(f.super.volType) {
 		f.super.ec.GetStreamer(ino).SetParentInode(f.parentIno)
 		size, err = f.super.ec.Write(ino, int(req.Offset), req.Data, flags)
-	} else {
+	} else { // if proto.IsCold(f.super.volType)
 		atomic.StoreInt32(&f.idle, 0)
 		size, err = f.fWriter.Write(ctx, int(req.Offset), req.Data, flags)
 	}

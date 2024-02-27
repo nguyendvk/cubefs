@@ -77,6 +77,7 @@ func isColdVolExtentDelErr(p *repl.Packet) bool {
 	return false
 }
 
+// DataNode PacketHandler
 func (s *DataNode) OperatePacket(p *repl.Packet, c net.Conn) (err error) {
 	var (
 		tpLabels map[string]string
@@ -470,6 +471,7 @@ func (s *DataNode) handleBatchMarkDeletePacket(p *repl.Packet, c net.Conn) {
 }
 
 // Handle OpWrite packet.
+// - call ExtentStore.Write
 func (s *DataNode) handleWritePacket(p *repl.Packet) {
 	var (
 		err error

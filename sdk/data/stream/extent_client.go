@@ -18,11 +18,12 @@ import (
 	"container/list"
 	"context"
 	"fmt"
-	"github.com/cubefs/cubefs/sdk/data/manager"
-	"golang.org/x/time/rate"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/cubefs/cubefs/sdk/data/manager"
+	"golang.org/x/time/rate"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/wrapper"
@@ -294,6 +295,7 @@ func (client *ExtentClient) SetClientID(id uint64) (err error) {
 }
 
 // Open request shall grab the lock until request is sent to the request channel
+// Add new streamer to client.streamers
 func (client *ExtentClient) OpenStream(inode uint64) error {
 	client.streamerLock.Lock()
 	s, ok := client.streamers[inode]

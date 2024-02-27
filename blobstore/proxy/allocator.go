@@ -22,6 +22,7 @@ import (
 )
 
 // Alloc vids and bids from allocator
+// - call VolumeMgr.Alloc()
 func (s *Service) Alloc(c *rpc.Context) {
 	args := new(proxy.AllocVolsArgs)
 	if err := c.ParseArgs(args); err != nil {

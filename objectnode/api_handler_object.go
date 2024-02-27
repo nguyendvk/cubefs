@@ -1114,6 +1114,7 @@ func (o *ObjectNode) getBucketV2Handler(w http.ResponseWriter, r *http.Request) 
 
 // Put object
 // API reference: https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html
+// S3 API put object handler
 func (o *ObjectNode) putObjectHandler(w http.ResponseWriter, r *http.Request) {
 
 	var err error
@@ -1199,6 +1200,7 @@ func (o *ObjectNode) putObjectHandler(w http.ResponseWriter, r *http.Request) {
 		CacheControl: cacheControl,
 		Expires:      expires,
 	}
+	// do Put Object
 	fsFileInfo, err = vol.PutObject(param.Object(), r.Body, opt)
 	if err == syscall.EINVAL {
 		errorCode = ObjectModeConflict

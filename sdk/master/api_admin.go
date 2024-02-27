@@ -17,9 +17,10 @@ package master
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/cubefs/cubefs/util/log"
 	"net/http"
 	"strconv"
+
+	"github.com/cubefs/cubefs/util/log"
 
 	"github.com/cubefs/cubefs/proto"
 )
@@ -114,6 +115,7 @@ func (api *AdminAPI) Topo() (topo *proto.TopologyView, err error) {
 	return
 }
 
+// http request to get dp information
 func (api *AdminAPI) GetDataPartition(volName string, partitionID uint64) (partition *proto.DataPartitionInfo, err error) {
 	var buf []byte
 	var request = newAPIRequest(http.MethodGet, proto.AdminGetDataPartition)

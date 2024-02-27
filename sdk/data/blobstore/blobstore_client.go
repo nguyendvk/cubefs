@@ -38,7 +38,7 @@ const (
 )
 
 type BlobStoreClient struct {
-	client access.API
+	client access.API //blobstore/api/access
 }
 
 func NewEbsClient(cfg access.Config) (*BlobStoreClient, error) {
@@ -115,6 +115,8 @@ func (ebs *BlobStoreClient) Read(ctx context.Context, volName string, buf []byte
 	return readN, nil
 }
 
+/*
+ */
 func (ebs *BlobStoreClient) Write(ctx context.Context, volName string, data []byte, size uint32) (location access.Location, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
@@ -132,6 +134,7 @@ func (ebs *BlobStoreClient) Write(ctx context.Context, volName string, data []by
 	}()
 
 	for i := 0; i < MaxRetryTimes; i++ {
+		// access.API.Put
 		location, _, err = ebs.client.Put(ctx, &access.PutArgs{
 			Size:   int64(size),
 			Hashes: hashAlg,

@@ -445,6 +445,7 @@ func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (f
 		return fsInfo, nil
 	}
 	var parentId uint64
+	// mkdir -p
 	if parentId, err = v.recursiveMakeDirectory(fixedPath); err != nil {
 		log.LogErrorf("PutObject: recursive make directory fail: volume(%v) path(%v) err(%v)",
 			v.name, path, err)
@@ -486,6 +487,7 @@ func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (f
 	// This file has only inode but no dentry. In this way, this temporary file can be made invisible
 	// in the true sense. In order to avoid the adverse impact of other user operations on temporary data.
 	var invisibleTempDataInode *proto.InodeInfo
+	// create temp inode
 	if invisibleTempDataInode, err = v.mw.InodeCreate_ll(DefaultFileMode, 0, 0, nil); err != nil {
 		return
 	}
@@ -500,6 +502,7 @@ func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (f
 			_ = v.mw.Evict(invisibleTempDataInode.Inode)
 		}
 	}()
+	// create new streamer and add to ec.streamers[invisibleTempDataInode.Inode]
 	if err = v.ec.OpenStream(invisibleTempDataInode.Inode); err != nil {
 		return
 	}
@@ -1034,6 +1037,7 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 	return fInfo, nil
 }
 
+// v.ec.Write lan luot tung block 262 144 (= 2 * 65536 * 2) bytes
 func (v *Volume) streamWrite(inode uint64, reader io.Reader, h hash.Hash) (size uint64, err error) {
 	var (
 		buf                   = make([]byte, 2*util.BlockSize)
@@ -1362,8 +1366,9 @@ func (v *Volume) Close() error {
 // and the actual search result is a non-directory, an ENOENT error is returned.
 //
 // ENOENT:
-// 		0x2 ENOENT No such file or directory. A component of a specified
-// 		pathname did not exist, or the pathname was an empty string.
+//
+//	0x2 ENOENT No such file or directory. A component of a specified
+//	pathname did not exist, or the pathname was an empty string.
 func (v *Volume) recursiveLookupTarget(path string) (parent uint64, ino uint64, name string, mode os.FileMode, err error) {
 	parent = rootIno
 	var pathIterator = NewPathIterator(path)

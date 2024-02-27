@@ -40,8 +40,18 @@ import (
 //  put empty shard to blobnode if file has been aligned.
 
 // Put put one object
-//     required: size, file size
-//     optional: hasher map to calculate hash.Hash
+//
+//	required: size, file size
+//	optional: hasher map to calculate hash.Hash
+//
+/*
+Access Object Put handler:
+- make hasher
+- allocFromAllocatorWithHystrix(): gửi request đến proxy để xin các blobs
+- foreach blob:
+	-- EC encode data
+	-- writeToBlobnodesWithHystrix
+*/
 func (h *Handler) Put(ctx context.Context, rc io.Reader, size int64,
 	hasherMap access.HasherMap) (*access.Location, error) {
 	span := trace.SpanFromContextSafe(ctx)
