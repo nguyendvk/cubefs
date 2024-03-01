@@ -15,9 +15,11 @@
 package rpc
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
@@ -65,23 +67,58 @@ const (
 var UserAgent = "Golang blobstore/rpc package"
 
 type (
-	// ValueGetter get value from url values or http params
+	// ValueGetter fill argument's field from url values or http params.
 	ValueGetter func(string) string
-	// Parser is the interface implemented by types
+	// Parser is the interface implemented by argument types
 	// that can parse themselves from url.Values.
 	Parser interface {
 		Parse(ValueGetter) error
 	}
+
+	// priority of marshaler and unmarshaler (default is json).
+	//  - - - - - - - - - - - - - - - - - - - - - -
+	//  |         | marshaler   | unmarshaler     |
+	//  | higher  |
+	//  |   ^     | MarshalerTo | UnmarshalerFrom |
+	//  |   |     | Marshaler   | Unmarshaler     |
+	//  |   |     | JSON Marshal| JSON Unmarshal  |
+	//  |  lower  |
+	//  - - - - - - - - - - - - - - - - - - - - - -
+
+	// Actions on RPC.
+	//  - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+	//  |     APP       |  Client     |    TCP    |  Server     |
+	//  - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+	//  | Request Type  | marshaler   | - - - - > | unmarshaler |
+	//  |                                              |        |
+	//  |                                              \/       |
+	//  | Response Type | unmarshaler | < - - - - | marshaler   |
+	//  - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
 	// Marshaler is the interface implemented by types that
 	// can marshal themselves into bytes, second parameter
 	// is content type.
 	Marshaler interface {
 		Marshal() ([]byte, string, error)
 	}
+	// MarshalerTo is the interface implemented by types that
+	// can marshal themselves into writer, the first parameter
+	// is content type. (Not Recommended).
+	// The underlying writer is a *bytes.Buffer.
+	// Context.RespondWithReader is better than MarshalerTo on Server Side.
+	MarshalerTo interface {
+		MarshalTo(responseBody io.Writer) (string, error)
+	}
 	// Unmarshaler is the interface implemented by types
 	// that can unmarshal themselves from bytes.
 	Unmarshaler interface {
 		Unmarshal([]byte) error
+	}
+	// UnmarshalerFrom is the interface implemented by types
+	// that can unmarshal themselves from body reader.
+	// The body underlying implementation is a *io.LimitedReader.
+	UnmarshalerFrom interface {
+		UnmarshalFrom(requestBody io.Reader) error
 	}
 
 	// HTTPError interface of error with http status code
@@ -100,20 +137,54 @@ type ProgressHandler interface {
 	Handler(http.ResponseWriter, *http.Request, func(http.ResponseWriter, *http.Request))
 }
 
-func marshalObj(obj interface{}) ([]byte, string, error) {
+// NoneBody no body of request of response.
+var NoneBody Marshaler = noneBody{}
+
+type noneBody struct{}
+
+func (noneBody) Marshal() ([]byte, string, error) {
+	return []byte{}, "", nil
+}
+
+type marshalledBody struct {
+	ContentLength int
+	ContentType   string
+	Body          io.Reader
+}
+
+func marshalObj(obj interface{}) (*marshalledBody, error) {
 	var (
-		body []byte
-		ct   string = MIMEJSON
-		err  error
+		buffer []byte
+		ct     string = MIMEJSON
+		err    error
 	)
 	if obj == nil {
-		body = jsonNull[:]
+		buffer = jsonNull[:]
+	} else if o, ok := obj.(MarshalerTo); ok {
+		w := bytes.NewBuffer(nil)
+		ct, err = o.MarshalTo(w)
+		if err != nil {
+			return nil, err
+		}
+		return &marshalledBody{
+			ContentLength: w.Len(),
+			ContentType:   ct,
+			Body:          w,
+		}, nil
+
 	} else if o, ok := obj.(Marshaler); ok {
-		body, ct, err = o.Marshal()
+		buffer, ct, err = o.Marshal()
 	} else {
-		body, err = json.Marshal(obj)
+		buffer, err = json.Marshal(obj)
 	}
-	return body, ct, err
+	if err != nil {
+		return nil, err
+	}
+	return &marshalledBody{
+		ContentLength: len(buffer),
+		ContentType:   ct,
+		Body:          bytes.NewReader(buffer),
+	}, nil
 }
 
 func programVersion() string {

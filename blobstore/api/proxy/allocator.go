@@ -24,6 +24,7 @@ import (
 
 type Allocator interface {
 	VolumeAlloc(ctx context.Context, host string, args *AllocVolsArgs) (ret []AllocRet, err error)
+	ListVolumes(ctx context.Context, host string, args *ListVolsArgs) (ret VolumeList, err error)
 }
 
 type ListVolsArgs struct {
@@ -46,5 +47,10 @@ type AllocVolsArgs struct {
 	CodeMode codemode.CodeMode `json:"code_mode"`
 	BidCount uint64            `json:"bid_count"`
 	Excludes []proto.Vid       `json:"excludes"`
+	Discards []proto.Vid       `json:"discards"`
+}
+
+type DiscardVolsArgs struct {
+	CodeMode codemode.CodeMode `json:"code_mode"`
 	Discards []proto.Vid       `json:"discards"`
 }

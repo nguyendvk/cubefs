@@ -16,6 +16,7 @@ package metanode
 
 import (
 	"encoding/binary"
+	"sync/atomic"
 	"time"
 
 	"github.com/cubefs/cubefs/cmd/common"
@@ -25,12 +26,20 @@ import (
 )
 
 type storeMsg struct {
-	command       uint32
-	applyIndex    uint64
-	inodeTree     *BTree
-	dentryTree    *BTree
-	extendTree    *BTree
-	multipartTree *BTree
+	command        uint32
+	applyIndex     uint64
+	txId           uint64
+	inodeTree      *BTree
+	dentryTree     *BTree
+	extendTree     *BTree
+	multipartTree  *BTree
+	txTree         *BTree
+	txRbInodeTree  *BTree
+	txRbDentryTree *BTree
+	quotaRebuild   bool
+	uidRebuild     bool
+	uniqId         uint64
+	uniqChecker    *uniqChecker
 }
 
 func (mp *metaPartition) startSchedule(curIndex uint64) {
@@ -38,13 +47,17 @@ func (mp *metaPartition) startSchedule(curIndex uint64) {
 	timer.Stop()
 	timerCursor := time.NewTimer(intervalToSyncCursor)
 	scheduleState := common.StateStopped
+	lastCursor := mp.GetCursor()
 	dumpFunc := func(msg *storeMsg) {
-		log.LogDebugf("[startSchedule] partitionId=%d: nowAppID"+
+		log.LogWarnf("[startSchedule] partitionId=%d: nowAppID"+
 			"=%d, applyID=%d", mp.config.PartitionId, curIndex,
 			msg.applyIndex)
 		if err := mp.store(msg); err == nil {
 			// truncate raft log
 			if mp.raftPartition != nil {
+				log.LogWarnf("[startSchedule] start trunc, partitionId=%d: nowAppID"+
+					"=%d, applyID=%d", mp.config.PartitionId, curIndex,
+					msg.applyIndex)
 				mp.raftPartition.Truncate(curIndex)
 			} else {
 				// maybe happen when start load dentry
@@ -64,15 +77,15 @@ func (mp *metaPartition) startSchedule(curIndex uint64) {
 		if _, ok := mp.IsLeader(); ok {
 			timer.Reset(intervalToPersistData)
 		}
-		scheduleState = common.StateStopped
+		atomic.StoreUint32(&scheduleState, common.StateStopped)
 	}
 	go func(stopC chan bool) {
 		var msgs []*storeMsg
 		readyChan := make(chan struct{}, 1)
 		for {
 			if len(msgs) > 0 {
-				if scheduleState == common.StateStopped {
-					scheduleState = common.StateRunning
+				if atomic.LoadUint32(&scheduleState) == common.StateStopped {
+					atomic.StoreUint32(&scheduleState, common.StateRunning)
 					readyChan <- struct{}{}
 				}
 			}
@@ -97,6 +110,11 @@ func (mp *metaPartition) startSchedule(curIndex uint64) {
 				}
 				if maxMsg != nil {
 					go dumpFunc(maxMsg)
+				} else {
+					if _, ok := mp.IsLeader(); ok {
+						timer.Reset(intervalToPersistData)
+					}
+					atomic.StoreUint32(&scheduleState, common.StateStopped)
 				}
 				msgs = msgs[:0]
 			case msg := <-mp.storeChan:
@@ -109,6 +127,7 @@ func (mp *metaPartition) startSchedule(curIndex uint64) {
 					msgs = append(msgs, msg)
 				}
 			case <-timer.C:
+				log.LogDebugf("[startSchedule] intervalToPersistData curIndex: %v,apply:%v", curIndex, mp.applyID)
 				if mp.applyID <= curIndex {
 					timer.Reset(intervalToPersistData)
 					continue
@@ -124,11 +143,24 @@ func (mp *metaPartition) startSchedule(curIndex uint64) {
 					timerCursor.Reset(intervalToSyncCursor)
 					continue
 				}
-				cursorBuf := make([]byte, 8)
-				binary.BigEndian.PutUint64(cursorBuf, mp.config.Cursor)
-				if _, err := mp.submit(opFSMSyncCursor, cursorBuf); err != nil {
+				curCursor := mp.GetCursor()
+				if curCursor == lastCursor {
+					log.LogDebugf("[startSchedule] partitionId=%d: curCursor[%v]=lastCursor[%v]",
+						mp.config.PartitionId, curCursor, lastCursor)
+					timerCursor.Reset(intervalToSyncCursor)
+					continue
+				}
+				Buf := make([]byte, 8)
+				binary.BigEndian.PutUint64(Buf, curCursor)
+				if _, err := mp.submit(opFSMSyncCursor, Buf); err != nil {
 					log.LogErrorf("[startSchedule] raft submit: %s", err.Error())
 				}
+
+				binary.BigEndian.PutUint64(Buf, mp.txProcessor.txManager.txIdAlloc.getTransactionID())
+				if _, err := mp.submit(opFSMSyncTxID, Buf); err != nil {
+					log.LogErrorf("[startSchedule] raft submit: %s", err.Error())
+				}
+				lastCursor = curCursor
 				timerCursor.Reset(intervalToSyncCursor)
 			}
 		}

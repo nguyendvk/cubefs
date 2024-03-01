@@ -24,10 +24,22 @@ import (
 	"github.com/cubefs/cubefs/proto"
 )
 
+func formatAddr(ipAddr string, domainAddr string) (addr string) {
+	if len(domainAddr) != 0 {
+		addr = fmt.Sprintf("%v(%v)", ipAddr, domainAddr)
+	} else {
+		addr = ipAddr
+	}
+	return
+}
+
 func formatClusterView(cv *proto.ClusterView, cn *proto.ClusterNodeInfo, cp *proto.ClusterIP) string {
 	var sb = strings.Builder{}
 	sb.WriteString(fmt.Sprintf("  Cluster name       : %v\n", cv.Name))
 	sb.WriteString(fmt.Sprintf("  Master leader      : %v\n", cv.LeaderAddr))
+	for _, master := range cv.MasterNodes {
+		sb.WriteString(fmt.Sprintf("  Master-%d           : %v\n", master.ID, master.Addr))
+	}
 	sb.WriteString(fmt.Sprintf("  Auto allocate      : %v\n", formatEnabledDisabled(!cv.DisableAutoAlloc)))
 	sb.WriteString(fmt.Sprintf("  MetaNode count     : %v\n", len(cv.MetaNodes)))
 	sb.WriteString(fmt.Sprintf("  MetaNode used      : %v GB\n", cv.MetaNodeStatInfo.UsedGB))
@@ -36,8 +48,9 @@ func formatClusterView(cv *proto.ClusterView, cn *proto.ClusterNodeInfo, cp *pro
 	sb.WriteString(fmt.Sprintf("  DataNode used      : %v GB\n", cv.DataNodeStatInfo.UsedGB))
 	sb.WriteString(fmt.Sprintf("  DataNode total     : %v GB\n", cv.DataNodeStatInfo.TotalGB))
 	sb.WriteString(fmt.Sprintf("  Volume count       : %v\n", len(cv.VolStatInfo)))
+	sb.WriteString(fmt.Sprintf("  Allow Mp Decomm    : %v\n", formatEnabledDisabled(!cv.ForbidMpDecommission)))
 	sb.WriteString(fmt.Sprintf("  EbsAddr            : %v\n", cp.EbsAddr))
-	sb.WriteString(fmt.Sprintf("  loadFactor         : %v\n", cn.LoadFactor))
+	sb.WriteString(fmt.Sprintf("  LoadFactor         : %v\n", cn.LoadFactor))
 	return sb.String()
 }
 
@@ -70,7 +83,7 @@ func formatClusterStat(cs *proto.ClusterStatInfo) string {
 	return sb.String()
 }
 
-var nodeViewTableRowPattern = "%-6v    %-18v    %-8v    %-8v"
+var nodeViewTableRowPattern = "%-6v    %-65v    %-8v    %-8v"
 
 func formatNodeViewTableHeader() string {
 	return fmt.Sprintf(nodeViewTableRowPattern, "ID", "ADDRESS", "WRITABLE", "STATUS")
@@ -78,12 +91,12 @@ func formatNodeViewTableHeader() string {
 
 func formatNodeView(view *proto.NodeView, tableRow bool) string {
 	if tableRow {
-		return fmt.Sprintf(nodeViewTableRowPattern, view.ID, view.Addr,
+		return fmt.Sprintf(nodeViewTableRowPattern, view.ID, formatAddr(view.Addr, view.DomainAddr),
 			formatYesNo(view.IsWritable), formatNodeStatus(view.Status))
 	}
 	var sb = strings.Builder{}
 	sb.WriteString(fmt.Sprintf("  ID      : %v\n", view.ID))
-	sb.WriteString(fmt.Sprintf("  Address : %v\n", view.Addr))
+	sb.WriteString(fmt.Sprintf("  Address : %v\n", formatAddr(view.Addr, view.DomainAddr)))
 	sb.WriteString(fmt.Sprintf("  Writable: %v\n", formatYesNo(view.IsWritable)))
 	sb.WriteString(fmt.Sprintf("  Status  : %v", formatNodeStatus(view.Status)))
 	return sb.String()
@@ -92,29 +105,37 @@ func formatNodeView(view *proto.NodeView, tableRow bool) string {
 func formatSimpleVolView(svv *proto.SimpleVolView) string {
 
 	var sb = strings.Builder{}
-	sb.WriteString(fmt.Sprintf("  ID                   : %v\n", svv.ID))
-	sb.WriteString(fmt.Sprintf("  Name                 : %v\n", svv.Name))
-	sb.WriteString(fmt.Sprintf("  Owner                : %v\n", svv.Owner))
-	sb.WriteString(fmt.Sprintf("  Authenticate         : %v\n", formatEnabledDisabled(svv.Authenticate)))
-	sb.WriteString(fmt.Sprintf("  Capacity             : %v GB\n", svv.Capacity))
-	sb.WriteString(fmt.Sprintf("  Create time          : %v\n", svv.CreateTime))
-	sb.WriteString(fmt.Sprintf("  Cross zone           : %v\n", formatEnabledDisabled(svv.CrossZone)))
-	sb.WriteString(fmt.Sprintf("  DefaultPriority      : %v\n", svv.DefaultPriority))
-	sb.WriteString(fmt.Sprintf("  Dentry count         : %v\n", svv.DentryCount))
-	sb.WriteString(fmt.Sprintf("  Description          : %v\n", string([]rune(svv.Description)[:])))
-	sb.WriteString(fmt.Sprintf("  DpCnt                : %v\n", svv.DpCnt))
-	sb.WriteString(fmt.Sprintf("  DpReplicaNum         : %v\n", svv.DpReplicaNum))
-	sb.WriteString(fmt.Sprintf("  Follower read        : %v\n", formatEnabledDisabled(svv.FollowerRead)))
-	sb.WriteString(fmt.Sprintf("  Inode count          : %v\n", svv.InodeCount))
-	sb.WriteString(fmt.Sprintf("  Max metaPartition ID : %v\n", svv.MaxMetaPartitionID))
-	sb.WriteString(fmt.Sprintf("  MpCnt                : %v\n", svv.MpCnt))
-	sb.WriteString(fmt.Sprintf("  MpReplicaNum         : %v\n", svv.MpReplicaNum))
-	sb.WriteString(fmt.Sprintf("  NeedToLowerReplica   : %v\n", svv.NeedToLowerReplica))
-	sb.WriteString(fmt.Sprintf("  MpReplicaNum         : %v\n", formatEnabledDisabled(svv.NeedToLowerReplica)))
-	sb.WriteString(fmt.Sprintf("  RwDpCnt              : %v\n", svv.RwDpCnt))
-	sb.WriteString(fmt.Sprintf("  Status               : %v\n", formatVolumeStatus(svv.Status)))
-	sb.WriteString(fmt.Sprintf("  ZoneName             : %v\n", svv.ZoneName))
-	sb.WriteString(fmt.Sprintf("  VolType              : %v\n", svv.VolType))
+	sb.WriteString(fmt.Sprintf("  ID                              : %v\n", svv.ID))
+	sb.WriteString(fmt.Sprintf("  Name                            : %v\n", svv.Name))
+	sb.WriteString(fmt.Sprintf("  Owner                           : %v\n", svv.Owner))
+	sb.WriteString(fmt.Sprintf("  Authenticate                    : %v\n", formatEnabledDisabled(svv.Authenticate)))
+	sb.WriteString(fmt.Sprintf("  Capacity                        : %v GB\n", svv.Capacity))
+	sb.WriteString(fmt.Sprintf("  Create time                     : %v\n", svv.CreateTime))
+	sb.WriteString(fmt.Sprintf("  DeleteLockTime                  : %v\n", svv.DeleteLockTime))
+	sb.WriteString(fmt.Sprintf("  Cross zone                      : %v\n", formatEnabledDisabled(svv.CrossZone)))
+	sb.WriteString(fmt.Sprintf("  DefaultPriority                 : %v\n", svv.DefaultPriority))
+	sb.WriteString(fmt.Sprintf("  Dentry count                    : %v\n", svv.DentryCount))
+	sb.WriteString(fmt.Sprintf("  Description                     : %v\n", string([]rune(svv.Description)[:])))
+	sb.WriteString(fmt.Sprintf("  DpCnt                           : %v\n", svv.DpCnt))
+	sb.WriteString(fmt.Sprintf("  DpReplicaNum                    : %v\n", svv.DpReplicaNum))
+	sb.WriteString(fmt.Sprintf("  Follower read                   : %v\n", formatEnabledDisabled(svv.FollowerRead)))
+	sb.WriteString(fmt.Sprintf("  Inode count                     : %v\n", svv.InodeCount))
+	sb.WriteString(fmt.Sprintf("  Max metaPartition ID            : %v\n", svv.MaxMetaPartitionID))
+	sb.WriteString(fmt.Sprintf("  MpCnt                           : %v\n", svv.MpCnt))
+	sb.WriteString(fmt.Sprintf("  MpReplicaNum                    : %v\n", svv.MpReplicaNum))
+	sb.WriteString(fmt.Sprintf("  NeedToLowerReplica              : %v\n", formatEnabledDisabled(svv.NeedToLowerReplica)))
+	sb.WriteString(fmt.Sprintf("  RwDpCnt                         : %v\n", svv.RwDpCnt))
+	sb.WriteString(fmt.Sprintf("  Status                          : %v\n", formatVolumeStatus(svv.Status)))
+	sb.WriteString(fmt.Sprintf("  ZoneName                        : %v\n", svv.ZoneName))
+	sb.WriteString(fmt.Sprintf("  VolType                         : %v\n", svv.VolType))
+	sb.WriteString(fmt.Sprintf("  DpReadOnlyWhenVolFull           : %v\n", svv.DpReadOnlyWhenVolFull))
+	sb.WriteString(fmt.Sprintf("  Transaction Mask                : %v\n", svv.EnableTransaction))
+	sb.WriteString(fmt.Sprintf("  Transaction timeout             : %v\n", svv.TxTimeout))
+	sb.WriteString(fmt.Sprintf("  Tx conflict retry num           : %v\n", svv.TxConflictRetryNum))
+	sb.WriteString(fmt.Sprintf("  Tx conflict retry interval(ms)  : %v\n", svv.TxConflictRetryInterval))
+	sb.WriteString(fmt.Sprintf("  Tx limit interval(s)            : %v\n", svv.TxOpLimit))
+	sb.WriteString(fmt.Sprintf("  DisableAuditLog                 : %v\n", svv.DisableAuditLog))
+	sb.WriteString(fmt.Sprintf("  Quota                           : %v\n", formatEnabledDisabled(svv.EnableQuota)))
 	if svv.VolType == 1 {
 		sb.WriteString(fmt.Sprintf("  ObjBlockSize         : %v byte\n", svv.ObjBlockSize))
 		sb.WriteString(fmt.Sprintf("  CacheCapacity        : %v G\n", svv.CacheCapacity))
@@ -152,6 +173,31 @@ func formatVolInfoTableRow(vi *proto.VolInfo) string {
 }
 
 var (
+	volumeVersionPattern     = "%-20v    %-40v    %-8v    %-8v"
+	volumeVersionTableHeader = fmt.Sprintf(volumeVersionPattern, "VER", "CTIME", "STATUS", "OTHER")
+)
+
+var (
+	volumeAclPattern     = "%-20v    %-40v    %-8v"
+	volumeAclTableHeader = fmt.Sprintf(volumeAclPattern, "IP", "CTIME", "OTHER")
+)
+
+func formatAclInfoTableRow(aclInfo *proto.AclIpInfo) string {
+	return fmt.Sprintf(volumeAclPattern,
+		aclInfo.Ip, time.Unix(aclInfo.CTime, 0).Format(time.RFC1123), "")
+}
+
+var (
+	volumeUidPattern     = "%-20v    %-40v     %-8v   %-8v   %-8v    %-8v"
+	volumeUidTableHeader = fmt.Sprintf(volumeUidPattern, "UID", "CTIME", "ENABLED", "LIMITED", "LIMITSIZE", "USED")
+)
+
+func formatUidInfoTableRow(uidInfo *proto.UidSpaceInfo) string {
+	return fmt.Sprintf(volumeUidPattern,
+		uidInfo.Uid, time.Unix(uidInfo.CTime, 0).Format(time.RFC1123), uidInfo.Enabled, uidInfo.Limited, uidInfo.LimitSize, uidInfo.UsedSize)
+}
+
+var (
 	dataPartitionTablePattern = "%-8v    %-8v    %-10v    %-10v     %-18v    %-18v"
 	dataPartitionTableHeader  = fmt.Sprintf(dataPartitionTablePattern,
 		"ID", "REPLICAS", "STATUS", "ISRECOVER", "LEADER", "MEMBERS")
@@ -164,19 +210,187 @@ func formatDataPartitionTableRow(view *proto.DataPartitionResponse) string {
 }
 
 var (
-	partitionInfoTablePattern = "%-8v    %-8v    %-10v     %-18v    %-18v"
+	partitionInfoTablePattern = "%-8v    %-8v    %-10v     %-12v    %-18v"
 	partitionInfoTableHeader  = fmt.Sprintf(partitionInfoTablePattern,
 		"ID", "VOLUME", "REPLICAS", "STATUS", "MEMBERS")
+
+	badReplicaPartitionInfoTablePattern = "%-8v    %-8v    %-8v    %-8v    %-24v    %-24v"
+	badReplicaPartitionInfoTableHeader  = fmt.Sprintf(badReplicaPartitionInfoTablePattern,
+		"DP_ID", "VOLUME", "REPLICAS", "DP_STATUS", "MEMBERS", "UNAVAILABLE_REPLICAS")
+
+	repFileCountDifferPartitionInfoTablePattern = "%-8v    %-8v    %-8v    %-8v    %-24v"
+	RepFileCountDifferInfoTableHeader           = fmt.Sprintf(repFileCountDifferPartitionInfoTablePattern,
+		"DP_ID", "VOLUME", "REPLICAS", "DP_STATUS", "MEMBERS(fileCount)")
+
+	repUsedSizeDifferPartitionInfoTablePattern = "%-8v    %-8v    %-8v    %-8v    %-24v"
+	RepUsedSizeDifferInfoTableHeader           = fmt.Sprintf(repUsedSizeDifferPartitionInfoTablePattern,
+		"DP_ID", "VOLUME", "REPLICAS", "DP_STATUS", "MEMBERS(usedSize)")
+
+	inodeCountNotEqualInfoTablePattern = "%-8v    %-8v    %-8v     %-8v    %-24v"
+	inodeCountNotEqualInfoTableHeader  = fmt.Sprintf(inodeCountNotEqualInfoTablePattern,
+		"ID", "VOLUME", "REPLICAS", "STATUS", "MEMBERS(inodeCount)")
+	maxInodeNotEqualInfoTableHeader = fmt.Sprintf(inodeCountNotEqualInfoTablePattern,
+		"ID", "VOLUME", "REPLICAS", "STATUS", "MEMBERS(maxInode)")
+
+	dentryCountNotEqualInfoTablePattern = "%-8v    %-8v    %-8v     %-8v    %-24v"
+	dentryCountNotEqualInfoTableHeader  = fmt.Sprintf(dentryCountNotEqualInfoTablePattern,
+		"ID", "VOLUME", "REPLICAS", "STATUS", "MEMBERS(dentryCount)")
 )
 
 func formatDataPartitionInfoRow(partition *proto.DataPartitionInfo) string {
-	return fmt.Sprintf(partitionInfoTablePattern,
-		partition.PartitionID, partition.VolName, partition.ReplicaNum, formatDataPartitionStatus(partition.Status), strings.Join(partition.Hosts, ", "))
+	return fmt.Sprintf(partitionInfoTablePattern, partition.PartitionID, partition.VolName, partition.ReplicaNum,
+		formatDataPartitionStatus(partition.Status), strings.Join(partition.Hosts, ", "))
+}
+
+func formatBadReplicaDpInfoRow(partition *proto.DataPartitionInfo) string {
+	var sb = strings.Builder{}
+	sb.WriteString("[")
+	var firstItem = true
+	for _, replica := range partition.Replicas {
+		if replica.Status == proto.Unavailable {
+			if !firstItem {
+				sb.WriteString(",")
+			}
+
+			sb.WriteString(fmt.Sprintf("%v", replica.Addr))
+			firstItem = false
+		}
+	}
+	sb.WriteString("]")
+	return fmt.Sprintf(badReplicaPartitionInfoTablePattern, partition.PartitionID, partition.VolName, partition.ReplicaNum,
+		formatDataPartitionStatus(partition.Status), "["+strings.Join(partition.Hosts, ", ")+"]", sb.String())
+}
+
+func formatReplicaFileCountDiffDpInfoRow(partition *proto.DataPartitionInfo) string {
+	var sb = strings.Builder{}
+	sb.WriteString("[")
+	var firstItem = true
+	for _, replica := range partition.Replicas {
+		if !firstItem {
+			sb.WriteString(",")
+		}
+
+		if replica.IsLeader {
+			sb.WriteString(fmt.Sprintf("%v(%v isLeader)", replica.Addr, replica.FileCount))
+		} else {
+			sb.WriteString(fmt.Sprintf("%v(%v)", replica.Addr, replica.FileCount))
+		}
+		firstItem = false
+	}
+	sb.WriteString("]")
+	return fmt.Sprintf(repFileCountDifferPartitionInfoTablePattern, partition.PartitionID, partition.VolName, partition.ReplicaNum,
+		formatDataPartitionStatus(partition.Status), sb.String())
+}
+
+func formatReplicaSizeDiffDpInfoRow(partition *proto.DataPartitionInfo) string {
+	var sb = strings.Builder{}
+	sb.WriteString("[")
+	var firstItem = true
+	for _, replica := range partition.Replicas {
+		if !firstItem {
+			sb.WriteString(",")
+		}
+
+		if replica.IsLeader {
+			sb.WriteString(fmt.Sprintf("%v(%v isLeader)", replica.Addr, replica.Used))
+		} else {
+			sb.WriteString(fmt.Sprintf("%v(%v)", replica.Addr, replica.Used))
+		}
+		firstItem = false
+	}
+	sb.WriteString("]")
+	return fmt.Sprintf(repUsedSizeDifferPartitionInfoTablePattern, partition.PartitionID, partition.VolName, partition.ReplicaNum,
+		formatDataPartitionStatus(partition.Status), sb.String())
+}
+
+func formatMetaPartitionReplicaInodeNotEqualInfoRow(partition *proto.MetaPartitionInfo) string {
+	var sb = strings.Builder{}
+	sb.WriteString("[")
+	var firstItem = true
+	for _, replica := range partition.Replicas {
+		if !firstItem {
+			sb.WriteString(",")
+		}
+
+		if replica.IsLeader {
+			sb.WriteString(fmt.Sprintf("%v(%v isLeader)", replica.Addr, replica.InodeCount))
+		} else {
+			sb.WriteString(fmt.Sprintf("%v(%v)", replica.Addr, replica.InodeCount))
+		}
+		firstItem = false
+	}
+	sb.WriteString("]")
+	return fmt.Sprintf(inodeCountNotEqualInfoTablePattern, partition.PartitionID, partition.VolName, partition.ReplicaNum,
+		formatDataPartitionStatus(partition.Status), sb.String())
+
+}
+
+func formatMetaPartitionReplicaMaxInodeNotEqualInfoRow(partition *proto.MetaPartitionInfo) string {
+	var sb = strings.Builder{}
+	sb.WriteString("[")
+	var firstItem = true
+	for _, replica := range partition.Replicas {
+		if !firstItem {
+			sb.WriteString(",")
+		}
+
+		if replica.IsLeader {
+			sb.WriteString(fmt.Sprintf("%v(%v isLeader)", replica.Addr, replica.MaxInode))
+		} else {
+			sb.WriteString(fmt.Sprintf("%v(%v)", replica.Addr, replica.MaxInode))
+		}
+		firstItem = false
+	}
+	sb.WriteString("]")
+	return fmt.Sprintf(inodeCountNotEqualInfoTablePattern, partition.PartitionID, partition.VolName, partition.ReplicaNum,
+		formatDataPartitionStatus(partition.Status), sb.String())
+
+}
+
+func formatMetaPartitionReplicaDentryNotEqualInfoRow(partition *proto.MetaPartitionInfo) string {
+	var sb = strings.Builder{}
+	sb.WriteString("[")
+	var firstItem = true
+	for _, replica := range partition.Replicas {
+		if !firstItem {
+			sb.WriteString(",")
+		}
+
+		if replica.IsLeader {
+			sb.WriteString(fmt.Sprintf("%v(%v isLeader)", replica.Addr, replica.DentryCount))
+		} else {
+			sb.WriteString(fmt.Sprintf("%v(%v)", replica.Addr, replica.DentryCount))
+		}
+		firstItem = false
+	}
+	sb.WriteString("]")
+	return fmt.Sprintf(dentryCountNotEqualInfoTablePattern, partition.PartitionID, partition.VolName, partition.ReplicaNum,
+		formatDataPartitionStatus(partition.Status), sb.String())
+
 }
 
 func formatMetaPartitionInfoRow(partition *proto.MetaPartitionInfo) string {
 	return fmt.Sprintf(partitionInfoTablePattern,
 		partition.PartitionID, partition.VolName, partition.ReplicaNum, formatDataPartitionStatus(partition.Status), strings.Join(partition.Hosts, ", "))
+}
+
+func formatBadReplicaMpInfoRow(partition *proto.MetaPartitionInfo) string {
+	var sb = strings.Builder{}
+	sb.WriteString("[")
+	var firstItem = true
+	for _, replica := range partition.Replicas {
+		if replica.Status == proto.Unavailable {
+			if !firstItem {
+				sb.WriteString(", ")
+			}
+
+			sb.WriteString(fmt.Sprintf("%v", replica.Addr))
+			firstItem = false
+		}
+	}
+	sb.WriteString("]")
+	return fmt.Sprintf(badReplicaPartitionInfoTablePattern, partition.PartitionID, partition.VolName, partition.ReplicaNum,
+		formatDataPartitionStatus(partition.Status), "["+strings.Join(partition.Hosts, ", ")+"]", sb.String())
 }
 
 func formatDataPartitionInfo(partition *proto.DataPartitionInfo) string {
@@ -188,6 +402,8 @@ func formatDataPartitionInfo(partition *proto.DataPartitionInfo) string {
 	sb.WriteString(fmt.Sprintf("Status        : %v\n", formatDataPartitionStatus(partition.Status)))
 	sb.WriteString(fmt.Sprintf("LastLoadedTime: %v\n", formatTime(partition.LastLoadedTime)))
 	sb.WriteString(fmt.Sprintf("OfflinePeerID : %v\n", partition.OfflinePeerID))
+	sb.WriteString(fmt.Sprintf("ISRdOnly      : %v\n", partition.RdOnly))
+	sb.WriteString(fmt.Sprintf("IsDiscard     : %v\n", partition.IsDiscard))
 	sb.WriteString(fmt.Sprintf("ReplicaNum    : %v\n", partition.ReplicaNum))
 	sb.WriteString("\n")
 	sb.WriteString(fmt.Sprintf("Replicas : \n"))
@@ -219,6 +435,11 @@ func formatDataPartitionInfo(partition *proto.DataPartitionInfo) string {
 	sb.WriteString(fmt.Sprintf("Zones :\n"))
 	for _, zone := range partition.Zones {
 		sb.WriteString(fmt.Sprintf("  [%v]", zone))
+	}
+	sb.WriteString("\n")
+	sb.WriteString(fmt.Sprintf("NodeSets :\n"))
+	for _, nodeSet := range partition.NodeSets {
+		sb.WriteString(fmt.Sprintf("  [%v]", nodeSet))
 	}
 	sb.WriteString("\n")
 	sb.WriteString("\n")
@@ -263,6 +484,11 @@ func formatMetaPartitionInfo(partition *proto.MetaPartitionInfo) string {
 	sb.WriteString(fmt.Sprintf("Zones :\n"))
 	for _, zone := range partition.Zones {
 		sb.WriteString(fmt.Sprintf("  [%v]", zone))
+	}
+	sb.WriteString("\n")
+	sb.WriteString(fmt.Sprintf("NodeSets :\n"))
+	for _, nodeSet := range partition.NodeSets {
+		sb.WriteString(fmt.Sprintf("  [%v]", nodeSet))
 	}
 	sb.WriteString("\n")
 	sb.WriteString("\n")
@@ -394,7 +620,7 @@ func formatTimeToString(t time.Time) string {
 	return t.Format("2006-01-02 15:04:05")
 }
 
-var dataReplicaTableRowPattern = "%-18v    %-12v    %-12v    %-12v    %-12v    %-12v    %-12v    %-12v    %-18v    %-10v"
+var dataReplicaTableRowPattern = "%-65v    %-12v    %-12v    %-12v    %-12v    %-12v    %-12v    %-12v    %-18v    %-10v"
 
 func formatDataReplicaTableHeader() string {
 	return fmt.Sprintf(dataReplicaTableRowPattern, "ADDR", "USEDSIZE", "TOTALSIZE", "ISLEADER", "FILECOUNT", "HASLOADRESPONSE", "NEEDSTOCOMPARE", "STATUS", "DISKPATH", "REPORT TIME")
@@ -434,13 +660,14 @@ func formatDataFileMetadate(indentation string, fileMeta *proto.FileMetadata) st
 
 func formatDataReplica(indentation string, replica *proto.DataReplica, rowTable bool) string {
 	if rowTable {
-		return fmt.Sprintf(dataReplicaTableRowPattern, replica.Addr, formatSize(replica.Used), formatSize(replica.Total), replica.IsLeader,
-			replica.FileCount, replica.HasLoadResponse, replica.NeedsToCompare, formatDataPartitionStatus(replica.Status),
+		return fmt.Sprintf(dataReplicaTableRowPattern, formatAddr(replica.Addr, replica.DomainAddr),
+			formatSize(replica.Used), formatSize(replica.Total), replica.IsLeader, replica.FileCount,
+			replica.HasLoadResponse, replica.NeedsToCompare, formatDataPartitionStatus(replica.Status),
 			replica.DiskPath, formatTime(replica.ReportTime))
 	}
 	var sb = strings.Builder{}
-	sb.WriteString(fmt.Sprintf("%v- Addr           : %v\n", indentation, replica.Addr))
-	sb.WriteString(fmt.Sprintf("%v  Allocated           : %v\n", indentation, formatSize(replica.Used)))
+	sb.WriteString(fmt.Sprintf("%v- Addr           : %v\n", indentation, formatAddr(replica.Addr, replica.DomainAddr)))
+	sb.WriteString(fmt.Sprintf("%v  Allocated      : %v\n", indentation, formatSize(replica.Used)))
 	sb.WriteString(fmt.Sprintf("%v  Total          : %v\n", indentation, formatSize(replica.Total)))
 	sb.WriteString(fmt.Sprintf("%v  IsLeader       : %v\n", indentation, replica.IsLeader))
 	sb.WriteString(fmt.Sprintf("%v  FileCount      : %v\n", indentation, replica.FileCount))
@@ -452,19 +679,20 @@ func formatDataReplica(indentation string, replica *proto.DataReplica, rowTable 
 	return sb.String()
 }
 
-var metaReplicaTableRowPattern = "%-18v    %-6v    %-6v    %-10v"
+var metaReplicaTableRowPattern = "%-65v    %-6v    %-6v    %-6v    %-10v"
 
 func formatMetaReplicaTableHeader() string {
-	return fmt.Sprintf(metaReplicaTableRowPattern, "ADDRESS", "ISLEADER", "STATUS", "REPORT TIME")
+	return fmt.Sprintf(metaReplicaTableRowPattern, "ADDRESS", "MaxInodeID", "ISLEADER", "STATUS", "REPORT TIME")
 }
 
 func formatMetaReplica(indentation string, replica *proto.MetaReplicaInfo, rowTable bool) string {
 	if rowTable {
-		return fmt.Sprintf(metaReplicaTableRowPattern, replica.Addr, replica.IsLeader, formatMetaPartitionStatus(replica.Status),
-			formatTime(replica.ReportTime))
+		return fmt.Sprintf(metaReplicaTableRowPattern, formatAddr(replica.Addr, replica.DomainAddr), replica.MaxInodeID,
+			replica.IsLeader, formatMetaPartitionStatus(replica.Status), formatTime(replica.ReportTime))
 	}
 	var sb = strings.Builder{}
-	sb.WriteString(fmt.Sprintf("%v- Addr           : %v\n", indentation, replica.Addr))
+	sb.WriteString(fmt.Sprintf("%v- Addr           : %v\n", indentation, formatAddr(replica.Addr, replica.DomainAddr)))
+	sb.WriteString(fmt.Sprintf("%v- MaxInodeID     : %v\n", indentation, replica.MaxInodeID))
 	sb.WriteString(fmt.Sprintf("%v  Status         : %v\n", indentation, formatMetaPartitionStatus(replica.Status)))
 	sb.WriteString(fmt.Sprintf("%v  IsLeader       : %v\n", indentation, replica.IsLeader))
 	sb.WriteString(fmt.Sprintf("%v  ReportTime     : %v\n", indentation, formatTime(replica.ReportTime)))
@@ -480,7 +708,7 @@ func formatPeer(peer proto.Peer) string {
 	return fmt.Sprintf(peerTableRowPattern, peer.ID, peer.Addr)
 }
 
-var dataNodeDetailTableRowPattern = "%-6v    %-6v    %-18v    %-6v    %-6v    %-6v    %-10v"
+var dataNodeDetailTableRowPattern = "%-6v    %-6v    %-65v    %-6v    %-6v    %-6v    %-10v"
 
 func formatDataNodeDetailTableHeader() string {
 	return fmt.Sprintf(dataNodeDetailTableRowPattern, "ID", "ZONE", "ADDRESS", "USED", "TOTAL", "STATUS", "REPORT TIME")
@@ -488,15 +716,15 @@ func formatDataNodeDetailTableHeader() string {
 
 func formatDataNodeDetail(dn *proto.DataNodeInfo, rowTable bool) string {
 	if rowTable {
-		return fmt.Sprintf(dataNodeDetailTableRowPattern, dn.ID, dn.ZoneName, dn.Addr, formatSize(dn.Used),
-			formatSize(dn.Total), formatNodeStatus(dn.IsActive), formatTimeToString(dn.ReportTime))
+		return fmt.Sprintf(dataNodeDetailTableRowPattern, dn.ID, dn.ZoneName, formatAddr(dn.Addr, dn.DomainAddr),
+			formatSize(dn.Used), formatSize(dn.Total), formatNodeStatus(dn.IsActive), formatTimeToString(dn.ReportTime))
 	}
 	var sb = strings.Builder{}
 	sb.WriteString(fmt.Sprintf("  ID                  : %v\n", dn.ID))
-	sb.WriteString(fmt.Sprintf("  Address             : %v\n", dn.Addr))
+	sb.WriteString(fmt.Sprintf("  Address             : %v\n", formatAddr(dn.Addr, dn.DomainAddr)))
 	sb.WriteString(fmt.Sprintf("  Carry               : %v\n", dn.Carry))
-	sb.WriteString(fmt.Sprintf("  Allocated ratio          : %v\n", dn.UsageRatio))
-	sb.WriteString(fmt.Sprintf("  Allocated                : %v\n", formatSize(dn.Used)))
+	sb.WriteString(fmt.Sprintf("  Allocated ratio     : %v\n", dn.UsageRatio))
+	sb.WriteString(fmt.Sprintf("  Allocated           : %v\n", formatSize(dn.Used)))
 	sb.WriteString(fmt.Sprintf("  Available           : %v\n", formatSize(dn.AvailableSpace)))
 	sb.WriteString(fmt.Sprintf("  Total               : %v\n", formatSize(dn.Total)))
 	sb.WriteString(fmt.Sprintf("  Zone                : %v\n", dn.ZoneName))
@@ -508,7 +736,7 @@ func formatDataNodeDetail(dn *proto.DataNodeInfo, rowTable bool) string {
 	return sb.String()
 }
 
-var metaNodeDetailTableRowPattern = "%-6v    %-6v    %-18v    %-6v    %-6v    %-6v    %-10v"
+var metaNodeDetailTableRowPattern = "%-6v    %-6v    %-65v    %-6v    %-6v    %-6v    %-10v"
 
 func formatMetaNodeDetailTableHeader() string {
 	return fmt.Sprintf(metaNodeDetailTableRowPattern, "ID", "ZONE", "ADDRESS", "USED", "TOTAL", "STATUS", "REPORT TIME")
@@ -516,15 +744,16 @@ func formatMetaNodeDetailTableHeader() string {
 
 func formatMetaNodeDetail(mn *proto.MetaNodeInfo, rowTable bool) string {
 	if rowTable {
-		return fmt.Sprintf(metaNodeDetailTableRowPattern, mn.ID, mn.ZoneName, mn.Addr, mn.Used, mn.Total, mn.IsActive, formatTimeToString(mn.ReportTime))
+		return fmt.Sprintf(metaNodeDetailTableRowPattern, mn.ID, mn.ZoneName, formatAddr(mn.Addr, mn.DomainAddr),
+			mn.Used, mn.Total, mn.IsActive, formatTimeToString(mn.ReportTime))
 	}
 	var sb = strings.Builder{}
 	sb.WriteString(fmt.Sprintf("  ID                  : %v\n", mn.ID))
-	sb.WriteString(fmt.Sprintf("  Address             : %v\n", mn.Addr))
+	sb.WriteString(fmt.Sprintf("  Address             : %v\n", formatAddr(mn.Addr, mn.DomainAddr)))
 	sb.WriteString(fmt.Sprintf("  Carry               : %v\n", mn.Carry))
 	sb.WriteString(fmt.Sprintf("  Threshold           : %v\n", mn.Threshold))
 	sb.WriteString(fmt.Sprintf("  MaxMemAvailWeight   : %v\n", formatSize(mn.MaxMemAvailWeight)))
-	sb.WriteString(fmt.Sprintf("  Allocated                : %v\n", formatSize(mn.Used)))
+	sb.WriteString(fmt.Sprintf("  Allocated           : %v\n", formatSize(mn.Used)))
 	sb.WriteString(fmt.Sprintf("  Total               : %v\n", formatSize(mn.Total)))
 	sb.WriteString(fmt.Sprintf("  Zone                : %v\n", mn.ZoneName))
 	sb.WriteString(fmt.Sprintf("  IsActive            : %v\n", formatNodeStatus(mn.IsActive)))
@@ -554,4 +783,40 @@ func formatZoneView(zv *proto.ZoneView) string {
 		}
 	}
 	return sb.String()
+}
+
+var quotaTableRowPattern = "%-6v %-30v %-15v %-20v     %-15v    %-10v    %-12v    %-12v    %-10v    %-10v    %-10v    %-10v"
+
+func formatQuotaTableHeader() string {
+	return fmt.Sprintf(quotaTableRowPattern, "ID", "PATH", "VOL", "CTIME",
+		"PID", "RINODE", "LIMITEDFILES", "LIMITEDBYTES", "USEDFILES", "USEDBYTES", "MAXFILES", "MAXBYTES")
+}
+
+func formatQuotaInfo(info *proto.QuotaInfo) string {
+	t := time.Unix(info.CTime, 0)
+	var ret string
+	firstLine := true
+	for _, pathInfo := range info.PathInfos {
+		if firstLine {
+			ret = fmt.Sprintf(quotaTableRowPattern, info.QuotaId, pathInfo.FullPath, info.VolName, t.Format("2006-01-02 15:04:05"), pathInfo.PartitionId,
+				pathInfo.RootInode, info.LimitedInfo.LimitedFiles, info.LimitedInfo.LimitedBytes, info.UsedInfo.UsedFiles, info.UsedInfo.UsedBytes,
+				info.MaxFiles, info.MaxBytes)
+			firstLine = false
+		} else {
+			ret += "\n"
+			ret += fmt.Sprintf(quotaTableRowPattern, "", pathInfo.FullPath, "", "", pathInfo.PartitionId, pathInfo.RootInode,
+				"", "", "", "", "", "")
+		}
+	}
+	return ret
+}
+
+var badDiskDetailTableRowPattern = "%-18v    %-24v"
+
+func formatBadDiskTableHeader() string {
+	return fmt.Sprintf(badDiskDetailTableRowPattern, "ADDRESS", "PATH")
+}
+
+func formatBadDiskInfoRow(disk proto.BadDiskInfo) string {
+	return fmt.Sprintf(badDiskDetailTableRowPattern, disk.Address, disk.Path)
 }

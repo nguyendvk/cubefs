@@ -4,6 +4,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cubefs/cubefs/proto"
+
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -20,6 +22,7 @@ var (
 	nodeInfo                   = &NodeInfo{}
 	nodeInfoStopC              = make(chan struct{}, 0)
 	deleteWorkerSleepMs uint64 = 0
+	dirChildrenNumLimit uint32 = proto.DefaultDirChildrenNumLimit
 )
 
 func DeleteBatchCount() uint64 {
@@ -36,6 +39,10 @@ func updateDeleteBatchCount(val uint64) {
 
 func updateDeleteWorkerSleepMs(val uint64) {
 	atomic.StoreUint64(&deleteWorkerSleepMs, val)
+}
+
+func updateDirChildrenNumLimit(val uint32) {
+	atomic.StoreUint32(&dirChildrenNumLimit, val)
 }
 
 func DeleteWorkerSleepMs() {
@@ -72,4 +79,15 @@ func (m *MetaNode) updateNodeInfo() {
 	}
 	updateDeleteBatchCount(clusterInfo.MetaNodeDeleteBatchCount)
 	updateDeleteWorkerSleepMs(clusterInfo.MetaNodeDeleteWorkerSleepMs)
+
+	if clusterInfo.DirChildrenNumLimit < proto.MinDirChildrenNumLimit {
+		log.LogWarnf("updateNodeInfo: DirChildrenNumLimit probably not enabled on master, set to default value(%v)",
+			proto.DefaultDirChildrenNumLimit)
+		atomic.StoreUint32(&dirChildrenNumLimit, proto.DefaultDirChildrenNumLimit)
+	} else {
+		atomic.StoreUint32(&dirChildrenNumLimit, clusterInfo.DirChildrenNumLimit)
+		log.LogInfof("updateNodeInfo: DirChildrenNumLimit(%v)", clusterInfo.DirChildrenNumLimit)
+	}
+
+	//updateDirChildrenNumLimit(clusterInfo.DirChildrenNumLimit)
 }

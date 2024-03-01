@@ -15,12 +15,10 @@
 package rpc
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	urllib "net/url"
 	"strings"
@@ -28,6 +26,7 @@ import (
 
 	"github.com/cubefs/cubefs/blobstore/common/crc32block"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
+	"github.com/cubefs/cubefs/blobstore/util/bytespool"
 	"github.com/cubefs/cubefs/blobstore/util/errors"
 )
 
@@ -98,6 +97,10 @@ type client struct {
 
 // NewClient returns a rpc client
 func NewClient(cfg *Config) Client {
+	if cfg == nil {
+		cfg = &Config{}
+	}
+	cfg.Tc = cfg.Tc.Default()
 	if cfg.BodyBaseTimeoutMs == 0 {
 		cfg.BodyBaseTimeoutMs = 30 * 1e3
 	}
@@ -121,28 +124,28 @@ func (c *client) Form(ctx context.Context, method, url string, form map[string][
 }
 
 func (c *client) Put(ctx context.Context, url string, params interface{}) (resp *http.Response, err error) {
-	data, ct, err := marshalObj(params)
+	body, err := marshalObj(params)
 	if err != nil {
 		return
 	}
-	request, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(data))
+	request, err := http.NewRequest(http.MethodPut, url, body.Body)
 	if err != nil {
 		return
 	}
-	request.Header.Set(HeaderContentType, ct)
+	request.Header.Set(HeaderContentType, body.ContentType)
 	return c.Do(ctx, request)
 }
 
 func (c *client) Post(ctx context.Context, url string, params interface{}) (resp *http.Response, err error) {
-	data, ct, err := marshalObj(params)
+	body, err := marshalObj(params)
 	if err != nil {
 		return nil, err
 	}
-	request, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	request, err := http.NewRequest(http.MethodPost, url, body.Body)
 	if err != nil {
 		return nil, err
 	}
-	request.Header.Set(HeaderContentType, ct)
+	request.Header.Set(HeaderContentType, body.ContentType)
 	return c.Do(ctx, request)
 }
 
@@ -154,6 +157,7 @@ func (c *client) DoWith(ctx context.Context, req *http.Request, ret interface{},
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
 	err = serverCrcEncodeCheck(ctx, req, resp)
 	if err != nil {
@@ -167,19 +171,19 @@ func (c *client) GetWith(ctx context.Context, url string, ret interface{}) error
 	if err != nil {
 		return err
 	}
-	return ParseData(resp, ret)
+	return parseData(resp, ret)
 }
 
 func (c *client) PutWith(ctx context.Context, url string, ret interface{}, params interface{}, opts ...Option) (err error) {
-	data, ct, err := marshalObj(params)
+	body, err := marshalObj(params)
 	if err != nil {
 		return
 	}
-	request, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(data))
+	request, err := http.NewRequest(http.MethodPut, url, body.Body)
 	if err != nil {
 		return
 	}
-	request.Header.Set(HeaderContentType, ct)
+	request.Header.Set(HeaderContentType, body.ContentType)
 	for _, opt := range opts {
 		opt(request)
 	}
@@ -187,6 +191,7 @@ func (c *client) PutWith(ctx context.Context, url string, ret interface{}, param
 	if err != nil {
 		return
 	}
+	defer resp.Body.Close()
 	err = serverCrcEncodeCheck(ctx, request, resp)
 	if err != nil {
 		return err
@@ -195,15 +200,15 @@ func (c *client) PutWith(ctx context.Context, url string, ret interface{}, param
 }
 
 func (c *client) PostWith(ctx context.Context, url string, ret interface{}, params interface{}, opts ...Option) error {
-	data, ct, err := marshalObj(params)
+	body, err := marshalObj(params)
 	if err != nil {
 		return err
 	}
-	request, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	request, err := http.NewRequest(http.MethodPost, url, body.Body)
 	if err != nil {
 		return err
 	}
-	request.Header.Set(HeaderContentType, ct)
+	request.Header.Set(HeaderContentType, body.ContentType)
 
 	for _, opt := range opts {
 		opt(request)
@@ -212,6 +217,7 @@ func (c *client) PostWith(ctx context.Context, url string, ret interface{}, para
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
 	err = serverCrcEncodeCheck(ctx, request, resp)
 	if err != nil {
@@ -288,14 +294,30 @@ func (c *client) doWithCtx(ctx context.Context, req *http.Request) (resp *http.R
 	return
 }
 
-// ParseData parse response with data
+// parseData close response body in this package.
+func parseData(resp *http.Response, data interface{}) (err error) {
+	defer resp.Body.Close()
+	return ParseData(resp, data)
+}
+
+// ParseData parse response with data, close response body by yourself.
 func ParseData(resp *http.Response, data interface{}) (err error) {
-	defer func() {
-		io.Copy(ioutil.Discard, resp.Body)
-		resp.Body.Close()
-	}()
 	if resp.StatusCode/100 == 2 {
-		if data != nil && resp.ContentLength != 0 {
+		size := resp.ContentLength
+		if data != nil && size != 0 {
+			if d, ok := data.(UnmarshalerFrom); ok {
+				return d.UnmarshalFrom(io.LimitReader(resp.Body, size))
+			}
+
+			if d, ok := data.(Unmarshaler); ok {
+				buf := bytespool.Alloc(int(size))
+				defer bytespool.Free(buf)
+				if _, err = io.ReadFull(resp.Body, buf); err != nil {
+					return NewError(resp.StatusCode, "ReadResponse", err)
+				}
+				return d.Unmarshal(buf)
+			}
+
 			if err := json.NewDecoder(resp.Body).Decode(data); err != nil {
 				return NewError(resp.StatusCode, "JSONDecode", err)
 			}

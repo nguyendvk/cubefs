@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,14 +30,13 @@ import (
 	"github.com/hashicorp/consul/api"
 
 	cmapi "github.com/cubefs/cubefs/blobstore/api/clustermgr"
+	"github.com/cubefs/cubefs/blobstore/api/proxy"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
-	"github.com/cubefs/cubefs/blobstore/common/redis"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
+	"github.com/cubefs/cubefs/blobstore/util/defaulter"
 	"github.com/cubefs/cubefs/blobstore/util/errors"
 	"github.com/cubefs/cubefs/blobstore/util/log"
 )
-
-// TODO: how to stop service of one cluster???
 
 // AlgChoose algorithm of choose cluster
 type AlgChoose uint32
@@ -51,6 +51,30 @@ const (
 	AlgRandom
 	maxAlg
 )
+
+var cachedClient = struct {
+	mu    sync.Mutex
+	cache map[string]*cmapi.Client
+}{
+	cache: make(map[string]*cmapi.Client),
+}
+
+func getClusterClient(conf cmapi.Config) *cmapi.Client {
+	hosts := make([]string, len(conf.Hosts))
+	copy(hosts, conf.Hosts[:])
+	sort.Strings(hosts)
+	key := strings.Join(hosts, "-")
+
+	cachedClient.mu.Lock()
+	defer cachedClient.mu.Unlock()
+	cli, ok := cachedClient.cache[key]
+	if ok {
+		return cli
+	}
+	cli = cmapi.New(&conf)
+	cachedClient.cache[key] = cli
+	return cli
+}
 
 // IsValid returns valid algorithm or not.
 func (alg AlgChoose) IsValid() bool {
@@ -98,13 +122,12 @@ type ClusterController interface {
 // Region and RegionMagic are paired,
 // magic cannot change if one region was deployed.
 type ClusterConfig struct {
-	IDC               string              `json:"-"`
-	Region            string              `json:"region"`
-	RegionMagic       string              `json:"region_magic"`
-	ClusterReloadSecs int                 `json:"cluster_reload_secs"`
-	ServiceReloadSecs int                 `json:"service_reload_secs"`
-	CMClientConfig    cmapi.Config        `json:"clustermgr_client_config"`
-	RedisClientConfig redis.ClusterConfig `json:"redis_client_config"`
+	IDC               string       `json:"-"` // passing by stream config.
+	Region            string       `json:"region"`
+	RegionMagic       string       `json:"region_magic"`
+	ClusterReloadSecs int          `json:"cluster_reload_secs"`
+	ServiceReloadSecs int          `json:"service_reload_secs"`
+	CMClientConfig    cmapi.Config `json:"clustermgr_client_config"`
 
 	ServicePunishThreshold      uint32 `json:"service_punish_threshold"`
 	ServicePunishValidIntervalS int    `json:"service_punish_valid_interval_s"`
@@ -138,12 +161,16 @@ type clusterControllerImpl struct {
 	serviceMgrs     sync.Map
 	volumeGetters   sync.Map
 	roundRobinCount uint64 // a count for round robin
+	proxy           proxy.Cacher
+	stopCh          <-chan struct{}
 
 	config ClusterConfig
 }
 
 // NewClusterController returns a cluster controller
-func NewClusterController(cfg *ClusterConfig) (ClusterController, error) {
+func NewClusterController(cfg *ClusterConfig, proxy proxy.Cacher, stopCh <-chan struct{}) (ClusterController, error) {
+	defaulter.LessOrEqual(&cfg.ClusterReloadSecs, int(3))
+
 	consulConf := api.DefaultConfig()
 	consulConf.Address = cfg.ConsulAgentAddr
 	var client *api.Client
@@ -157,6 +184,8 @@ func NewClusterController(cfg *ClusterConfig) (ClusterController, error) {
 	controller := &clusterControllerImpl{
 		region:   cfg.Region,
 		kvClient: client,
+		proxy:    proxy,
+		stopCh:   stopCh,
 		config:   *cfg,
 	}
 	atomic.StoreUint32(&controller.allocAlg, uint32(AlgAvailable))
@@ -169,15 +198,20 @@ func NewClusterController(cfg *ClusterConfig) (ClusterController, error) {
 		return nil, errors.Base(err, "load cluster failed")
 	}
 
-	if cfg.ClusterReloadSecs <= 0 {
-		cfg.ClusterReloadSecs = 3
+	if stopCh == nil {
+		return controller, nil
 	}
-	tick := time.NewTicker(time.Duration(cfg.ClusterReloadSecs) * time.Second)
 	go func() {
+		tick := time.NewTicker(time.Duration(cfg.ClusterReloadSecs) * time.Second)
 		defer tick.Stop()
-		for range tick.C {
-			if err := f(); err != nil {
-				log.Warn("load timer error", err)
+		for {
+			select {
+			case <-tick.C:
+				if err := f(); err != nil {
+					log.Warn("load timer error", err)
+				}
+			case <-controller.stopCh:
+				return
 			}
 		}
 	}()
@@ -196,7 +230,7 @@ func (c *clusterControllerImpl) loadWithConfig() error {
 	for _, cs := range c.config.Clusters {
 		conf := c.config.CMClientConfig
 		conf.Hosts = cs.Hosts
-		cmCli := cmapi.New(&conf)
+		cmCli := getClusterClient(conf)
 
 		stat, err := cmCli.Stat(ctx)
 		if err != nil {
@@ -250,7 +284,7 @@ func (c *clusterControllerImpl) loadWithConsul() error {
 		clusterKey := filepath.Base(pair.Key)
 		span.Debug("found cluster", clusterKey)
 
-		clusterID, err := strconv.Atoi(clusterKey)
+		clusterID, err := strconv.ParseUint(clusterKey, 10, 32)
 		if err != nil {
 			span.Warn("invalid cluster id", clusterKey, err)
 			continue
@@ -291,7 +325,7 @@ func (c *clusterControllerImpl) deal(ctx context.Context, available []*cmapi.Clu
 		if allClusters[clusterID].client == nil {
 			conf := c.config.CMClientConfig
 			conf.Hosts = newCluster.Nodes
-			allClusters[clusterID].client = cmapi.New(&conf)
+			allClusters[clusterID].client = getClusterClient(conf)
 		}
 
 		cmCli := allClusters[clusterID].client
@@ -315,18 +349,14 @@ func (c *clusterControllerImpl) deal(ctx context.Context, available []*cmapi.Clu
 			ReloadSec:                   c.config.ServiceReloadSecs,
 			ServicePunishThreshold:      c.config.ServicePunishThreshold,
 			ServicePunishValidIntervalS: c.config.ServicePunishValidIntervalS,
-		}, cmCli)
+		}, cmCli, c.proxy, c.stopCh)
 		if err != nil {
 			removeThisCluster()
 			span.Warn("new service manager failed", clusterID, err)
 			continue
 		}
 
-		var redisCli *redis.ClusterClient
-		if len(c.config.RedisClientConfig.Addrs) > 0 {
-			redisCli = redis.NewClusterClient(&c.config.RedisClientConfig)
-		}
-		volumeGetter, err := NewVolumeGetter(clusterID, cmCli, redisCli, -1)
+		volumeGetter, err := NewVolumeGetter(clusterID, serviceController, c.proxy, -1)
 		if err != nil {
 			removeThisCluster()
 			span.Warn("new volume getter failed", clusterID, err)
@@ -335,7 +365,6 @@ func (c *clusterControllerImpl) deal(ctx context.Context, available []*cmapi.Clu
 
 		c.serviceMgrs.Store(clusterID, serviceController)
 		c.volumeGetters.Store(clusterID, volumeGetter)
-
 		span.Debug("loaded new cluster", clusterID)
 	}
 

@@ -232,14 +232,9 @@ func (e *Extent) WriteTiny(data []byte, offset, size int64, crc uint32, writeTyp
 }
 
 // Write writes data to an extent.
-// call os.File.WriteAt()
 func (e *Extent) Write(data []byte, offset, size int64, crc uint32, writeType int, isSync bool, crcFunc UpdateCrcFunc, ei *ExtentInfo) (err error) {
 	if IsTinyExtent(e.extentID) {
 		err = e.WriteTiny(data, offset, size, crc, writeType, isSync)
-		return
-	}
-
-	if err = e.checkOffsetAndSize(offset, size); err != nil {
 		return
 	}
 
@@ -287,9 +282,6 @@ func (e *Extent) Read(data []byte, offset, size int64, isRepairRead bool) (crc u
 	if IsTinyExtent(e.extentID) {
 		return e.ReadTiny(data, offset, size, isRepairRead)
 	}
-	if err = e.checkOffsetAndSize(offset, size); err != nil {
-		return
-	}
 	if _, err = e.file.ReadAt(data[:size], offset); err != nil {
 		return
 	}
@@ -306,20 +298,6 @@ func (e *Extent) ReadTiny(data []byte, offset, size int64, isRepairRead bool) (c
 	crc = crc32.ChecksumIEEE(data[:size])
 
 	return
-}
-
-func (e *Extent) checkOffsetAndSize(offset, size int64) error {
-	if offset+size > util.BlockSize*util.BlockCount {
-		return NewParameterMismatchErr(fmt.Sprintf("offset=%v size=%v", offset, size))
-	}
-	if offset >= util.BlockCount*util.BlockSize || size == 0 {
-		return NewParameterMismatchErr(fmt.Sprintf("offset=%v size=%v", offset, size))
-	}
-
-	if size > util.BlockSize {
-		return NewParameterMismatchErr(fmt.Sprintf("offset=%v size=%v", offset, size))
-	}
-	return nil
 }
 
 // Flush synchronizes data to the disk.
@@ -373,9 +351,6 @@ func (e *Extent) DeleteTiny(offset, size int64) (hasDelete bool, err error) {
 
 	if int(size)%PageSize != 0 {
 		size += int64(PageSize - int(size)%PageSize)
-	}
-	if int(size)%PageSize != 0 {
-		return false, ParameterMismatchError
 	}
 
 	newOffset, err := e.file.Seek(offset, SEEK_DATA)

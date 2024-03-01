@@ -93,11 +93,14 @@ func newRaftFsm(config *Config, raftConfig *RaftConfig) (*raftFsm, error) {
 	for _, p := range raftConfig.Peers {
 		r.replicas[p.ID] = newReplica(p, 0)
 	}
+
 	if !hs.IsEmpty() {
 		if raftConfig.Applied > r.raftLog.lastIndex() {
+			logger.Info("newRaft[%v] update [applied: %d, to lastindex: %d]", r.id, raftConfig.Applied, raftlog.lastIndex())
 			raftConfig.Applied = r.raftLog.lastIndex()
 		}
 		if hs.Commit > r.raftLog.lastIndex() {
+			logger.Info("newRaft[%v] update [hardState commit: %d, to lastindex: %d]", r.id, hs.Commit, raftlog.lastIndex())
 			hs.Commit = r.raftLog.lastIndex()
 		}
 		if err := r.loadState(hs); err != nil {
@@ -170,6 +173,12 @@ func (r *raftFsm) doRandomSeed() {
 }
 
 func (r *raftFsm) StopFsm() {
+	peers := make([]proto.Peer, len(r.replicas))
+	for _, r := range r.replicas {
+		peers = append(peers, r.peer)
+	}
+
+	r.mo.RemovePartition(r.id, peers)
 	close(r.stopCh)
 }
 
@@ -196,6 +205,12 @@ func (r *raftFsm) Step(m *proto.Message) {
 			r.campaign(m.ForceVote)
 		} else if logger.IsEnableDebug() && r.state == stateLeader {
 			logger.Debug("[raft->Step][%v] ignoring LocalMsgHup because already leader.", r.id)
+		} else if logger.IsEnableDebug() {
+			var replicas []uint64
+			for id := range r.replicas {
+				replicas = append(replicas, id)
+			}
+			logger.Debug("[raft->Step][%v] state %v, replicas %v.", r.id, r.state, replicas)
 		}
 		return
 	}

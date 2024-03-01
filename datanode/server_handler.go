@@ -18,12 +18,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path"
 	"strconv"
 	"sync/atomic"
 
 	"github.com/cubefs/cubefs/depends/tiglabs/raft"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/storage"
+	"github.com/cubefs/cubefs/util/config"
 )
 
 var (
@@ -347,6 +350,71 @@ func (s *DataNode) setQosEnable() func(http.ResponseWriter, *http.Request) {
 	}
 }
 
+func (s *DataNode) setDiskQos(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		s.buildFailureResp(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	parser := func(key string) (val int64, err error, has bool) {
+		valStr := r.FormValue(key)
+		if valStr == "" {
+			return 0, nil, false
+		}
+		has = true
+		val, err = strconv.ParseInt(valStr, 10, 64)
+		return
+	}
+
+	updated := false
+	for key, pVal := range map[string]*int{
+		ConfigDiskReadIocc:  &s.diskReadIocc,
+		ConfigDiskReadIops:  &s.diskReadIops,
+		ConfigDiskReadFlow:  &s.diskReadFlow,
+		ConfigDiskWriteIocc: &s.diskWriteIocc,
+		ConfigDiskWriteIops: &s.diskWriteIops,
+		ConfigDiskWriteFlow: &s.diskWriteFlow,
+	} {
+		val, err, has := parser(key)
+		if err != nil {
+			s.buildFailureResp(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if has {
+			updated = true
+			*pVal = int(val)
+		}
+	}
+
+	if updated {
+		s.updateQosLimit()
+	}
+	s.buildSuccessResp(w, "success")
+}
+
+func (s *DataNode) getDiskQos(w http.ResponseWriter, r *http.Request) {
+	disks := make([]interface{}, 0)
+	for _, diskItem := range s.space.GetDisks() {
+		disk := &struct {
+			Path  string        `json:"path"`
+			Read  LimiterStatus `json:"read"`
+			Write LimiterStatus `json:"write"`
+		}{
+			Path:  diskItem.Path,
+			Read:  diskItem.limitRead.Status(),
+			Write: diskItem.limitWrite.Status(),
+		}
+		disks = append(disks, disk)
+	}
+	diskStatus := &struct {
+		Disks []interface{} `json:"disks"`
+		Zone  string        `json:"zone"`
+	}{
+		Disks: disks,
+		Zone:  s.zoneName,
+	}
+	s.buildSuccessResp(w, diskStatus)
+}
+
 func (s *DataNode) getSmuxPoolStat() func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.enableSmuxConnPool {
@@ -384,6 +452,30 @@ func (s *DataNode) getMetricsDegrade(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(fmt.Sprintf("%v\n", atomic.LoadInt64(&s.metricsDegrade))))
 }
 
+func (s *DataNode) genClusterVersionFile(w http.ResponseWriter, r *http.Request) {
+	paths := make([]string, 0)
+	s.space.RangePartitions(func(partition *DataPartition) bool {
+		paths = append(paths, partition.disk.Path)
+		return true
+	})
+	paths = append(paths, s.raftDir)
+
+	for _, p := range paths {
+		if _, err := os.Stat(path.Join(p, config.ClusterVersionFile)); err == nil || os.IsExist(err) {
+			s.buildFailureResp(w, http.StatusCreated, "cluster version file already exists in "+p)
+			return
+		}
+	}
+	for _, p := range paths {
+		if err := config.CheckOrStoreClusterUuid(p, s.clusterUuid, true); err != nil {
+			s.buildFailureResp(w, http.StatusInternalServerError, "Failed to create cluster version file in "+p)
+			return
+		}
+	}
+	s.buildSuccessResp(w, "Generate cluster version file success")
+	return
+}
+
 func (s *DataNode) buildSuccessResp(w http.ResponseWriter, data interface{}) {
 	s.buildJSONResp(w, http.StatusOK, data, "")
 }
@@ -413,4 +505,62 @@ func (s *DataNode) buildJSONResp(w http.ResponseWriter, code int, data interface
 		return
 	}
 	w.Write(jsonBody)
+}
+
+type GcExtent struct {
+	*storage.ExtentInfo
+	GcStatus string `json:"gc_status"`
+}
+
+func (s *DataNode) getAllExtent(w http.ResponseWriter, r *http.Request) {
+	var (
+		partitionID uint64
+		err         error
+		extents     []*storage.ExtentInfo
+	)
+	if err = r.ParseForm(); err != nil {
+		s.buildFailureResp(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	beforeTime, err := strconv.ParseInt(r.FormValue("beforeTime"), 10, 64)
+	if err != nil {
+		s.buildFailureResp(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if partitionID, err = strconv.ParseUint(r.FormValue("id"), 10, 64); err != nil {
+		s.buildFailureResp(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	partition := s.space.Partition(partitionID)
+	if partition == nil {
+		s.buildFailureResp(w, http.StatusNotFound, "partition not exist")
+		return
+	}
+
+	store := partition.ExtentStore()
+	extents, err = store.GetAllExtents(beforeTime)
+	if err != nil {
+		s.buildFailureResp(w, http.StatusInternalServerError, "get all extents failed")
+		return
+	}
+
+	getGcStatus := func(extId uint64) string {
+		if store.IsMarkGc(extId) {
+			return "mark_gc"
+		}
+		return "normal"
+	}
+
+	gcExtents := make([]*GcExtent, len(extents))
+	for idx, e := range extents {
+		gcExtents[idx] = &GcExtent{
+			ExtentInfo: e,
+			GcStatus:   getGcStatus(e.FileID),
+		}
+	}
+
+	s.buildSuccessResp(w, gcExtents)
+	return
 }

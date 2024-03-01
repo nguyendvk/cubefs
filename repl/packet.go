@@ -16,11 +16,12 @@ package repl
 
 import (
 	"fmt"
-	"github.com/cubefs/cubefs/util/log"
 	"io"
 	"net"
 	"strings"
 	"time"
+
+	"github.com/cubefs/cubefs/util/log"
 
 	"github.com/cubefs/cubefs/depends/tiglabs/raft"
 	"github.com/cubefs/cubefs/proto"
@@ -47,6 +48,7 @@ type Packet struct {
 
 	// used locally
 	shallDegrade bool
+	AfterPre     bool
 }
 
 type FollowerPacket struct {
@@ -89,6 +91,8 @@ func (p *FollowerPacket) identificationErrorResultCode(errLog string, errMsg str
 	} else if strings.Contains(errMsg, storage.TryAgainError.Error()) {
 		p.ResultCode = proto.OpAgain
 	} else if strings.Contains(errMsg, raft.ErrNotLeader.Error()) {
+		p.ResultCode = proto.OpTryOtherAddr
+	} else if strings.Contains(errMsg, raft.ErrStopped.Error()) {
 		p.ResultCode = proto.OpTryOtherAddr
 	} else {
 		p.ResultCode = proto.OpIntraGroupNetErr
@@ -306,6 +310,8 @@ func (p *Packet) identificationErrorResultCode(errLog string, errMsg string) {
 		p.ResultCode = proto.OpAgain
 	} else if strings.Contains(errMsg, raft.ErrNotLeader.Error()) {
 		p.ResultCode = proto.OpTryOtherAddr
+	} else if strings.Contains(errMsg, raft.ErrStopped.Error()) {
+		p.ResultCode = proto.OpTryOtherAddr
 	} else {
 		p.ResultCode = proto.OpIntraGroupNetErr
 	}
@@ -342,6 +348,7 @@ func (p *Packet) ReadFromConnFromCli(c net.Conn, deadlineTime time.Duration) (er
 	if _, err = io.ReadFull(c, header); err != nil {
 		return
 	}
+
 	if err = p.UnmarshalHeader(header); err != nil {
 		return
 	}
@@ -415,7 +422,7 @@ func (p *Packet) IsMarkDeleteExtentOperation() bool {
 }
 
 func (p *Packet) IsBatchDeleteExtents() bool {
-	return p.Opcode == proto.OpBatchDeleteExtent
+	return p.Opcode == proto.OpBatchDeleteExtent || p.Opcode == proto.OpGcBatchDeleteExtent
 }
 
 func (p *Packet) IsBroadcastMinAppliedID() bool {
@@ -425,7 +432,8 @@ func (p *Packet) IsBroadcastMinAppliedID() bool {
 func (p *Packet) IsReadOperation() bool {
 	return p.Opcode == proto.OpStreamRead || p.Opcode == proto.OpRead ||
 		p.Opcode == proto.OpExtentRepairRead || p.Opcode == proto.OpReadTinyDeleteRecord ||
-		p.Opcode == proto.OpTinyExtentRepairRead || p.Opcode == proto.OpStreamFollowerRead
+		p.Opcode == proto.OpTinyExtentRepairRead || p.Opcode == proto.OpStreamFollowerRead ||
+		p.Opcode == proto.OpBackupRead
 }
 
 func (p *Packet) IsRandomWrite() bool {

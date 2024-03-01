@@ -90,11 +90,13 @@ func callWithJSON(w http.ResponseWriter, req *http.Request) {
 	r := &ret{}
 	err := json.NewDecoder(req.Body).Decode(r)
 	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 	r.Name = r.Name + "+Test"
 	marshal, err := json.Marshal(r)
 	if err != nil {
+		w.WriteHeader(http.StatusGatewayTimeout)
 		return
 	}
 	w.Write(marshal)
@@ -133,6 +135,36 @@ func init() {
 	testServer = httptest.NewServer(&handler{})
 }
 
+func TestClient_NewClient(t *testing.T) {
+	NewClient(nil)
+	{
+		cfg := Config{}
+		NewClient(&cfg)
+		require.Equal(t, 10, cfg.Tc.MaxConnsPerHost)
+		require.Equal(t, int64(0), cfg.Tc.DialTimeoutMs)
+		require.False(t, cfg.Tc.Auth.EnableAuth)
+	}
+	{
+		cfg := Config{}
+		cfg.Tc.Auth.EnableAuth = true
+		cfg.Tc.Auth.Secret = "true"
+		NewClient(&cfg)
+		require.Equal(t, 10, cfg.Tc.MaxConnsPerHost)
+		require.Equal(t, int64(0), cfg.Tc.DialTimeoutMs)
+		require.True(t, cfg.Tc.Auth.EnableAuth)
+		require.Equal(t, "true", cfg.Tc.Auth.Secret)
+	}
+	{
+		cfg := Config{}
+		cfg.Tc.MaxConnsPerHost = 4
+		NewClient(&cfg)
+		require.Equal(t, 4, cfg.Tc.MaxConnsPerHost)
+		require.Equal(t, 0, cfg.Tc.MaxIdleConnsPerHost)
+		require.Equal(t, int64(0), cfg.Tc.DialTimeoutMs)
+		require.False(t, cfg.Tc.Auth.EnableAuth)
+	}
+}
+
 func TestClient_GetWith(t *testing.T) {
 	ctx := context.Background()
 	result := &ret{}
@@ -158,6 +190,12 @@ func TestClient_PostWithNoCrc(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.Equal(t, "TestClient_PostWithNoCrc+Test", result.Name)
+}
+
+func TestClient_PostWithNoneBody(t *testing.T) {
+	ctx := context.Background()
+	err := simpleClient.PostWith(ctx, testServer.URL+"/json", nil, NoneBody)
+	require.Equal(t, DetectStatusCode(err), http.StatusBadRequest)
 }
 
 func TestClient_Delete(t *testing.T) {
@@ -192,7 +230,7 @@ func TestClient_Post(t *testing.T) {
 	result := &ret{}
 	resp, err := simpleClient.Post(ctx, testServer.URL+"/json", &ret{Name: "TestClient_Post"})
 	require.NoError(t, err)
-	err = ParseData(resp, result)
+	err = parseData(resp, result)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.Equal(t, "TestClient_Post+Test", result.Name)
@@ -230,7 +268,7 @@ func TestClient_Put(t *testing.T) {
 	result := &ret{}
 	resp, err := simpleClient.Put(ctx, testServer.URL+"/json", &ret{Name: "TestClient_Put"})
 	require.NoError(t, err)
-	err = ParseData(resp, result)
+	err = parseData(resp, result)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.Equal(t, "TestClient_Put+Test", result.Name)
@@ -287,7 +325,7 @@ func TestClient_ParseDataWithContentLengthZero(t *testing.T) {
 	require.NoError(t, err)
 	resp.StatusCode = 400
 	resp.ContentLength = 0
-	err = ParseData(resp, result)
+	err = parseData(resp, result)
 	require.Error(t, err)
 }
 
@@ -300,7 +338,7 @@ func TestClient_ParseData(t *testing.T) {
 	require.NoError(t, err)
 	resp.StatusCode = 400
 	resp.ContentLength = 12
-	err = ParseData(resp, result)
+	err = parseData(resp, result)
 	require.Error(t, err)
 }
 
@@ -322,7 +360,7 @@ func TestClient_ResponseClose(t *testing.T) {
 		&ret{Name: "TestClient_ResponseClose"})
 	require.NoError(t, err)
 	resp.Body.Close()
-	err = ParseData(resp, result)
+	err = parseData(resp, result)
 	require.Error(t, err)
 }
 

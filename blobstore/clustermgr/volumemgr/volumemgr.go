@@ -50,9 +50,11 @@ const (
 	defaultCheckExpiredVolumeIntervalS = 60
 	defaultFlushIntervalS              = 600
 	defaultApplyConcurrency            = 20
-	defaultMinAllocableVolumeCount     = 5
+	defaultMinAllocatableVolumeCount   = 5
 	defaultVolumeSliceMapNum           = 10
-	defaultListVolumeMaxCount          = 500
+	defaultListVolumeMaxCount          = 2000
+	defaultAllocFactor                 = 5
+	defaultAllocatableSize             = 1 << 30
 )
 
 // notify queue key definition
@@ -327,7 +329,7 @@ func (v *VolumeMgr) AllocVolume(ctx context.Context, mode codemode.CodeMode, cou
 	data, err := json.Marshal(allocArgs)
 	if err != nil {
 		isAllocSucc = false
-		span.Errorf("marshal data error,args:%#v", allocArgs)
+		span.Errorf("marshal data error,args:%+v", allocArgs)
 		return nil, err
 	}
 
@@ -342,7 +344,7 @@ func (v *VolumeMgr) AllocVolume(ctx context.Context, mode codemode.CodeMode, cou
 	value, _ := v.pendingEntries.Load(pendingKey)
 	if value == nil {
 		isAllocSucc = false
-		span.Errorf("load pending entry error")
+		span.Error("load pending entry error")
 		return nil, errors.New("propose success without set pending key")
 	}
 	ret = value.(*cm.AllocatedVolumeInfos)
@@ -365,6 +367,7 @@ func (v *VolumeMgr) AllocVolume(ctx context.Context, mode codemode.CodeMode, cou
 	}
 
 	if len(allocatedVidM) == 0 {
+		span.Errorf("no available volume, alloc args:%+v, alloc volume is:%d", allocArgs, len(ret.AllocVolumeInfos))
 		return nil, apierrors.ErrNoAvailableVolume
 	}
 
@@ -456,7 +459,13 @@ func (v *VolumeMgr) UnlockVolume(ctx context.Context, vid proto.Vid) error {
 	}
 
 	vol.lock.RLock()
-	if !vol.canUnlock() {
+	status := vol.getStatus()
+	if status == proto.VolumeStatusUnlocking || status == proto.VolumeStatusIdle {
+		vol.lock.RUnlock()
+		return nil
+	}
+
+	if status == proto.VolumeStatusActive {
 		vol.lock.RUnlock()
 		span.Warnf("can't unlock volume, volume %d, current status(%d)", vid, vol.getStatus())
 		return apierrors.ErrUnlockNotAllow
@@ -480,6 +489,7 @@ func (v *VolumeMgr) UnlockVolume(ctx context.Context, vid proto.Vid) error {
 		span.Errorf("raft propose error:%v", err)
 		return apierrors.ErrRaftPropose
 	}
+
 	return nil
 }
 
@@ -519,16 +529,14 @@ func (v *VolumeMgr) applyRetainVolume(ctx context.Context, retainVolTokens []cm.
 			span.Errorf("vid is nil,:%s decode error", retainVol.Token)
 			return errors.Info(ErrVolumeNotExist, "get volume failed").Detail(ErrVolumeNotExist)
 		}
-		vol.lock.RLock()
+
+		vol.lock.Lock()
 		if vol.token == nil {
-			vol.lock.RUnlock()
-			// each volume has a tokenID, one tokenID mismatch do not affect other volume
+			vol.lock.Unlock()
 			span.Errorf("volume not alloc,can not alloc:%d", vid)
 			return ErrVolumeNotAlloc
 		}
-		vol.lock.RUnlock()
 
-		vol.lock.Lock()
 		tokenRecord := &volumedb.TokenRecord{
 			Vid:        vid,
 			TokenID:    retainVol.Token,
@@ -571,8 +579,8 @@ func (v *VolumeMgr) applyAllocVolume(ctx context.Context, vid proto.Vid, host st
 
 	allocatableScoreThreshold := volume.getScoreThreshold()
 	// when propose data, volume status may change , check to ensure volume can alloc,
-	if !volume.canAlloc(v.FreezeThreshold, allocatableScoreThreshold) {
-		span.Debugf("volume can not alloc,volume info is %+v", volume.volInfoBase)
+	if !volume.canAlloc(v.AllocatableSize, allocatableScoreThreshold) {
+		span.Warnf("volume can not alloc,volume info is %+v", volume.volInfoBase)
 		volume.lock.Unlock()
 		return
 	}
@@ -621,12 +629,12 @@ func (v *VolumeMgr) applyExpireVolume(ctx context.Context, vids []proto.Vid) (er
 		vol.lock.Lock()
 		if vol.getStatus() == proto.VolumeStatusIdle {
 			vol.lock.Unlock()
-			return nil
+			continue
 		}
 		// double check if expired
 		if !vol.isExpired() {
 			vol.lock.Unlock()
-			return nil
+			continue
 		}
 
 		span.Debugf("volume info:  %#v expired,token is %#v", vol.volInfoBase, vol.token)
@@ -690,6 +698,7 @@ func (v *VolumeMgr) applyAdminUpdateVolumeUnit(ctx context.Context, unitInfo *cm
 	}
 	diskInfo, err := v.diskMgr.GetDiskInfo(ctx, unitInfo.DiskID)
 	if err != nil {
+		vol.lock.Unlock()
 		return err
 	}
 	vol.vUnits[index].vuInfo.DiskID = diskInfo.DiskID

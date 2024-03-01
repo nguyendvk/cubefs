@@ -52,9 +52,7 @@ const (
 type RPCConnectMode uint8
 
 // timeout: [short - - - - - - - - -> long]
-//
-//	quick --> general --> default --> slow --> nolimit
-//
+//       quick --> general --> default --> slow --> nolimit
 // speed: 40MB -->  20MB   -->  10MB   --> 4MB  --> nolimit
 const (
 	DefaultConnMode RPCConnectMode = iota
@@ -387,11 +385,6 @@ func getClient(cfg *Config, hosts []string) rpc.Client {
 	return rpc.NewLbClient(lbConfig, nil)
 }
 
-/*
-access.API.Put
-- nếu Size <= MaxSizePutOnce: putObject
-- else: putParts
-*/
 func (c *client) Put(ctx context.Context, args *PutArgs) (location Location, hashSumMap HashSumMap, err error) {
 	if args.Size == 0 {
 		hashSumMap := args.Hashes.ToHashSumMap()
@@ -408,8 +401,6 @@ func (c *client) Put(ctx context.Context, args *PutArgs) (location Location, has
 	return c.putParts(ctx, args)
 }
 
-// send put request to access server
-// endpoint handler at:  blobstore/access/server.go: func (s *Service) Put(c *rpc.Context)
 func (c *client) putObject(ctx context.Context, args *PutArgs) (location Location, hashSumMap HashSumMap, err error) {
 	rpcClient := c.rpcClient.Load().(rpc.Client)
 
@@ -508,9 +499,6 @@ func (c *client) readerPipeline(span trace.Span, reqBody io.Reader,
 	return ch
 }
 
-/*
-TODO:
-*/
 func (c *client) putParts(ctx context.Context, args *PutArgs) (Location, HashSumMap, error) {
 	span := trace.SpanFromContextSafe(ctx)
 	rpcClient := c.rpcClient.Load().(rpc.Client)
@@ -743,6 +731,9 @@ func (c *client) Get(ctx context.Context, args *GetArgs) (body io.ReadCloser, er
 	resp, err := rpcClient.Post(ctx, "/get", args)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		return nil, rpc.NewError(resp.StatusCode, "StatusCode", fmt.Errorf("code: %d", resp.StatusCode))
 	}
 
 	return resp.Body, nil

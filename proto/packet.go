@@ -112,6 +112,19 @@ const (
 	OpRemoveMetaPartitionRaftMember uint8 = 0x47
 	OpMetaPartitionTryToLeader      uint8 = 0x48
 
+	// Quota
+	OpMetaBatchSetInodeQuota    uint8 = 0x50
+	OpMetaBatchDeleteInodeQuota uint8 = 0x51
+	OpMetaGetInodeQuota         uint8 = 0x52
+	OpQuotaCreateInode          uint8 = 0x53
+	OpQuotaCreateDentry         uint8 = 0x54
+
+	//backUp
+	OpBatchLockNormalExtent   uint8 = 0x57
+	OpBatchUnlockNormalExtent uint8 = 0x58
+	OpBackupRead              uint8 = 0x59
+	OpBackupWrite             uint8 = 0x5A
+
 	// Operations: Master -> DataNode
 	OpCreateDataPartition           uint8 = 0x60
 	OpDeleteDataPartition           uint8 = 0x61
@@ -132,7 +145,8 @@ const (
 	OpRemoveMultipart  uint8 = 0x73
 	OpListMultiparts   uint8 = 0x74
 
-	OpBatchDeleteExtent uint8 = 0x75 // SDK to MetaNode
+	OpBatchDeleteExtent   uint8 = 0x75 // SDK to MetaNode
+	OpGcBatchDeleteExtent uint8 = 0x76 // SDK to MetaNode
 
 	//Operations: MetaNode Leader -> MetaNode Follower
 	OpMetaBatchDeleteInode  uint8 = 0x90
@@ -140,7 +154,26 @@ const (
 	OpMetaBatchUnlinkInode  uint8 = 0x92
 	OpMetaBatchEvictInode   uint8 = 0x93
 
+	//Transaction Operations: Client -> MetaNode.
+	OpMetaTxCreate       uint8 = 0xA0
+	OpMetaTxCreateInode  uint8 = 0xA1
+	OpMetaTxUnlinkInode  uint8 = 0xA2
+	OpMetaTxCreateDentry uint8 = 0xA3
+	OpTxCommit           uint8 = 0xA4
+	OpTxRollback         uint8 = 0xA5
+	OpTxCommitRM         uint8 = 0xA6
+	OpTxRollbackRM       uint8 = 0xA7
+	OpMetaTxDeleteDentry uint8 = 0xA8
+	OpMetaTxUpdateDentry uint8 = 0xA9
+	OpMetaTxLinkInode    uint8 = 0xAA
+	OpMetaTxGet          uint8 = 0xAB
+
+	//Operations: Client -> MetaNode.
+	OpMetaGetUniqID uint8 = 0xAC
+
 	// Commons
+	OpNoSpaceErr         uint8 = 0xEE
+	OpDirQuota           uint8 = 0xF1
 	OpConflictExtentsErr uint8 = 0xF2
 	OpIntraGroupNetErr   uint8 = 0xF3
 	OpArgMismatchErr     uint8 = 0xF4
@@ -153,12 +186,13 @@ const (
 	OpInodeFullErr       uint8 = 0xFB
 	OpTryOtherAddr       uint8 = 0xFC
 	OpNotPerm            uint8 = 0xFD
-	OpNotEmtpy           uint8 = 0xFE
+	OpNotEmpty           uint8 = 0xFE
 	OpOk                 uint8 = 0xF0
 
-	OpPing            uint8 = 0xFF
-	OpMetaUpdateXAttr uint8 = 0x3B
-	OpMetaReadDirOnly uint8 = 0x3C
+	OpPing                  uint8 = 0xFF
+	OpMetaUpdateXAttr       uint8 = 0x3B
+	OpMetaReadDirOnly       uint8 = 0x3C
+	OpUploadPartConflictErr uint8 = 0x3D
 
 	// ebs obj meta
 	OpMetaObjExtentAdd       uint8 = 0xDD
@@ -166,12 +200,31 @@ const (
 	OpMetaExtentsEmpty       uint8 = 0xDF
 	OpMetaBatchObjExtentsAdd uint8 = 0xD0
 	OpMetaClearInodeCache    uint8 = 0xD1
+	OpMetaBatchSetXAttr      uint8 = 0xD2
+	OpMetaGetAllXAttr        uint8 = 0xD3
+
+	//transaction error
+	OpTxInodeInfoNotExistErr  uint8 = 0xE0
+	OpTxConflictErr           uint8 = 0xE1
+	OpTxDentryInfoNotExistErr uint8 = 0xE2
+	OpTxRbInodeNotExistErr    uint8 = 0xE3
+	OpTxRbDentryNotExistErr   uint8 = 0xE4
+	OpTxInfoNotExistErr       uint8 = 0xE5
+	OpTxInternalErr           uint8 = 0xE6
+	OpTxCommitItemErr         uint8 = 0xE7
+	OpTxRollbackItemErr       uint8 = 0xE8
+	OpTxRollbackUnknownRbType uint8 = 0xE9
+	OpTxTimeoutErr            uint8 = 0xEA
+	OpTxSetStateErr           uint8 = 0xEB
+	OpTxCommitErr             uint8 = 0xEC
+	OpTxRollbackErr           uint8 = 0xED
+	OpTxUnknownOp             uint8 = 0xEE
 )
 
 const (
 	WriteDeadlineTime                         = 5
 	ReadDeadlineTime                          = 5
-	SyncSendTaskDeadlineTime                  = 20
+	SyncSendTaskDeadlineTime                  = 30
 	NoReadDeadlineTime                        = -1
 	BatchDeleteExtentReadDeadLineTime         = 120
 	GetAllWatermarksDeadLineTime              = 60
@@ -225,6 +278,19 @@ func NewPacketReqID() *Packet {
 	return p
 }
 
+func (p *Packet) GetCopy() *Packet {
+	newPacket := NewPacket()
+	newPacket.ReqID = p.ReqID
+	newPacket.Opcode = p.Opcode
+	newPacket.PartitionID = p.PartitionID
+
+	newPacket.Data = make([]byte, p.Size)
+	copy(newPacket.Data[:p.Size], p.Data)
+
+	newPacket.Size = p.Size
+	return newPacket
+}
+
 func (p *Packet) String() string {
 	return fmt.Sprintf("ReqID(%v)Op(%v)PartitionID(%v)ResultCode(%v)", p.ReqID, p.GetOpMsg(), p.PartitionID, p.GetResultMsg())
 }
@@ -275,12 +341,16 @@ func (p *Packet) GetOpMsg() (m string) {
 		m = "IntraGroupNetErr"
 	case OpMetaCreateInode:
 		m = "OpMetaCreateInode"
+	case OpQuotaCreateInode:
+		m = "OpQuotaCreateInode"
 	case OpMetaUnlinkInode:
 		m = "OpMetaUnlinkInode"
 	case OpMetaBatchUnlinkInode:
 		m = "OpMetaBatchUnlinkInode"
 	case OpMetaCreateDentry:
 		m = "OpMetaCreateDentry"
+	case OpQuotaCreateDentry:
+		m = "OpQuotaCreateDentry"
 	case OpMetaDeleteDentry:
 		m = "OpMetaDeleteDentry"
 	case OpMetaOpen:
@@ -409,10 +479,54 @@ func (p *Packet) GetOpMsg() (m string) {
 		m = "OpListMultiparts"
 	case OpBatchDeleteExtent:
 		m = "OpBatchDeleteExtent"
+	case OpGcBatchDeleteExtent:
+		m = "OpGcBatchDeleteExtent"
 	case OpMetaClearInodeCache:
 		m = "OpMetaClearInodeCache"
+	case OpMetaTxCreateInode:
+		m = "OpMetaTxCreateInode"
+	case OpMetaTxCreateDentry:
+		m = "OpMetaTxCreateDentry"
+	case OpTxCommit:
+		m = "OpTxCommit"
+	case OpMetaTxCreate:
+		m = "OpMetaTxCreate"
+	case OpTxRollback:
+		m = "OpTxRollback"
+	case OpTxCommitRM:
+		m = "OpTxCommitRM"
+	case OpTxRollbackRM:
+		m = "OpTxRollbackRM"
+	case OpMetaTxDeleteDentry:
+		m = "OpMetaTxDeleteDentry"
+	case OpMetaTxUnlinkInode:
+		m = "OpMetaTxUnlinkInode"
+	case OpMetaTxUpdateDentry:
+		m = "OpMetaTxUpdateDentry"
+	case OpMetaTxLinkInode:
+		m = "OpMetaTxLinkInode"
+	case OpMetaTxGet:
+		m = "OpMetaTxGet"
+	case OpMetaBatchSetInodeQuota:
+		m = "OpMetaBatchSetInodeQuota"
+	case OpMetaBatchDeleteInodeQuota:
+		m = "OpMetaBatchDeleteInodeQuota"
+	case OpMetaGetInodeQuota:
+		m = "OpMetaGetInodeQuota"
+	case OpBackupRead:
+		m = "OpBackupRead"
+	case OpBatchLockNormalExtent:
+		m = "OpBatchLockNormalExtent"
+	case OpBatchUnlockNormalExtent:
+		m = "OpBatchUnlockNormalExtent"
 	}
 	return
+}
+
+func GetStatusStr(status uint8) string {
+	pkt := &Packet{}
+	pkt.ResultCode = status
+	return pkt.GetResultMsg()
 }
 
 // GetResultMsg returns the result message.
@@ -448,8 +562,42 @@ func (p *Packet) GetResultMsg() (m string) {
 		m = "TryOtherAddr"
 	case OpNotPerm:
 		m = "NotPerm"
-	case OpNotEmtpy:
+	case OpNotEmpty:
 		m = "DirNotEmpty"
+	case OpDirQuota:
+		m = "OpDirQuota"
+	case OpNoSpaceErr:
+		m = "NoSpaceErr"
+	case OpTxInodeInfoNotExistErr:
+		m = "OpTxInodeInfoNotExistErr"
+	case OpTxConflictErr:
+		m = "TransactionConflict"
+	case OpTxDentryInfoNotExistErr:
+		m = "OpTxDentryInfoNotExistErr"
+	case OpTxRbInodeNotExistErr:
+		m = "OpTxRbInodeNotExistEr"
+	case OpTxRbDentryNotExistErr:
+		m = "OpTxRbDentryNotExistEr"
+	case OpTxInfoNotExistErr:
+		m = "OpTxInfoNotExistErr"
+	case OpTxInternalErr:
+		m = "OpTxInternalErr"
+	case OpTxCommitItemErr:
+		m = "OpTxCommitItemErr"
+	case OpTxRollbackItemErr:
+		m = "OpTxRollbackItemErr"
+	case OpTxRollbackUnknownRbType:
+		m = "OpTxRollbackUnknownRbType"
+	case OpTxTimeoutErr:
+		m = "OpTxTimeoutErr"
+	case OpTxSetStateErr:
+		m = "OpTxSetStateErr"
+	case OpTxCommitErr:
+		m = "OpTxCommitErr"
+	case OpTxRollbackErr:
+		m = "OpTxRollbackErr"
+	case OpUploadPartConflictErr:
+		m = "OpUploadPartConflictErr"
 	default:
 		return fmt.Sprintf("Unknown ResultCode(%v)", p.ResultCode)
 	}
@@ -597,7 +745,8 @@ func (p *Packet) ReadFromConn(c net.Conn, timeoutSec int) (err error) {
 		return syscall.EBADMSG
 	}
 	size := p.Size
-	if (p.Opcode == OpRead || p.Opcode == OpStreamRead || p.Opcode == OpExtentRepairRead || p.Opcode == OpStreamFollowerRead) && p.ResultCode == OpInitResultCode {
+	if (p.Opcode == OpRead || p.Opcode == OpStreamRead || p.Opcode == OpExtentRepairRead || p.Opcode == OpStreamFollowerRead ||
+		p.Opcode == OpBackupRead) && p.ResultCode == OpInitResultCode {
 		size = 0
 	}
 	p.Data = make([]byte, size)
@@ -623,6 +772,14 @@ func (p *Packet) PacketOkWithBody(reply []byte) {
 	p.Size = uint32(len(reply))
 	p.Data = make([]byte, p.Size)
 	copy(p.Data[:p.Size], reply)
+	p.ResultCode = OpOk
+	p.ArgLen = 0
+}
+
+// attention use for tmp byte arr, eg: json marshal data
+func (p *Packet) PacketOkWithByte(reply []byte) {
+	p.Size = uint32(len(reply))
+	p.Data = reply
 	p.ResultCode = OpOk
 	p.ArgLen = 0
 }
@@ -668,7 +825,7 @@ func (p *Packet) GetUniqueLogId() (m string) {
 			return m
 		}
 	} else if p.Opcode == OpReadTinyDeleteRecord || p.Opcode == OpNotifyReplicasToRepair || p.Opcode == OpDataNodeHeartbeat ||
-		p.Opcode == OpLoadDataPartition || p.Opcode == OpBatchDeleteExtent {
+		p.Opcode == OpLoadDataPartition || p.Opcode == OpBatchDeleteExtent || p.Opcode == OpGcBatchDeleteExtent {
 		p.mesg += fmt.Sprintf("Opcode(%v)", p.GetOpMsg())
 		return
 	} else if p.Opcode == OpBroadcastMinAppliedID || p.Opcode == OpGetAppliedId {
@@ -699,7 +856,7 @@ func (p *Packet) setPacketPrefix() {
 			return
 		}
 	} else if p.Opcode == OpReadTinyDeleteRecord || p.Opcode == OpNotifyReplicasToRepair || p.Opcode == OpDataNodeHeartbeat ||
-		p.Opcode == OpLoadDataPartition || p.Opcode == OpBatchDeleteExtent {
+		p.Opcode == OpLoadDataPartition || p.Opcode == OpBatchDeleteExtent || p.Opcode == OpGcBatchDeleteExtent {
 		p.mesg += fmt.Sprintf("Opcode(%v)", p.GetOpMsg())
 		return
 	} else if p.Opcode == OpBroadcastMinAppliedID || p.Opcode == OpGetAppliedId {
@@ -743,11 +900,19 @@ func (p *Packet) ShouldRetry() bool {
 }
 
 func (p *Packet) IsBatchDeleteExtents() bool {
-	return p.Opcode == OpBatchDeleteExtent
+	return p.Opcode == OpBatchDeleteExtent || p.Opcode == OpGcBatchDeleteExtent
 }
 
 func InitBufferPool(bufLimit int64) {
 	buf.NormalBuffersTotalLimit = bufLimit
 	buf.HeadBuffersTotalLimit = bufLimit
 	Buffers = buf.NewBufferPool()
+}
+
+func (p *Packet) IsBatchLockNormalExtents() bool {
+	return p.Opcode == OpBatchLockNormalExtent
+}
+
+func (p *Packet) IsBatchUnlockNormalExtents() bool {
+	return p.Opcode == OpBatchUnlockNormalExtent
 }

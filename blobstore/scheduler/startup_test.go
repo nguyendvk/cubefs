@@ -41,7 +41,7 @@ var (
 func runMockLeaderService(s *Service) string {
 	router := rpc.New()
 	router.Handle(http.MethodGet, api.PathStats, s.HTTPStats, rpc.OptArgsQuery())
-	router.Handle(http.MethodGet, api.PathLeaderStats, s.HTTPStats, rpc.OptArgsQuery())
+	router.Handle(http.MethodGet, api.PathStatsLeader, s.HTTPStats, rpc.OptArgsQuery())
 	router.Handle(http.MethodPost, api.PathUpdateVolume, s.HTTPUpdateVolume, rpc.OptArgsBody())
 	router.Handle(http.MethodGet, api.PathTaskAcquire, s.HTTPTaskAcquire, rpc.OptArgsQuery())
 
@@ -101,7 +101,7 @@ func newMockServiceWithOpts(ctr *gomock.Controller, isLeader bool) *Service {
 	manualMgr := NewMockMigrater(ctr)
 	balanceMgr := NewMockMigrater(ctr)
 	inspecterMgr := NewMockVolumeInspector(ctr)
-	volumeCache := NewMockVolumeCache(ctr)
+	clusterTopology := NewMockClusterTopology(ctr)
 	volumeUpdater := NewMockVolumeUpdater(ctr)
 
 	balanceMgr.EXPECT().Close().AnyTimes().Return()
@@ -116,9 +116,11 @@ func newMockServiceWithOpts(ctr *gomock.Controller, isLeader bool) *Service {
 	inspecterMgr.EXPECT().Run().AnyTimes().Return()
 	manualMgr.EXPECT().Run().AnyTimes().Return()
 
-	volumeCache.EXPECT().Load().AnyTimes().Return(nil)
-	shardRepairMgr.EXPECT().RunTask().AnyTimes().Return()
-	blobDeleteMgr.EXPECT().RunTask().AnyTimes().Return()
+	clusterTopology.EXPECT().LoadVolumes().AnyTimes().Return(nil)
+	shardRepairMgr.EXPECT().Run().AnyTimes().Return()
+	shardRepairMgr.EXPECT().Close().AnyTimes().Return()
+	blobDeleteMgr.EXPECT().Run().AnyTimes().Return()
+	blobDeleteMgr.EXPECT().Close().AnyTimes().Return()
 
 	balanceMgr.EXPECT().Load().AnyTimes().Return(nil)
 	diskRepairMgr.EXPECT().Load().AnyTimes().Return(nil)
@@ -132,10 +134,10 @@ func newMockServiceWithOpts(ctr *gomock.Controller, isLeader bool) *Service {
 	shardRepairMgr.EXPECT().GetTaskStats().AnyTimes().Return([counter.SLOT]int{}, [counter.SLOT]int{})
 	shardRepairMgr.EXPECT().Enabled().AnyTimes().Return(true)
 	diskRepairMgr.EXPECT().Stats().AnyTimes().Return(api.MigrateTasksStat{})
-	diskRepairMgr.EXPECT().Progress(any).AnyTimes().Return(proto.DiskID(1), 0, 0)
+	diskRepairMgr.EXPECT().Progress(any).AnyTimes().Return([]proto.DiskID{proto.DiskID(1)}, 0, 0)
 	diskRepairMgr.EXPECT().Enabled().AnyTimes().Return(true)
 	diskDropMgr.EXPECT().Stats().AnyTimes().Return(api.MigrateTasksStat{})
-	diskDropMgr.EXPECT().Progress(any).AnyTimes().Return(proto.DiskID(1), 0, 0)
+	diskDropMgr.EXPECT().Progress(any).AnyTimes().Return([]proto.DiskID{proto.DiskID(1)}, 0, 0)
 	diskDropMgr.EXPECT().Enabled().AnyTimes().Return(true)
 	balanceMgr.EXPECT().Stats().AnyTimes().Return(api.MigrateTasksStat{})
 	balanceMgr.EXPECT().Enabled().AnyTimes().Return(true)
@@ -147,24 +149,26 @@ func newMockServiceWithOpts(ctr *gomock.Controller, isLeader bool) *Service {
 	volumeUpdater.EXPECT().UpdateLeaderVolumeCache(any, any).AnyTimes().Return(nil)
 
 	manualMgr.EXPECT().AcquireTask(any, any).AnyTimes().Return(proto.MigrateTask{TaskType: proto.TaskTypeManualMigrate}, nil)
+	diskRepairMgr.EXPECT().AcquireTask(any, any).AnyTimes().Return(proto.MigrateTask{}, errMock)
+	diskDropMgr.EXPECT().AcquireTask(any, any).AnyTimes().Return(proto.MigrateTask{}, errMock)
+	balanceMgr.EXPECT().AcquireTask(any, any).AnyTimes().Return(proto.MigrateTask{}, errMock)
 
-	volumeCache.EXPECT().Update(any).AnyTimes().Return(&client.VolumeInfoSimple{}, nil)
-
+	clusterTopology.EXPECT().UpdateVolume(any).AnyTimes().Return(&client.VolumeInfoSimple{}, nil)
 	clusterMgrCli.EXPECT().GetConfig(any, any).AnyTimes().Return("", errMock)
-	service := &Service{
-		ClusterID:      1,
-		leader:         isLeader,
-		balanceMgr:     balanceMgr,
-		diskDropMgr:    diskDropMgr,
-		manualMigMgr:   manualMgr,
-		diskRepairMgr:  diskRepairMgr,
-		inspectMgr:     inspecterMgr,
-		shardRepairMgr: shardRepairMgr,
-		blobDeleteMgr:  blobDeleteMgr,
-		volCache:       volumeCache,
-		volumeUpdater:  volumeUpdater,
 
-		clusterMgrCli: clusterMgrCli,
+	service := &Service{
+		ClusterID:       1,
+		leader:          isLeader,
+		balanceMgr:      balanceMgr,
+		diskDropMgr:     diskDropMgr,
+		manualMigMgr:    manualMgr,
+		diskRepairMgr:   diskRepairMgr,
+		inspectMgr:      inspecterMgr,
+		shardRepairMgr:  shardRepairMgr,
+		blobDeleteMgr:   blobDeleteMgr,
+		clusterTopology: clusterTopology,
+		volumeUpdater:   volumeUpdater,
+		clusterMgrCli:   clusterMgrCli,
 	}
 	return service
 }
@@ -198,7 +202,7 @@ func TestServer(t *testing.T) {
 	kafkaOffset.EXPECT().GetConsumeOffset(any, any, any).AnyTimes().Return(int64(0), nil)
 	kafkaOffset.EXPECT().SetConsumeOffset(any, any, any, any).AnyTimes().Return(nil)
 
-	err := leaderServer.runKafkaMonitor(proto.ClusterID(1), kafkaOffset)
+	err := leaderServer.NewKafkaMonitor(proto.ClusterID(1), kafkaOffset)
 	require.Error(t, err)
 
 	hosts := []string{leaderHost, followerHost}

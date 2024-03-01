@@ -22,7 +22,7 @@ import (
 
 	api "github.com/cubefs/cubefs/blobstore/api/scheduler"
 	"github.com/cubefs/cubefs/blobstore/common/counter"
-	"github.com/cubefs/cubefs/blobstore/common/errors"
+	errcode "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/recordlog"
 	"github.com/cubefs/cubefs/blobstore/common/rpc"
@@ -31,7 +31,6 @@ import (
 	"github.com/cubefs/cubefs/blobstore/scheduler/base"
 	"github.com/cubefs/cubefs/blobstore/scheduler/client"
 	"github.com/cubefs/cubefs/blobstore/util/closer"
-	"github.com/cubefs/cubefs/blobstore/util/log"
 )
 
 const (
@@ -72,7 +71,8 @@ type Migrator interface {
 // IDisKMigrator base interface of disk migrate, such as disk repair and disk drop
 type IDisKMigrator interface {
 	Migrator
-	Progress(ctx context.Context) (repairingDiskID proto.DiskID, total, repaired int)
+	Progress(ctx context.Context) (migratingDisks []proto.DiskID, total, migrated int)
+	DiskProgress(ctx context.Context, diskID proto.DiskID) (stats *api.DiskMigratingStats, err error)
 }
 
 // IManualMigrator interface of manual migrator
@@ -85,16 +85,65 @@ type IManualMigrator interface {
 type IMigrator interface {
 	Migrator
 	// inner interface
-	SetLockFailHandleFunc(lockFailHandleFunc func(ctx context.Context, task *proto.MigrateTask))
+	SetLockFailHandleFunc(lockFailHandleFunc lockFailFunc)
+	SetClearJunkTasksWhenLoadingFunc(clearJunkTasksWhenLoadingFunc clearJunkTasksFunc)
 	GetMigratingDiskNum() int
 	IsMigratingDisk(diskID proto.DiskID) bool
 	ClearDeletedTasks(diskID proto.DiskID)
+	ClearDeletedTaskByID(diskID proto.DiskID, taskID string)
 	IsDeletedTask(task *proto.MigrateTask) bool
+	DeletedTasks() []DeletedTask
 	AddTask(ctx context.Context, task *proto.MigrateTask)
 	GetTask(ctx context.Context, taskID string) (*proto.MigrateTask, error)
 	ListAllTask(ctx context.Context) (tasks []*proto.MigrateTask, err error)
 	ListAllTaskByDiskID(ctx context.Context, diskID proto.DiskID) (tasks []*proto.MigrateTask, err error)
 	FinishTaskInAdvanceWhenLockFail(ctx context.Context, task *proto.MigrateTask)
+}
+
+type migratingDisks struct {
+	disks map[proto.DiskID]*client.DiskInfoSimple
+	sync.RWMutex
+}
+
+func newMigratingDisks() *migratingDisks {
+	return &migratingDisks{
+		disks: make(map[proto.DiskID]*client.DiskInfoSimple),
+	}
+}
+
+func (m *migratingDisks) add(diskID proto.DiskID, disk *client.DiskInfoSimple) {
+	m.Lock()
+	m.disks[diskID] = disk
+	m.Unlock()
+}
+
+func (m *migratingDisks) delete(diskID proto.DiskID) {
+	m.Lock()
+	delete(m.disks, diskID)
+	m.Unlock()
+}
+
+func (m *migratingDisks) get(diskID proto.DiskID) (disk *client.DiskInfoSimple, exist bool) {
+	m.RLock()
+	disk, exist = m.disks[diskID]
+	m.RUnlock()
+	return
+}
+
+func (m *migratingDisks) list() (disks []*client.DiskInfoSimple) {
+	m.RLock()
+	for _, disk := range m.disks {
+		disks = append(disks, disk)
+	}
+	m.RUnlock()
+	return
+}
+
+func (m *migratingDisks) size() (size int) {
+	m.RLock()
+	size = len(m.disks)
+	m.RUnlock()
+	return
 }
 
 // MigratingVuids record migrating vuid info
@@ -142,7 +191,7 @@ func (m *diskMigratingVuids) isMigratingDisk(diskID proto.DiskID) (ok bool) {
 	return
 }
 
-type migratedTasks map[string]struct{}
+type migratedTasks map[string]time.Time
 
 type diskMigratedTasks struct {
 	tasks map[proto.DiskID]migratedTasks
@@ -160,7 +209,7 @@ func (m *diskMigratedTasks) add(diskID proto.DiskID, taskID string) {
 	if m.tasks[diskID] == nil {
 		m.tasks[diskID] = make(migratedTasks)
 	}
-	m.tasks[diskID][taskID] = struct{}{}
+	m.tasks[diskID][taskID] = time.Now()
 	m.Unlock()
 }
 
@@ -177,6 +226,37 @@ func (m *diskMigratedTasks) delete(diskID proto.DiskID) {
 	m.Lock()
 	delete(m.tasks, diskID)
 	m.Unlock()
+}
+
+func (m *diskMigratedTasks) deleteByID(diskID proto.DiskID, taskID string) {
+	m.Lock()
+	tasks := m.tasks[diskID]
+	delete(tasks, taskID)
+	if len(tasks) == 0 {
+		delete(m.tasks, diskID)
+	}
+	m.Unlock()
+}
+
+type DeletedTask struct {
+	DiskID      proto.DiskID
+	TaskID      string
+	DeletedTime time.Time
+}
+
+func (m *diskMigratedTasks) list() (tasks []DeletedTask) {
+	m.RLock()
+	for diskID, deletedTasks := range m.tasks {
+		for taskID, deletedTime := range deletedTasks {
+			tasks = append(tasks, DeletedTask{
+				DiskID:      diskID,
+				TaskID:      taskID,
+				DeletedTime: deletedTime,
+			})
+		}
+	}
+	m.RUnlock()
+	return tasks
 }
 
 type migratedDisk struct {
@@ -230,6 +310,14 @@ type MigrateConfig struct {
 	base.TaskCommonConfig
 }
 
+type clearJunkTasksFunc func(ctx context.Context, tasks []*proto.MigrateTask) error
+
+var defaultClearJunkTasksWhenLoadingFunc = func(ctx context.Context, tasks []*proto.MigrateTask) error {
+	return nil
+}
+
+type lockFailFunc func(ctx context.Context, task *proto.MigrateTask)
+
 // MigrateMgr migrate manager
 type MigrateMgr struct {
 	closer.Closer
@@ -254,7 +342,9 @@ type MigrateMgr struct {
 
 	taskLogger recordlog.Encoder
 	// handle func when lock volume fail
-	lockFailHandleFunc func(ctx context.Context, task *proto.MigrateTask)
+	lockFailHandleFunc lockFailFunc
+	// clear junk tasks
+	clearJunkTasksWhenLoadingFunc clearJunkTasksFunc
 }
 
 // NewMigrateMgr returns migrate manager
@@ -283,6 +373,8 @@ func NewMigrateMgr(
 		cfg:        conf,
 		taskLogger: taskLogger,
 
+		clearJunkTasksWhenLoadingFunc: defaultClearJunkTasksWhenLoadingFunc,
+
 		Closer: closer.New(),
 	}
 
@@ -291,8 +383,13 @@ func NewMigrateMgr(
 }
 
 // SetLockFailHandleFunc set lock failed func
-func (mgr *MigrateMgr) SetLockFailHandleFunc(lockFailHandleFunc func(ctx context.Context, task *proto.MigrateTask)) {
+func (mgr *MigrateMgr) SetLockFailHandleFunc(lockFailHandleFunc lockFailFunc) {
 	mgr.lockFailHandleFunc = lockFailHandleFunc
+}
+
+// SetClearJunkTasksWhenLoadingFunc set clear junk task func
+func (mgr *MigrateMgr) SetClearJunkTasksWhenLoadingFunc(clearJunkTasksWhenLoadingFunc clearJunkTasksFunc) {
+	mgr.clearJunkTasksWhenLoadingFunc = clearJunkTasksWhenLoadingFunc
 }
 
 // Load load migrate task from database
@@ -309,7 +406,20 @@ func (mgr *MigrateMgr) Load() (err error) {
 	}
 	span.Infof("load task success: task_type[%s], tasks len[%d]", mgr.taskType, len(tasks))
 
+	if len(tasks) == 0 {
+		return
+	}
+
+	disks, err := mgr.listMigratingDisks(ctx)
+	if err != nil {
+		return
+	}
+	var junkTasks []*proto.MigrateTask
 	for i := range tasks {
+		if mgr.isJunkTask(disks, tasks[i]) {
+			junkTasks = append(junkTasks, tasks[i])
+			continue
+		}
 		if tasks[i].Running() {
 			err = base.VolTaskLockerInst().TryLock(ctx, tasks[i].SourceVuid.Vid())
 			if err != nil {
@@ -334,7 +444,34 @@ func (mgr *MigrateMgr) Load() (err error) {
 			return fmt.Errorf("unexpect migrate state: task[%+v]", tasks[i])
 		}
 	}
-	return
+	return mgr.clearJunkTasksWhenLoadingFunc(ctx, junkTasks)
+}
+
+func (mgr *MigrateMgr) isJunkTask(disks *migratingDisks, task *proto.MigrateTask) bool {
+	switch mgr.taskType {
+	case proto.TaskTypeDiskDrop:
+		if _, ok := disks.get(task.SourceDiskID); !ok {
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+func (mgr *MigrateMgr) listMigratingDisks(ctx context.Context) (*migratingDisks, error) {
+	switch mgr.taskType {
+	case proto.TaskTypeDiskDrop:
+		migratingDisks, err := mgr.clusterMgrCli.ListMigratingDisks(ctx, mgr.taskType)
+		if err != nil {
+			return nil, err
+		}
+		disks := newMigratingDisks()
+		for _, disk := range migratingDisks {
+			disks.add(disk.Disk.DiskID, disk.Disk)
+		}
+		return disks, nil
+	}
+	return nil, nil
 }
 
 // Run run migrate task do prepare and finish task phase
@@ -353,7 +490,6 @@ func (mgr *MigrateMgr) prepareTaskLoop() {
 		}
 		err := mgr.prepareTask()
 		if err == base.ErrNoTaskInQueue {
-			log.Debug("no task in prepare queue and sleep")
 			time.Sleep(prepareMigrateTaskInterval)
 		}
 	}
@@ -420,7 +556,8 @@ func (mgr *MigrateMgr) prepareTask() (err error) {
 	// lock volume
 	err = mgr.clusterMgrCli.LockVolume(ctx, migTask.SourceVuid.Vid())
 	if err != nil {
-		if rpc.DetectStatusCode(err) == errors.CodeLockNotAllow && mgr.lockFailHandleFunc != nil {
+		if rpc.DetectStatusCode(err) == errcode.CodeLockNotAllow && mgr.lockFailHandleFunc != nil {
+			// disk drop lockFailHandleFunc is nil, and can not finished in advance
 			mgr.lockFailHandleFunc(ctx, migTask)
 			return nil
 		}
@@ -458,7 +595,6 @@ func (mgr *MigrateMgr) finishTaskLoop() {
 		mgr.taskSwitch.WaitEnable()
 		err := mgr.finishTask()
 		if err == base.ErrNoTaskInQueue {
-			log.Debug("no task in finish queue and sleep")
 			time.Sleep(finishMigrateTaskInterval)
 		}
 	}
@@ -512,7 +648,7 @@ func (mgr *MigrateMgr) finishTask() (err error) {
 		// to avoid affecting the deletion process due to caching the old mapping relationship.
 		// If the update is successful, continue with the following process, and return err it fails.
 		httpCode := rpc.DetectStatusCode(err)
-		if httpCode != errors.CodeVuidNotFound && httpCode != errors.CodeDiskBroken {
+		if httpCode != errcode.CodeVuidNotFound && httpCode != errcode.CodeDiskBroken {
 			err = mgr.updateVolumeCache(ctx, migrateTask)
 			if err != nil {
 				return base.ErrUpdateVolumeCache
@@ -598,7 +734,7 @@ func (mgr *MigrateMgr) handleUpdateVolMappingFail(ctx context.Context, task *pro
 	span.Infof("handle update vol mapping failed: task_id[%s], state[%d], dest vuid[%d]", task.TaskID, task.State, task.Destination.Vuid)
 
 	code := rpc.DetectStatusCode(err)
-	if code == errors.CodeOldVuidNotMatch {
+	if code == errcode.CodeOldVuidNotMatch {
 		span.Panicf("change volume unit relationship failed: old vuid not match")
 	}
 
@@ -630,14 +766,27 @@ func (mgr *MigrateMgr) handleUpdateVolMappingFail(ctx context.Context, task *pro
 // ClearDeletedTasks clear tasks when disk is migrated
 func (mgr *MigrateMgr) ClearDeletedTasks(diskID proto.DiskID) {
 	switch mgr.taskType {
-	case proto.TaskTypeDiskDrop: // only disk drop task need to add
+	case proto.TaskTypeDiskDrop: // only disk drop task need to clear by disk
 		mgr.deletedTasks.delete(diskID)
+	}
+}
+
+// ClearDeletedTaskByID clear migrated task
+func (mgr *MigrateMgr) ClearDeletedTaskByID(diskID proto.DiskID, taskID string) {
+	switch mgr.taskType {
+	case proto.TaskTypeBalance: // only balance task need to clear by id
+		mgr.deletedTasks.deleteByID(diskID, taskID)
 	}
 }
 
 // IsDeletedTask return true if the task is deleted
 func (mgr *MigrateMgr) IsDeletedTask(task *proto.MigrateTask) bool {
 	return mgr.deletedTasks.exits(task.SourceDiskID, task.TaskID)
+}
+
+// DeletedTasks returns deleted tasks
+func (mgr *MigrateMgr) DeletedTasks() []DeletedTask {
+	return mgr.deletedTasks.list()
 }
 
 func (mgr *MigrateMgr) addMigratingVuid(diskID proto.DiskID, vuid proto.Vuid, taskID string) {
@@ -656,7 +805,7 @@ func (mgr *MigrateMgr) deleteMigratingVuid(diskID proto.DiskID, vuid proto.Vuid)
 
 func (mgr *MigrateMgr) addDeletedTask(task *proto.MigrateTask) {
 	switch mgr.taskType {
-	case proto.TaskTypeDiskDrop: // only disk drop task need to add
+	case proto.TaskTypeDiskDrop, proto.TaskTypeBalance: // only disk drop and balance task need to add
 		mgr.deletedTasks.add(task.SourceDiskID, task.TaskID)
 	}
 }

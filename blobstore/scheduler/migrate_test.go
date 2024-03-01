@@ -40,6 +40,12 @@ var MockMigrateVolInfoMap = map[proto.Vid]*client.VolumeInfoSimple{
 	104: MockGenVolInfo(104, codemode.EC6P6, proto.VolumeStatusLock),
 	105: MockGenVolInfo(105, codemode.EC6P6, proto.VolumeStatusActive),
 
+	110: MockGenVolInfo(110, codemode.EC6P6, proto.VolumeStatusIdle),
+	111: MockGenVolInfo(111, codemode.EC6P6, proto.VolumeStatusIdle),
+	112: MockGenVolInfo(112, codemode.EC6P6, proto.VolumeStatusIdle),
+	113: MockGenVolInfo(113, codemode.EC6P6, proto.VolumeStatusIdle),
+	114: MockGenVolInfo(114, codemode.EC6P6, proto.VolumeStatusIdle),
+
 	300: MockGenVolInfo(300, codemode.EC6P6, proto.VolumeStatusIdle),
 	301: MockGenVolInfo(301, codemode.EC6P10L2, proto.VolumeStatusIdle),
 	302: MockGenVolInfo(302, codemode.EC6P10L2, proto.VolumeStatusActive),
@@ -110,6 +116,20 @@ func TestMigrateMigrateLoad(t *testing.T) {
 		mgr.clusterMgrCli.(*MockClusterMgrAPI).EXPECT().ListAllMigrateTasks(any, any).Return([]*proto.MigrateTask{t4}, nil)
 		err = mgr.Load()
 		require.Error(t, err)
+	}
+	{
+		mgr := newMigrateMgr(t)
+		mgr.taskType = proto.TaskTypeDiskDrop
+
+		t1 := mockGenMigrateTask(proto.TaskTypeDiskDrop, "z0", 1, 110, proto.MigrateStateInited, MockMigrateVolInfoMap)
+		t2 := mockGenMigrateTask(proto.TaskTypeDiskDrop, "z0", 2, 111, proto.MigrateStatePrepared, MockMigrateVolInfoMap)
+		t3 := mockGenMigrateTask(proto.TaskTypeDiskDrop, "z1", 3, 112, proto.MigrateStateWorkCompleted, MockMigrateVolInfoMap)
+		t4 := mockGenMigrateTask(proto.TaskTypeDiskDrop, "z0", 4, 113, proto.MigrateStateInited, MockMigrateVolInfoMap)
+
+		mgr.clusterMgrCli.(*MockClusterMgrAPI).EXPECT().ListAllMigrateTasks(any, any).Return([]*proto.MigrateTask{t1, t2, t3, t4}, nil)
+		mgr.clusterMgrCli.(*MockClusterMgrAPI).EXPECT().ListMigratingDisks(any, any).Return([]*client.MigratingDiskMeta{{Disk: testDisk1}, {Disk: testDisk2}}, nil)
+		err := mgr.Load()
+		require.NoError(t, err)
 	}
 }
 
@@ -533,7 +553,14 @@ func TestDeletedTasks(t *testing.T) {
 			SourceDiskID: diskID1,
 		}
 		mgr.addDeletedTask(task1)
+		require.True(t, mgr.IsDeletedTask(task1))
+		require.Equal(t, 1, len(mgr.DeletedTasks()))
+
+		mgr.ClearDeletedTaskByID(task1.SourceDiskID, task1.TaskID)
+		require.Equal(t, 0, len(mgr.DeletedTasks()))
 		require.False(t, mgr.IsDeletedTask(task1))
+
+		mgr.ClearDeletedTaskByID(task1.SourceDiskID, task1.TaskID)
 	}
 }
 

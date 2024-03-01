@@ -15,8 +15,10 @@
 package master
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cubefs/cubefs/util/log"
@@ -33,6 +35,7 @@ type DataNode struct {
 	ID                        uint64
 	ZoneName                  string `json:"Zone"`
 	Addr                      string
+	DomainAddr                string
 	ReportTime                time.Time
 	StartTime                 int64
 	LastUpdateTime            time.Time
@@ -48,6 +51,7 @@ type DataNode struct {
 	NodeSetID                 uint64
 	PersistenceDataPartitions []uint64
 	BadDisks                  []string
+	DecommissionedDisks       sync.Map
 	ToBeOffline               bool
 	RdOnly                    bool
 	MigrateLock               sync.RWMutex
@@ -55,6 +59,15 @@ type DataNode struct {
 	QosIopsWLimit             uint64
 	QosFlowRLimit             uint64
 	QosFlowWLimit             uint64
+	DecommissionStatus        uint32
+	DecommissionDstAddr       string
+	DecommissionRaftForce     bool
+	DecommissionRetry         uint8
+	DecommissionDpTotal       int
+	DecommissionLimit         int
+	DecommissionTerm          uint64
+	DecommissionCompleteTime  int64
+	DpCntLimit                DpCountLimiter `json:"-"` // max count of data partition in a data node
 }
 
 func newDataNode(addr, zoneName, clusterID string) (dataNode *DataNode) {
@@ -65,6 +78,10 @@ func newDataNode(addr, zoneName, clusterID string) (dataNode *DataNode) {
 	dataNode.ZoneName = zoneName
 	dataNode.LastUpdateTime = time.Now().Add(-time.Minute)
 	dataNode.TaskManager = newAdminTaskManager(dataNode.Addr, clusterID)
+	dataNode.DecommissionStatus = DecommissionInitial
+	dataNode.DecommissionTerm = 0
+	dataNode.DecommissionDpTotal = InvalidDecommissionDpCnt
+	dataNode.DpCntLimit = newDpCountLimiter(nil)
 	return
 }
 
@@ -96,6 +113,7 @@ func (dataNode *DataNode) badPartitions(diskPath string, c *Cluster) (partitions
 func (dataNode *DataNode) updateNodeMetric(resp *proto.DataNodeHeartbeatResponse) {
 	dataNode.Lock()
 	defer dataNode.Unlock()
+	dataNode.DomainAddr = util.ParseIpAddrToDomainAddr(dataNode.Addr)
 	dataNode.Total = resp.Total
 	dataNode.Used = resp.Used
 	if dataNode.AvailableSpace > resp.Available ||
@@ -151,6 +169,7 @@ func (dataNode *DataNode) canAllocDp() bool {
 	}
 
 	if dataNode.ToBeOffline {
+		log.LogWarnf("action[canAllocDp] dataNode [%v] is offline ", dataNode.Addr)
 		return false
 	}
 
@@ -161,8 +180,12 @@ func (dataNode *DataNode) canAllocDp() bool {
 	return true
 }
 
+func (dataNode *DataNode) GetDpCntLimit() uint32 {
+	return uint32(dataNode.DpCntLimit.GetCntLimit())
+}
+
 func (dataNode *DataNode) dpCntInLimit() bool {
-	return dataNode.DataPartitionCount <= dpCntOneNodeLimit()
+	return dataNode.DataPartitionCount <= dataNode.GetDpCntLimit()
 }
 
 func (dataNode *DataNode) isWriteAbleWithSize(size uint64) (ok bool) {
@@ -227,4 +250,198 @@ func (dataNode *DataNode) createHeartbeatTask(masterAddr string, enableDiskQos b
 	request.QosFlowWriteLimit = dataNode.QosFlowWLimit
 	task = proto.NewAdminTask(proto.OpDataNodeHeartbeat, dataNode.Addr, request)
 	return
+}
+
+func (dataNode *DataNode) addDecommissionedDisk(diskPath string) (exist bool) {
+	_, exist = dataNode.DecommissionedDisks.LoadOrStore(diskPath, struct{}{})
+	log.LogInfof("action[addDecommissionedDisk] finish, exist[%v], decommissioned disk[%v], dataNode[%v]", exist, diskPath, dataNode.Addr)
+	return
+}
+
+func (dataNode *DataNode) deleteDecommissionedDisk(diskPath string) (exist bool) {
+	_, exist = dataNode.DecommissionedDisks.LoadAndDelete(diskPath)
+	log.LogInfof("action[deleteDecommissionedDisk] finish, exist[%v], decommissioned disk[%v], dataNode[%v]", exist, diskPath, dataNode.Addr)
+	return
+}
+
+func (dataNode *DataNode) getDecommissionedDisks() (decommissionedDisks []string) {
+	dataNode.DecommissionedDisks.Range(func(key, value interface{}) bool {
+		if diskPath, ok := key.(string); ok {
+			decommissionedDisks = append(decommissionedDisks, diskPath)
+		}
+		return true
+	})
+	return
+}
+
+func (dataNode *DataNode) updateDecommissionStatus(c *Cluster, debug bool) (uint32, float64) {
+	var (
+		progress            float64
+		totalNum            = dataNode.DecommissionDpTotal
+		partitionIds        []uint64
+		failedPartitionIds  []uint64
+		runningPartitionIds []uint64
+		preparePartitionIds []uint64
+		stopPartitionIds    []uint64
+	)
+	if dataNode.GetDecommissionStatus() == DecommissionInitial {
+		return DecommissionInitial, float64(0)
+	}
+	//not enter running status
+	if dataNode.DecommissionRetry >= defaultDecommissionRetryLimit {
+		dataNode.markDecommissionFail()
+		return DecommissionFail, float64(0)
+	}
+
+	if dataNode.GetDecommissionStatus() == markDecommission {
+		return markDecommission, float64(0)
+	}
+
+	if totalNum == InvalidDecommissionDpCnt && dataNode.GetDecommissionStatus() == DecommissionFail {
+		return DecommissionFail, float64(0)
+	}
+
+	if dataNode.GetDecommissionStatus() == DecommissionSuccess {
+		return DecommissionSuccess, float64(1)
+	}
+
+	if dataNode.GetDecommissionStatus() == DecommissionStop {
+		return DecommissionStop, float64(0)
+	}
+	defer func() {
+		c.syncUpdateDataNode(dataNode)
+	}()
+
+	//Get all dp on this dataNode
+	failedNum := 0
+	runningNum := 0
+	prepareNum := 0
+	stopNum := 0
+	partitions := c.getAllDecommissionDataPartitionByDataNodeAndTerm(dataNode.Addr, dataNode.DecommissionTerm)
+	//log.LogDebugf("action[updateDecommissionDataNodeStatus] partitions len %v", len(partitions))
+	//only failed or stopped or markDeleted
+	if len(partitions) == 0 {
+		dataNode.markDecommissionSuccess()
+		return DecommissionSuccess, float64(1)
+	}
+
+	for _, dp := range partitions {
+		if dp.IsDecommissionFailed() {
+			failedNum++
+			failedPartitionIds = append(failedPartitionIds, dp.PartitionID)
+		}
+		if dp.GetDecommissionStatus() == DecommissionRunning {
+			runningNum++
+			runningPartitionIds = append(runningPartitionIds, dp.PartitionID)
+		}
+		if dp.GetDecommissionStatus() == DecommissionPrepare {
+			prepareNum++
+			preparePartitionIds = append(preparePartitionIds, dp.PartitionID)
+		}
+		//datanode may stop before and will be counted into partitions
+		if dp.GetDecommissionStatus() == DecommissionStop {
+			stopNum++
+			stopPartitionIds = append(stopPartitionIds, dp.PartitionID)
+		}
+		partitionIds = append(partitionIds, dp.PartitionID)
+	}
+	progress = float64(totalNum-len(partitions)+stopNum) / float64(totalNum)
+	if debug {
+		log.LogInfof("action[updateDecommissionDataNodeStatus]dataNode[%v] progress[%v] totalNum[%v] "+
+			"partitionIds[%v] FailedNum[%v] failedPartitionIds[%v], runningNum[%v] runningDp[%v], prepareNum[%v] prepareDp[%v] "+
+			"stopNum[%v] stopPartitionIds[%v]",
+			dataNode.Addr, progress, totalNum, partitionIds, failedNum, failedPartitionIds, runningNum, runningPartitionIds,
+			prepareNum, preparePartitionIds, stopNum, stopPartitionIds)
+	}
+
+	if failedNum >= (len(partitions) - stopNum) {
+		dataNode.markDecommissionFail()
+		return DecommissionFail, progress
+	}
+	return dataNode.GetDecommissionStatus(), progress
+}
+
+func (dataNode *DataNode) GetDecommissionStatus() uint32 {
+	return atomic.LoadUint32(&dataNode.DecommissionStatus)
+}
+
+func (dataNode *DataNode) SetDecommissionStatus(status uint32) {
+	atomic.StoreUint32(&dataNode.DecommissionStatus, status)
+}
+
+func (dataNode *DataNode) GetDecommissionFailedDPByTerm(c *Cluster) (error, []uint64) {
+	var (
+		failedDps []uint64
+		err       error
+	)
+	if dataNode.GetDecommissionStatus() != DecommissionFail {
+		err = fmt.Errorf("action[GetDecommissionDataNodeFailedDP]dataNode[%s] status must be failed,but[%d]",
+			dataNode.Addr, dataNode.GetDecommissionStatus())
+		return err, failedDps
+	}
+	partitions := c.getAllDecommissionDataPartitionByDataNodeAndTerm(dataNode.Addr, dataNode.DecommissionTerm)
+	log.LogDebugf("action[GetDecommissionDataNodeFailedDP] partitions len %v", len(partitions))
+	for _, dp := range partitions {
+		if dp.IsDecommissionFailed() {
+			failedDps = append(failedDps, dp.PartitionID)
+			log.LogWarnf("action[GetDecommissionDataNodeFailedDP] dp[%v] failed", dp.PartitionID)
+		}
+	}
+	log.LogWarnf("action[GetDecommissionDataNodeFailedDP] failed dp list [%v]", failedDps)
+	return nil, failedDps
+}
+
+func (dataNode *DataNode) GetDecommissionFailedDP(c *Cluster) (error, []uint64) {
+	var (
+		failedDps []uint64
+		err       error
+	)
+	if dataNode.GetDecommissionStatus() != DecommissionFail {
+		err = fmt.Errorf("action[GetDecommissionDataNodeFailedDP]dataNode[%s] status must be failed,but[%d]",
+			dataNode.Addr, dataNode.GetDecommissionStatus())
+		return err, failedDps
+	}
+	partitions := c.getAllDecommissionDataPartitionByDataNode(dataNode.Addr)
+	log.LogDebugf("action[GetDecommissionDataNodeFailedDP] partitions len %v", len(partitions))
+	for _, dp := range partitions {
+		if dp.IsDecommissionFailed() {
+			failedDps = append(failedDps, dp.PartitionID)
+			log.LogWarnf("action[GetDecommissionDataNodeFailedDP] dp[%v] failed", dp.PartitionID)
+		}
+	}
+	log.LogWarnf("action[GetDecommissionDataNodeFailedDP] failed dp list [%v]", failedDps)
+	return nil, failedDps
+}
+
+func (dataNode *DataNode) markDecommission(targetAddr string, raftForce bool, limit int) {
+	dataNode.SetDecommissionStatus(markDecommission)
+	dataNode.DecommissionRaftForce = raftForce
+	dataNode.DecommissionDstAddr = targetAddr
+	//reset decommission status for failed once
+	dataNode.DecommissionRetry = 0
+	dataNode.DecommissionLimit = limit
+	dataNode.DecommissionDpTotal = InvalidDecommissionDpCnt
+	dataNode.DecommissionTerm = dataNode.DecommissionTerm + 1
+}
+
+func (dataNode *DataNode) markDecommissionSuccess() {
+	dataNode.SetDecommissionStatus(DecommissionSuccess)
+	dataNode.ToBeOffline = false
+	dataNode.DecommissionCompleteTime = time.Now().Unix()
+}
+
+func (dataNode *DataNode) markDecommissionFail() {
+	dataNode.SetDecommissionStatus(DecommissionFail)
+	//dataNode.ToBeOffline = false
+	//dataNode.DecommissionCompleteTime = time.Now().Unix()
+}
+
+func (dataNode *DataNode) resetDecommissionStatus() {
+	dataNode.SetDecommissionStatus(DecommissionInitial)
+	dataNode.DecommissionRaftForce = false
+	dataNode.DecommissionDstAddr = ""
+	dataNode.DecommissionRetry = 0
+	dataNode.DecommissionLimit = 0
+	dataNode.DecommissionDpTotal = InvalidDecommissionDpCnt
+	dataNode.DecommissionCompleteTime = 0
 }

@@ -156,7 +156,7 @@ func TestServiceAPI(t *testing.T) {
 		args *proto.ShardRepairTask
 		code int
 	}{
-		{args: &proto.ShardRepairTask{}, code: 704},
+		{args: &proto.ShardRepairTask{}, code: 672},
 	}
 	for _, tc := range testCases {
 		err := workerCli.RepairShard(context.Background(), workerServer.URL, tc.args)
@@ -174,7 +174,7 @@ func TestWorkerService(t *testing.T) {
 		svr.WorkerService.Run()
 		close(closed)
 	}()
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	svr.WorkerService.Close()
 	<-closed
 

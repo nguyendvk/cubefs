@@ -18,43 +18,99 @@ Usage: ./run_docker.sh [ -h | --help ] [ -d | --disk </disk/path> ] [ -l | --ltp
     -m, --monitor           start monitor web ui
     -l, --ltptest           run ltp test
     -r, --run               run servers, client and monitor
+    -f, --format            run gofmt to format source code
     --clean                 cleanup old docker image
 EOF
     exit 0
 }
 
+compose="docker-compose --env-file ${RootPath}/docker/run_docker.env -f ${RootPath}/docker/docker-compose.yml"
+
 
 clean() {
-    docker-compose -f ${RootPath}/docker/docker-compose.yml down
+    ${compose} down
+}
+
+prepare() {
+    ${compose} run prepare
 }
 
 # unit test
 run_unit_test() {
-    docker-compose -f ${RootPath}/docker/docker-compose.yml run unit_test
+    ${compose} run unit_test
+}
+
+# go format
+run_format() {
+    prepare
+    ${compose} run format
+}
+
+run_build_libsdkpre() {
+    prepare
+    ${compose} run build_libsdkpre
+}
+
+run_goreleaser() {
+    prepare
+    ${compose} run goreleaser
+}
+
+run_bsgofumpt() {
+    prepare
+    ${compose} run bs_gofumpt
+}
+
+run_bsgolint() {
+    prepare
+    ${compose} run bs_golint
+}
+
+run_gosec() {
+    prepare
+    ${compose} run gosec
 }
 
 # build
 build() {
-    docker-compose -f ${RootPath}/docker/docker-compose.yml run build
+    prepare
+    ${compose} run build
+}
+
+# build
+build_s3() {
+    prepare
+    ${compose} run build bash -c "/bin/bash /cfs/script/build.sh -s3"
 }
 
 # start server
 start_servers() {
     isDiskAvailable $DiskPath
     mkdir -p ${DiskPath}/disk/{1..4}
-    docker-compose -f ${RootPath}/docker/docker-compose.yml up -d servers
+    ${compose} up -d servers
 }
 
 start_client() {
-    docker-compose -f ${RootPath}/docker/docker-compose.yml run client bash -c "/cfs/script/start_client.sh ; /bin/bash"
+    ${compose} run client bash -c "/cfs/script/start_client.sh ; /bin/bash"
 }
 
 start_monitor() {
-    docker-compose -f ${RootPath}/docker/docker-compose.yml up -d monitor
+    ${compose} up -d monitor
+}
+
+start_s3test() {
+    ${compose} run client
 }
 
 start_ltptest() {
-    docker-compose -f ${RootPath}/docker/docker-compose.yml run client
+    ${compose} run client bash -c "/cfs/script/start.sh -ltp"
+}
+
+run_s3test() {
+    build_s3
+    start_servers
+    start_s3test
+    clean
 }
 
 run_ltptest() {
@@ -88,6 +144,9 @@ for opt in ${ARGS[*]} ; do
         -l|--ltptest)
             cmd=run_ltptest
             ;;
+        -n|--s3test)
+            cmd=run_s3test
+            ;;
         -r|--run)
             cmd=run
             ;;
@@ -99,6 +158,24 @@ for opt in ${ARGS[*]} ; do
             ;;
         -m|--monitor)
             cmd=run_monitor
+            ;;
+        -f|--format)
+            cmd=run_format
+            ;;
+        --buildlibsdkpre)
+            cmd=run_build_libsdkpre
+            ;;
+        --goreleaser)
+            cmd=run_goreleaser
+            ;;
+        --bsgofumpt)
+            cmd=run_bsgofumpt
+            ;;
+        --bsgolint)
+            cmd=run_bsgolint
+            ;;
+        --gosec)
+            cmd=run_gosec
             ;;
         -clean|--clean)
             cmd=clean
@@ -149,6 +226,13 @@ case "-$cmd" in
     -run_monitor) start_monitor ;;
     -run_ltptest) run_ltptest ;;
     -run_test) run_unit_test ;;
+    -run_format) run_format ;;
+    -run_s3test) run_s3test ;;
+    -run_build_libsdkpre) run_build_libsdkpre ;;
+    -run_goreleaser) run_goreleaser ;;
+    -run_bsgofumpt) run_bsgofumpt ;;
+    -run_bsgolint) run_bsgolint ;;
+    -run_gosec) run_gosec ;;
     -clean) clean ;;
     *) help ;;
 esac

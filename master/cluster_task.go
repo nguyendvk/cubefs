@@ -196,6 +196,10 @@ errHandler:
 // 4. synchronized create a new meta partition
 // 5. persistent the new host list
 func (c *Cluster) decommissionMetaPartition(nodeAddr string, mp *MetaPartition) (err error) {
+	if c.ForbidMpDecommission {
+		err = fmt.Errorf("cluster mataPartition decommission switch is disabled")
+		return
+	}
 	return c.migrateMetaPartition(nodeAddr, "", mp)
 }
 
@@ -228,10 +232,9 @@ func (c *Cluster) validateDecommissionMetaPartition(mp *MetaPartition, nodeAddr 
 	return
 }
 
-func (c *Cluster) checkCorruptMetaPartitions() (inactiveMetaNodes []string, corruptPartitions []*MetaPartition, err error) {
-	partitionMap := make(map[uint64]uint8)
+func (c *Cluster) checkInactiveMetaNodes() (inactiveMetaNodes []string, err error) {
 	inactiveMetaNodes = make([]string, 0)
-	corruptPartitions = make([]*MetaPartition, 0)
+
 	c.metaNodes.Range(func(addr, node interface{}) bool {
 		metaNode := node.(*MetaNode)
 		if !metaNode.IsActive {
@@ -239,27 +242,8 @@ func (c *Cluster) checkCorruptMetaPartitions() (inactiveMetaNodes []string, corr
 		}
 		return true
 	})
-	for _, addr := range inactiveMetaNodes {
-		var metaNode *MetaNode
-		if metaNode, err = c.metaNode(addr); err != nil {
-			return
-		}
-		for _, partition := range metaNode.PersistenceMetaPartitions {
-			partitionMap[partition] = partitionMap[partition] + 1
-		}
-	}
 
-	for partitionID, badNum := range partitionMap {
-		var partition *MetaPartition
-		if partition, err = c.getMetaPartitionByID(partitionID); err != nil {
-			return
-		}
-		if badNum > partition.ReplicaNum/2 {
-			corruptPartitions = append(corruptPartitions, partition)
-		}
-	}
-	log.LogInfof("clusterID[%v] inactiveMetaNodes:%v  corruptPartitions count:[%v]",
-		c.Name, inactiveMetaNodes, len(corruptPartitions))
+	log.LogInfof("clusterID[%v] inactiveMetaNodes:%v", c.Name, inactiveMetaNodes)
 	return
 }
 
@@ -296,17 +280,75 @@ func (c *Cluster) checkCorruptMetaNode(metaNode *MetaNode) (corruptPartitions []
 	return
 }
 
-func (c *Cluster) checkLackReplicaMetaPartitions() (lackReplicaMetaPartitions []*MetaPartition, err error) {
+type VolNameSet map[string]struct{}
+
+func (c *Cluster) checkReplicaMetaPartitions() (
+	lackReplicaMetaPartitions []*MetaPartition, noLeaderMetaPartitions []*MetaPartition,
+	unavailableReplicaMPs []*MetaPartition, excessReplicaMetaPartitions, inodeCountNotEqualMPs, maxInodeNotEqualMPs, dentryCountNotEqualMPs []*MetaPartition, err error) {
 	lackReplicaMetaPartitions = make([]*MetaPartition, 0)
+	noLeaderMetaPartitions = make([]*MetaPartition, 0)
+	excessReplicaMetaPartitions = make([]*MetaPartition, 0)
+	inodeCountNotEqualMPs = make([]*MetaPartition, 0)
+	maxInodeNotEqualMPs = make([]*MetaPartition, 0)
+	dentryCountNotEqualMPs = make([]*MetaPartition, 0)
+
+	markDeleteVolNames := make(VolNameSet)
+
 	vols := c.copyVols()
 	for _, vol := range vols {
+		if vol.Status == markDelete {
+			markDeleteVolNames[vol.Name] = struct{}{}
+			continue
+		}
+
+		vol.mpsLock.RLock()
 		for _, mp := range vol.MetaPartitions {
-			if mp.ReplicaNum > uint8(len(mp.Hosts)) {
+			if uint8(len(mp.Hosts)) < mp.ReplicaNum || uint8(len(mp.Replicas)) < mp.ReplicaNum {
 				lackReplicaMetaPartitions = append(lackReplicaMetaPartitions, mp)
 			}
+
+			if !mp.isLeaderExist() && (time.Now().Unix()-mp.LeaderReportTime > c.cfg.MpNoLeaderReportIntervalSec) {
+				noLeaderMetaPartitions = append(noLeaderMetaPartitions, mp)
+			}
+
+			if uint8(len(mp.Hosts)) > mp.ReplicaNum || uint8(len(mp.Replicas)) > mp.ReplicaNum {
+				excessReplicaMetaPartitions = append(excessReplicaMetaPartitions, mp)
+			}
+
+			for _, replica := range mp.Replicas {
+				if replica.Status == proto.Unavailable {
+					unavailableReplicaMPs = append(unavailableReplicaMPs, mp)
+					break
+				}
+			}
 		}
+		vol.mpsLock.RUnlock()
 	}
-	log.LogInfof("clusterID[%v] lackReplicaMetaPartitions count:[%v]", c.Name, len(lackReplicaMetaPartitions))
+	c.inodeCountNotEqualMP.Range(func(key, value interface{}) bool {
+		mp := value.(*MetaPartition)
+		if _, ok := markDeleteVolNames[mp.volName]; !ok {
+			inodeCountNotEqualMPs = append(inodeCountNotEqualMPs, mp)
+		}
+		return true
+	})
+	c.maxInodeNotEqualMP.Range(func(key, value interface{}) bool {
+		mp := value.(*MetaPartition)
+		if _, ok := markDeleteVolNames[mp.volName]; !ok {
+			maxInodeNotEqualMPs = append(maxInodeNotEqualMPs, mp)
+		}
+		return true
+	})
+	c.dentryCountNotEqualMP.Range(func(key, value interface{}) bool {
+		mp := value.(*MetaPartition)
+		if _, ok := markDeleteVolNames[mp.volName]; !ok {
+			dentryCountNotEqualMPs = append(dentryCountNotEqualMPs, mp)
+		}
+		return true
+	})
+	log.LogInfof("clusterID[%v], lackReplicaMetaPartitions count:[%v], noLeaderMetaPartitions count[%v]"+
+		"unavailableReplicaMPs count:[%v], excessReplicaMp count:[%v]",
+		c.Name, len(lackReplicaMetaPartitions), len(noLeaderMetaPartitions),
+		len(unavailableReplicaMPs), len(excessReplicaMetaPartitions))
 	return
 }
 
@@ -485,8 +527,16 @@ func (c *Cluster) buildAddMetaPartitionRaftMemberTaskAndSyncSend(mp *MetaPartiti
 		if resp != nil {
 			resultCode = resp.ResultCode
 		}
-		log.LogErrorf("action[addMetaRaftMemberAndSend],vol[%v],meta partition[%v],resultCode[%v],err[%v]", mp.volName, mp.PartitionID, resultCode, err)
+
+		if err != nil {
+			log.LogErrorf("action[addMetaRaftMemberAndSend],vol[%v],meta partition[%v],resultCode[%v],err[%v]",
+				mp.volName, mp.PartitionID, resultCode, err)
+		} else {
+			log.LogWarnf("action[addMetaRaftMemberAndSend],vol[%v],meta partition[%v],resultCode[%v]",
+				mp.volName, mp.PartitionID, resultCode)
+		}
 	}()
+
 	t, err := mp.createTaskToAddRaftMember(addPeer, leaderAddr)
 	if err != nil {
 		return
@@ -588,7 +638,7 @@ func (c *Cluster) doLoadMetaPartition(mp *MetaPartition) {
 		return
 	default:
 	}
-	mp.checkSnapshot(c.Name)
+	mp.checkSnapshot(c)
 }
 
 func (c *Cluster) doLoadDataPartition(dp *DataPartition) {
@@ -615,7 +665,7 @@ func (c *Cluster) doLoadDataPartition(dp *DataPartition) {
 	dp.getFileCount()
 	if proto.IsNormalDp(dp.PartitionType) {
 		dp.validateCRC(c.Name)
-		dp.checkReplicaSize(c.Name, c.cfg.diffSpaceUsage)
+		dp.checkReplicaSize(c.Name, c.cfg.diffReplicaSpaceUsage)
 	}
 
 	dp.setToNormal()
@@ -744,7 +794,8 @@ func (c *Cluster) dealMetaNodeHeartbeatResp(nodeAddr string, resp *proto.MetaNod
 		log.LogErrorf("action[dealMetaNodeHeartbeatResp],metaNode[%v] error[%v]", metaNode.Addr, err)
 	}
 	c.updateMetaNode(metaNode, resp.MetaPartitionReports, metaNode.reachesThreshold())
-	metaNode.metaPartitionInfos = nil
+	//todo remove, this no need set metaNode.metaPartitionInfos = nil
+	//metaNode.metaPartitionInfos = nil
 	logMsg = fmt.Sprintf("action[dealMetaNodeHeartbeatResp],metaNode:%v,zone[%v], ReportTime:%v  success", metaNode.Addr, metaNode.ZoneName, time.Now().Unix())
 	log.LogInfof(logMsg)
 	return
@@ -772,12 +823,15 @@ func (c *Cluster) adjustMetaNode(metaNode *MetaNode) {
 		zone = newZone(metaNode.ZoneName)
 		c.t.putZone(zone)
 	}
+	c.nsMutex.Lock()
 	ns := zone.getAvailNodeSetForMetaNode()
 	if ns == nil {
 		if ns, err = zone.createNodeSet(c); err != nil {
+			c.nsMutex.Unlock()
 			return
 		}
 	}
+	c.nsMutex.Unlock()
 
 	metaNode.NodeSetID = ns.ID
 	if err = c.syncUpdateMetaNode(metaNode); err != nil {
@@ -796,7 +850,9 @@ func (c *Cluster) handleDataNodeTaskResponse(nodeAddr string, task *proto.AdminT
 		log.LogInfof("action[handleDataNodeTaskResponse] receive addr[%v] task response,but task is nil", nodeAddr)
 		return
 	}
-	log.LogDebugf("action[handleDataNodeTaskResponse] receive addr[%v] task response:%v", nodeAddr, task.ToString())
+	if log.EnableDebug() {
+		log.LogDebugf("action[handleDataNodeTaskResponse] receive addr[%v] task response:%v", nodeAddr, task.ToString())
+	}
 	var (
 		err      error
 		dataNode *DataNode
@@ -946,12 +1002,16 @@ func (c *Cluster) adjustDataNode(dataNode *DataNode) {
 		zone = newZone(dataNode.ZoneName)
 		c.t.putZone(zone)
 	}
+
+	c.nsMutex.Lock()
 	ns := zone.getAvailNodeSetForDataNode()
 	if ns == nil {
 		if ns, err = zone.createNodeSet(c); err != nil {
+			c.nsMutex.Unlock()
 			return
 		}
 	}
+	c.nsMutex.Unlock()
 
 	dataNode.NodeSetID = ns.ID
 	if err = c.syncUpdateDataNode(dataNode); err != nil {
@@ -1029,6 +1089,8 @@ func (c *Cluster) updateMetaNode(metaNode *MetaNode, metaPartitions []*proto.Met
 		}
 
 		mp.updateMetaPartition(mr, metaNode)
+		vol.uidSpaceManager.volUidUpdate(mr)
+		vol.quotaManager.quotaUpdate(mr)
 		c.updateInodeIDUpperBound(mp, mr, threshold, metaNode)
 	}
 }
@@ -1042,18 +1104,24 @@ func (c *Cluster) updateInodeIDUpperBound(mp *MetaPartition, mr *proto.MetaParti
 		log.LogWarnf("action[updateInodeIDRange] vol[%v] not found", mp.volName)
 		return
 	}
+
 	maxPartitionID := vol.maxPartitionID()
 	if mr.PartitionID < maxPartitionID {
 		return
 	}
 	var end uint64
+	metaPartitionInodeIdStep := gConfig.MetaPartitionInodeIdStep
 	if mr.MaxInodeID <= 0 {
-		end = mr.Start + defaultMetaPartitionInodeIDStep
+		end = mr.Start + metaPartitionInodeIdStep
 	} else {
-		end = mr.MaxInodeID + defaultMetaPartitionInodeIDStep
+		end = mr.MaxInodeID + metaPartitionInodeIdStep
 	}
 	log.LogWarnf("mpId[%v],start[%v],end[%v],addr[%v],used[%v]", mp.PartitionID, mp.Start, mp.End, metaNode.Addr, metaNode.Used)
-	if err = vol.splitMetaPartition(c, mp, end); err != nil {
+	if c.cfg.DisableAutoCreate {
+		log.LogWarnf("updateInodeIDUpperBound: disable auto create meta partition, mp %d", mp.PartitionID)
+		return
+	}
+	if err = vol.splitMetaPartition(c, mp, end, metaPartitionInodeIdStep); err != nil {
 		log.LogError(err)
 	}
 	return

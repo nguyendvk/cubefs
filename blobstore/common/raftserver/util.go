@@ -15,6 +15,7 @@
 package raftserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"hash/crc32"
@@ -55,6 +56,7 @@ type Status struct {
 	Applied        uint64 `json:"applied"`
 	RaftApplied    uint64 `json:"raftApplied"`
 	LeadTransferee uint64 `json:"transferee"`
+	ApplyingLength int    `json:"applyingLength"`
 	Peers          []Peer `json:"peers"`
 }
 
@@ -114,10 +116,16 @@ func (nr *readIndexNotifier) Wait(ctx context.Context, stopc <-chan struct{}) er
 }
 
 func normalEntryEncode(id uint64, data []byte) []byte {
-	b := make([]byte, 8+len(data))
-	binary.BigEndian.PutUint64(b[0:8], id)
-	copy(b[8:], data)
-	return b
+	var buf bytes.Buffer
+	err := binary.Write(&buf, binary.BigEndian, id)
+	if err != nil {
+		panic(err)
+	}
+	_, err = buf.Write(data)
+	if err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
 }
 
 func normalEntryDecode(data []byte) (uint64, []byte) {

@@ -16,13 +16,19 @@ package auditlog
 
 import "net/http"
 
+const (
+	LogFormatText = "text"
+	LogFormatJSON = "json"
+)
+
 type Config struct {
 	// LogDir audit log whether to enable depend on whether config log dir
 	LogDir string `json:"logdir"`
 	// ChunkBits means one audit log file size
 	// eg: chunkbits=20 means one log file will hold 1<<10 size
 	ChunkBits uint `json:"chunkbits"`
-	BodyLimit int  `json:"bodylimit"`
+	// BodyLimit negative means no body-cache, 0 means default buffer size.
+	BodyLimit int `json:"bodylimit"`
 	// rotate new audit log file every start time
 	RotateNew     bool   `json:"rotate_new"`
 	LogFileSuffix string `json:"log_file_suffix"`
@@ -32,6 +38,9 @@ type Config struct {
 
 	// KeywordsFilter log filter based on uri and request method
 	KeywordsFilter []string `json:"keywords_filter"`
+
+	// LogFormat valid value is "text" or "json", default is "text"
+	LogFormat string `json:"log_format"`
 }
 
 // LogCloser a implemented audit logger should implements ProgressHandler
@@ -40,6 +49,13 @@ type LogCloser interface {
 	Close() error
 	Log([]byte) error
 }
+
+type noopLogCloser struct{}
+
+var _ LogCloser = noopLogCloser{}
+
+func (noopLogCloser) Close() error     { return nil }
+func (noopLogCloser) Log([]byte) error { return nil }
 
 type MetricSender interface {
 	Send(raw []byte) error

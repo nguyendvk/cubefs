@@ -52,7 +52,11 @@ func (w *responseWriter) Write(b []byte) (int, error) {
 		n := copy(w.body[w.n:], b)
 		w.n += n
 	}
-	n, err := w.ResponseWriter.Write(b)
+
+	copied := make([]byte, len(b))
+	copy(copied, b)
+
+	n, err := w.ResponseWriter.Write(copied)
 	w.bodyWritten += int64(n)
 	return n, err
 }
@@ -97,11 +101,11 @@ func (w *responseWriter) getBody() []byte {
 	return w.body[:w.n]
 }
 
-func (w *responseWriter) getStatusCode() []byte {
-	return []byte(strconv.Itoa(w.statusCode))
+func (w *responseWriter) getStatusCode() int {
+	return w.statusCode
 }
 
-func (w *responseWriter) getHeader() []byte {
+func (w *responseWriter) getHeader() M {
 	header := w.ResponseWriter.Header()
 	headerM := make(M)
 	for k := range header {
@@ -111,10 +115,7 @@ func (w *responseWriter) getHeader() []byte {
 			headerM[k] = header.Get(k)
 		}
 	}
-	if len(headerM) > 0 {
-		return headerM.Encode()
-	}
-	return nil
+	return headerM
 }
 
 func (w *responseWriter) getBodyWritten() int64 {

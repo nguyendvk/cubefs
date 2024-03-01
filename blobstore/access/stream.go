@@ -152,7 +152,7 @@ type blobIdent struct {
 }
 
 func (id *blobIdent) String() string {
-	return fmt.Sprintf("blob(%d %d %d)", id.cid, id.vid, id.bid)
+	return fmt.Sprintf("blob(cid:%d vid:%d bid:%d)", id.cid, id.vid, id.bid)
 }
 
 // Handler stream handler
@@ -228,7 +228,8 @@ func confCheck(cfg *StreamConfig) {
 // NewStreamHandler returns a stream handler
 func NewStreamHandler(cfg *StreamConfig, stopCh <-chan struct{}) StreamHandler {
 	confCheck(cfg)
-	clusterController, err := controller.NewClusterController(&cfg.ClusterConfig)
+	proxyClient := proxy.New(&cfg.ProxyConfig)
+	clusterController, err := controller.NewClusterController(&cfg.ClusterConfig, proxyClient, stopCh)
 	if err != nil {
 		log.Fatalf("new cluster controller failed, err: %v", err)
 	}
@@ -238,7 +239,7 @@ func NewStreamHandler(cfg *StreamConfig, stopCh <-chan struct{}) StreamHandler {
 		clusterController: clusterController,
 
 		blobnodeClient: blobnode.New(&cfg.BlobnodeConfig),
-		proxyClient:    proxy.New(&cfg.ProxyConfig),
+		proxyClient:    proxyClient,
 
 		maxObjectSize: defaultMaxObjectSize,
 		StreamConfig:  *cfg,

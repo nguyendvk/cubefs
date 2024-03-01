@@ -16,6 +16,7 @@ package meta
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -48,10 +49,17 @@ const (
 	statusInval
 	statusNotPerm
 	statusConflictExtents
+	statusOpDirQuota
+	statusNoSpace
+	statusTxInodeInfoNotExist
+	statusTxConflict
+	statusTxTimeout
+	statusUploadPartConflict
+	statusNotEmpty
 )
 
 const (
-	MaxMountRetryLimit = 5
+	MaxMountRetryLimit = 6
 	MountRetryInterval = time.Second * 5
 
 	/*
@@ -59,6 +67,8 @@ const (
 	 * i.e. only one force update request is allowed every 5 sec.
 	 */
 	MinForceUpdateMetaPartitionsInterval = 5
+	DefaultQuotaExpiration               = 120 * time.Second
+	MaxQuotaCache                        = 10000
 )
 
 type AsyncTaskErrorFunc func(err error)
@@ -79,20 +89,27 @@ type MetaConfig struct {
 	OnAsyncTaskError AsyncTaskErrorFunc
 	EnableSummary    bool
 	MetaSendTimeout  int64
+	//EnableTransaction uint8
+	//EnableTransaction bool
+	MountPoint                 string
+	SubDir                     string
+	TrashTraverseLimit         int
+	TrashRebuildGoroutineLimit int
 }
 
 type MetaWrapper struct {
 	sync.RWMutex
-	cluster         string
-	localIP         string
-	volname         string
-	ossSecure       *OSSSecure
-	volCreateTime   int64
-	owner           string
-	ownerValidation bool
-	mc              *masterSDK.MasterClient
-	ac              *authSDK.AuthClient
-	conns           *util.ConnectPool
+	cluster           string
+	localIP           string
+	volname           string
+	ossSecure         *OSSSecure
+	volCreateTime     int64
+	volDeleteLockTime int64
+	owner             string
+	ownerValidation   bool
+	mc                *masterSDK.MasterClient
+	ac                *authSDK.AuthClient
+	conns             *util.ConnectPool
 
 	// Callback handler for handling asynchronous task errors.
 	onAsyncTaskError AsyncTaskErrorFunc
@@ -128,13 +145,47 @@ type MetaWrapper struct {
 	partCond  *sync.Cond
 
 	// Allocated to trigger and throttle instant partition updates
-	forceUpdate      chan struct{}
-	forceUpdateLimit *rate.Limiter
-	EnableSummary    bool
-	metaSendTimeout  int64
+	forceUpdate             chan struct{}
+	forceUpdateLimit        *rate.Limiter
+	EnableSummary           bool
+	metaSendTimeout         int64
+	DirChildrenNumLimit     uint32
+	EnableTransaction       proto.TxOpMask
+	TxTimeout               int64
+	TxConflictRetryNum      int64
+	TxConflictRetryInterval int64
+	EnableQuota             bool
+	QuotaInfoMap            map[uint32]*proto.QuotaInfo
+	QuotaLock               sync.RWMutex
+
+	// uniqidRange for request dedup
+	uniqidRangeMap   map[uint64]*uniqidRange
+	uniqidRangeMutex sync.Mutex
+
+	qc *QuotaCache
+	//trash
+	TrashInterval        int64
+	trashPolicy          *Trash
+	disableTrash         bool
+	disableTrashByClient bool
+	rootIno              uint64
+	dirCache             map[uint64]dirInfoCache
+	inoInfoLk            sync.RWMutex
+	subDir               string
 }
 
-//the ticket from authnode
+type uniqidRange struct {
+	cur uint64
+	end uint64
+}
+
+type dirInfoCache struct {
+	ino       uint64
+	parentIno uint64
+	name      string
+}
+
+// the ticket from authnode
 type Ticket struct {
 	ID         string `json:"client_id"`
 	SessionKey string `json:"session_key"`
@@ -176,7 +227,12 @@ func NewMetaWrapper(config *MetaConfig) (*MetaWrapper, error) {
 	mw.forceUpdate = make(chan struct{}, 1)
 	mw.forceUpdateLimit = rate.NewLimiter(1, MinForceUpdateMetaPartitionsInterval)
 	mw.EnableSummary = config.EnableSummary
-
+	mw.DirChildrenNumLimit = proto.DefaultDirChildrenNumLimit
+	//mw.EnableTransaction = config.EnableTransaction
+	mw.uniqidRangeMap = make(map[uint64]*uniqidRange, 0)
+	mw.qc = NewQuotaCache(DefaultQuotaExpiration, MaxQuotaCache)
+	mw.dirCache = make(map[uint64]dirInfoCache)
+	mw.subDir = config.SubDir
 	limit := MaxMountRetryLimit
 
 	for limit > 0 {
@@ -184,26 +240,46 @@ func NewMetaWrapper(config *MetaConfig) (*MetaWrapper, error) {
 		// When initializing the volume, if the master explicitly responds that the specified
 		// volume does not exist, it will not retry.
 		if err != nil {
-			log.LogErrorf("initMetaWrapper failed, err %s", err.Error())
+			if strings.Contains(err.Error(), "auth key do not match") {
+				limit = 0
+				break
+			}
+			log.LogErrorf("NewMetaWrapper: init meta wrapper failed: volume(%v) err(%v)", mw.volname, err)
 		}
-
 		if err == proto.ErrVolNotExists {
 			return nil, err
 		}
 		if err != nil {
 			limit--
-			time.Sleep(MountRetryInterval)
+			time.Sleep(MountRetryInterval * time.Duration(limit))
 			continue
 		}
 		break
 	}
-
+	mw.enableTrash()
 	if limit <= 0 && err != nil {
 		return nil, err
 	}
 
+	go mw.updateQuotaInfoTick()
 	go mw.refresh()
 	return mw, nil
+}
+func (mw *MetaWrapper) enableTrash() {
+	if mw.disableTrash == true {
+		return
+	}
+	if mw.TrashInterval > 0 {
+		// default value for sdk
+		trashTraverseLimit := 10
+		trashRebuildGoroutineLimit := 10
+		var err error
+		mw.trashPolicy, err = NewTrash(mw, mw.TrashInterval, mw.subDir,
+			trashTraverseLimit, trashRebuildGoroutineLimit)
+		if err != nil {
+			log.LogErrorf("action[initMetaWrapper] init trash failed, err %s", err.Error())
+		}
+	}
 }
 
 func (mw *MetaWrapper) initMetaWrapper() (err error) {
@@ -219,11 +295,19 @@ func (mw *MetaWrapper) initMetaWrapper() (err error) {
 		return err
 	}
 
+	if err = mw.updateDirChildrenNumLimit(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
 func (mw *MetaWrapper) Owner() string {
 	return mw.owner
+}
+
+func (mw *MetaWrapper) enableTx(mask proto.TxOpMask) bool {
+	return mw.EnableTransaction != proto.TxPause && mw.EnableTransaction&mask > 0
 }
 
 func (mw *MetaWrapper) OSSSecure() (accessKey, secretKey string) {
@@ -273,10 +357,32 @@ func parseStatus(result uint8) (status int) {
 		status = statusNotPerm
 	case proto.OpConflictExtentsErr:
 		status = statusConflictExtents
+	case proto.OpDirQuota:
+		status = statusOpDirQuota
+	case proto.OpNotEmpty:
+		status = statusNotEmpty
+	case proto.OpNoSpaceErr:
+		status = statusNoSpace
+	case proto.OpTxInodeInfoNotExistErr:
+		status = statusTxInodeInfoNotExist
+	case proto.OpTxConflictErr:
+		status = statusTxConflict
+	case proto.OpTxTimeoutErr:
+		status = statusTxTimeout
+	case proto.OpUploadPartConflictErr:
+		status = statusUploadPartConflict
 	default:
 		status = statusError
 	}
 	return
+}
+
+func statusErrToErrno(status int, err error) error {
+	if status == statusOK && err != nil {
+		return syscall.EAGAIN
+	}
+
+	return statusToErrno(status)
 }
 
 func statusToErrno(status int) error {
@@ -286,6 +392,8 @@ func statusToErrno(status int) error {
 		return syscall.EAGAIN
 	case statusExist:
 		return syscall.EEXIST
+	case statusNotEmpty:
+		return syscall.ENOTEMPTY
 	case statusNoent:
 		return syscall.ENOENT
 	case statusFull:
@@ -300,6 +408,18 @@ func statusToErrno(status int) error {
 		return syscall.EAGAIN
 	case statusConflictExtents:
 		return syscall.ENOTSUP
+	case statusOpDirQuota:
+		return syscall.EDQUOT
+	case statusNoSpace:
+		return syscall.ENOSPC
+	case statusTxInodeInfoNotExist:
+		return syscall.EAGAIN
+	case statusTxConflict:
+		return syscall.EAGAIN
+	case statusTxTimeout:
+		return syscall.EAGAIN
+	case statusUploadPartConflict:
+		return syscall.EEXIST
 	default:
 	}
 	return syscall.EIO

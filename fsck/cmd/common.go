@@ -24,14 +24,23 @@ var (
 	InodesFile string
 	DensFile   string
 	MetaPort   string
+	InodeID    uint64
+	DataPort   string
+	CleanS     bool
+	CleanStr   string
 )
 
-var (
+const (
 	inodeDumpFileName          string = "inode.dump"
 	dentryDumpFileName         string = "dentry.dump"
 	inodeUpdateDumpFileName    string = "inode.dump.update"
 	obsoleteInodeDumpFileName  string = "inode.dump.obsolete"
 	obsoleteDentryDumpFileName string = "dentry.dump.obsolete"
+	pathDumpFileName           string = "path.dump"
+	tinyDir                    string = "tiny"
+	normalDir                  string = "normal"
+	beforeTimeFile             string = "before_time"
+	verifyInfoFile             string = "verify_info"
 )
 
 type Inode struct {
@@ -45,6 +54,10 @@ type Inode struct {
 
 	Dens  []*Dentry
 	Valid bool
+	Files uint64
+	Dirs  uint64
+	Bytes uint64
+	Path  string
 }
 
 func (i *Inode) String() string {

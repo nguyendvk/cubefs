@@ -25,7 +25,8 @@ import (
 	"github.com/cubefs/cubefs/util/log"
 )
 
-func (partition *DataPartition) checkStatus(clusterName string, needLog bool, dpTimeOutSec int64) {
+func (partition *DataPartition) checkStatus(clusterName string, needLog bool, dpTimeOutSec int64, c *Cluster,
+	shouldDpInhibitWriteByVolFull bool) {
 	partition.Lock()
 	defer partition.Unlock()
 	var liveReplicas []*DataReplica
@@ -46,8 +47,18 @@ func (partition *DataPartition) checkStatus(clusterName string, needLog bool, dp
 	switch len(liveReplicas) {
 	case (int)(partition.ReplicaNum):
 		partition.Status = proto.ReadOnly
-		if partition.checkReplicaEqualStatus(liveReplicas, proto.ReadWrite) == true && partition.canWrite() {
-			partition.Status = proto.ReadWrite
+		if partition.checkReplicaEqualStatus(liveReplicas, proto.ReadWrite) &&
+			partition.hasEnoughAvailableSpace() &&
+			!shouldDpInhibitWriteByVolFull {
+
+			if proto.IsNormalDp(partition.PartitionType) {
+				if partition.getLeaderAddr() != "" {
+					partition.Status = proto.ReadWrite
+				}
+			} else {
+				// cold volume has no leader
+				partition.Status = proto.ReadWrite
+			}
 		}
 	default:
 		partition.Status = proto.ReadOnly
@@ -63,6 +74,7 @@ func (partition *DataPartition) checkStatus(clusterName string, needLog bool, dp
 				log.LogInfof("action[checkStatus] partition %v with single replica on decommison and continue to remove old replica",
 					partition.PartitionID)
 				// partition.Status = proto.ReadWrite
+				c.syncUpdateDataPartition(partition)
 				partition.singleDecommissionChan <- true
 			}
 		}
@@ -84,7 +96,7 @@ func (partition *DataPartition) checkStatus(clusterName string, needLog bool, dp
 	}
 }
 
-func (partition *DataPartition) canWrite() bool {
+func (partition *DataPartition) hasEnoughAvailableSpace() bool {
 	avail := partition.total - partition.used
 	if int64(avail) > 10*util.GB {
 		return true
@@ -136,7 +148,7 @@ func (partition *DataPartition) checkReplicaStatus(timeOutSec int64) {
 	}
 }
 
-func (partition *DataPartition) checkLeader(timeOut int64) {
+func (partition *DataPartition) checkLeader(clusterID string, timeOut int64) {
 	partition.Lock()
 	defer partition.Unlock()
 	for _, dr := range partition.Replicas {
@@ -144,6 +156,16 @@ func (partition *DataPartition) checkLeader(timeOut int64) {
 			dr.IsLeader = false
 		}
 	}
+
+	if !proto.IsNormalDp(partition.PartitionType) {
+		return
+	}
+
+	var report bool
+	if partition.getLeaderAddr() == "" {
+		report = true
+	}
+	WarnMetrics.WarnDpNoLeader(clusterID, partition.PartitionID, report)
 	return
 }
 
@@ -153,23 +175,30 @@ func (partition *DataPartition) checkMissingReplicas(clusterID, leaderAddr strin
 	defer partition.Unlock()
 
 	for _, replica := range partition.Replicas {
-		if partition.hasHost(replica.Addr) && replica.isMissing(dataPartitionMissSec) && partition.needToAlarmMissingDataPartition(replica.Addr, dataPartitionWarnInterval) {
-			dataNode := replica.getReplicaNode()
-			var (
-				lastReportTime time.Time
-			)
-			isActive := true
-			if dataNode != nil {
-				lastReportTime = dataNode.ReportTime
-				isActive = dataNode.isActive
+		if partition.hasHost(replica.Addr) && replica.isMissing(dataPartitionMissSec) && !partition.IsDiscard {
+			if partition.needToAlarmMissingDataPartition(replica.Addr, dataPartitionWarnInterval) {
+				dataNode := replica.getReplicaNode()
+				var (
+					lastReportTime time.Time
+				)
+				isActive := true
+				if dataNode != nil {
+					lastReportTime = dataNode.ReportTime
+					isActive = dataNode.isActive
+				}
+				msg := fmt.Sprintf("action[checkMissErr],clusterID[%v] paritionID:%v  on node:%v  "+
+					"miss time > %v  lastRepostTime:%v   dnodeLastReportTime:%v  nodeisActive:%v So Migrate by manual",
+					clusterID, partition.PartitionID, replica.Addr, dataPartitionMissSec, replica.ReportTime, lastReportTime, isActive)
+				//msg = msg + fmt.Sprintf(" decommissionDataPartitionURL is http://%v/dataPartition/decommission?id=%v&addr=%v", leaderAddr, partition.PartitionID, replica.Addr)
+				Warn(clusterID, msg)
+				WarnMetrics.WarnMissingDp(clusterID, replica.Addr, partition.PartitionID, true)
 			}
-			msg := fmt.Sprintf("action[checkMissErr],clusterID[%v] paritionID:%v  on node:%v  "+
-				"miss time > %v  lastRepostTime:%v   dnodeLastReportTime:%v  nodeisActive:%v So Migrate by manual",
-				clusterID, partition.PartitionID, replica.Addr, dataPartitionMissSec, replica.ReportTime, lastReportTime, isActive)
-			msg = msg + fmt.Sprintf(" decommissionDataPartitionURL is http://%v/dataPartition/decommission?id=%v&addr=%v", leaderAddr, partition.PartitionID, replica.Addr)
-			Warn(clusterID, msg)
+		} else {
+			WarnMetrics.WarnMissingDp(clusterID, replica.Addr, partition.PartitionID, false)
 		}
 	}
+
+	WarnMetrics.CleanObsoleteDpMissing(clusterID, partition)
 
 	if !proto.IsNormalDp(partition.PartitionType) {
 		return
@@ -245,9 +274,9 @@ func (partition *DataPartition) checkDiskError(clusterID, leaderAddr string) {
 	return
 }
 
-func (partition *DataPartition) checkReplicationTask(clusterID string, dataPartitionSize uint64) (tasks []*proto.AdminTask) {
+func (partition *DataPartition) checkReplicationTask(clusterID string, dataPartitionSize uint64) {
 	var msg string
-	tasks = make([]*proto.AdminTask, 0)
+
 	if excessAddr, excessErr := partition.deleteIllegalReplica(); excessErr != nil {
 		msg = fmt.Sprintf("action[%v], partitionID:%v  Excess Replication On :%v  Err:%v  rocksDBRecords:%v",
 			deleteIllegalReplicaErr, partition.PartitionID, excessAddr, excessErr.Error(), partition.Hosts)

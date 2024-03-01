@@ -15,26 +15,23 @@
 package fs
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse"
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse/fs"
-	"github.com/cubefs/cubefs/util/stat"
-
-	"golang.org/x/net/context"
-
-	"sync"
-
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
-
-	"github.com/cubefs/cubefs/sdk/data/blobstore"
+	"github.com/cubefs/cubefs/util/stat"
 )
 
 // File defines the structure of a file.
@@ -43,6 +40,7 @@ type File struct {
 	info      *proto.InodeInfo
 	idle      int32
 	parentIno uint64
+	name      string
 	sync.RWMutex
 	fReader *blobstore.Reader
 	fWriter *blobstore.Writer
@@ -68,9 +66,7 @@ var (
 )
 
 // NewFile returns a new file.
-// - Nếu volume là Cold: có khởi tạo fReader và fWriter
-// - Nếu volume là Hot: không khởi tạo fReader và fWriter
-func NewFile(s *Super, i *proto.InodeInfo, flag uint32, pino uint64) fs.Node {
+func NewFile(s *Super, i *proto.InodeInfo, flag uint32, pino uint64, filename string) fs.Node {
 	if proto.IsCold(s.volType) {
 		var (
 			fReader    *blobstore.Reader
@@ -102,20 +98,18 @@ func NewFile(s *Super, i *proto.InodeInfo, flag uint32, pino uint64) fs.Node {
 			fReader = blobstore.NewReader(clientConf)
 		case syscall.O_WRONLY:
 			fWriter = blobstore.NewWriter(clientConf)
-
 		case syscall.O_RDWR:
 			fReader = blobstore.NewReader(clientConf)
 			fWriter = blobstore.NewWriter(clientConf)
 		}
 		log.LogDebugf("Trace NewFile:fReader(%v) fWriter(%v) ", fReader, fWriter)
-		return &File{super: s, info: i, fWriter: fWriter, fReader: fReader, parentIno: pino}
+		return &File{super: s, info: i, fWriter: fWriter, fReader: fReader, parentIno: pino, name: filename}
 	}
-	return &File{super: s, info: i, parentIno: pino}
+	return &File{super: s, info: i, parentIno: pino, name: filename}
 }
 
 // get file parentPath
 func (f *File) getParentPath() string {
-	filepath := ""
 	if f.parentIno == f.super.rootIno {
 		return "/"
 	}
@@ -124,15 +118,15 @@ func (f *File) getParentPath() string {
 	node, ok := f.super.nodeCache[f.parentIno]
 	f.super.fslock.Unlock()
 	if !ok {
-		log.LogErrorf("Get node cache failed: ino(%v)", f.parentIno)
-		return "unknown" + filepath
+		log.LogWarnf("Get node cache failed: ino(%v)", f.parentIno)
+		return "unknown"
 	}
 	parentDir, ok := node.(*Dir)
 	if !ok {
 		log.LogErrorf("Type error: Can not convert node -> *Dir, ino(%v)", f.parentIno)
-		return "unknown" + filepath
+		return "unknown"
 	}
-	return parentDir.getCwd() + filepath
+	return parentDir.getCwd()
 }
 
 // Attr sets the attributes of a file.
@@ -199,8 +193,8 @@ func (f *File) Forget() {
 	if !f.super.orphan.Evict(ino) {
 		return
 	}
-
-	if err := f.super.mw.Evict(ino); err != nil {
+	fullPath := f.getParentPath() + f.name
+	if err := f.super.mw.Evict(ino, fullPath); err != nil {
 		log.LogWarnf("Forget Evict: ino(%v) err(%v)", ino, err)
 	}
 }
@@ -218,7 +212,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	log.LogDebugf("TRACE open ino(%v) info(%v)", ino, f.info)
 	start := time.Now()
 
-	if f.super.bcacheDir != "" {
+	if f.super.bcacheDir != "" && !f.filterFilesSuffix(f.super.bcacheFilterFiles) {
 		parentPath := f.getParentPath()
 		if parentPath != "" && !strings.HasSuffix(parentPath, "/") {
 			parentPath = parentPath + "/"
@@ -260,15 +254,20 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 			FileSize:        uint64(fileSize),
 			CacheThreshold:  f.super.CacheThreshold,
 		}
-
+		f.fWriter.FreeCache()
 		switch req.Flags & 0x0f {
 		case syscall.O_RDONLY:
 			f.fReader = blobstore.NewReader(clientConf)
+			f.fWriter = nil
 		case syscall.O_WRONLY:
 			f.fWriter = blobstore.NewWriter(clientConf)
+			f.fReader = nil
 		case syscall.O_RDWR:
 			f.fReader = blobstore.NewReader(clientConf)
 			f.fWriter = blobstore.NewWriter(clientConf)
+		default:
+			f.fWriter = blobstore.NewWriter(clientConf)
+			f.fReader = nil
 		}
 		log.LogDebugf("TRACE file open,ino(%v)  req.Flags(%v) reader(%v)  writer(%v)", ino, req.Flags, f.fReader, f.fWriter)
 	}
@@ -364,14 +363,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 	return nil
 }
 
-/*
-Write handles the write request.
-  - if isHot():
-    super.extentClient.Truncate()
-    super.extentClient.Write()
-  - if isCold():
-    fWriter.Write()
-*/
+// Write handles the write request.
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) (err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
@@ -381,14 +373,15 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 
 	ino := f.info.Inode
 	reqlen := len(req.Data)
-
-	log.LogDebugf("TRACE Write enter: ino(%v) offset(%v) len(%v)  flags(%v) fileflags(%v) req(%v)", ino, req.Offset, reqlen, req.Flags, req.FileFlags, req)
+	log.LogDebugf("TRACE Write enter: ino(%v) offset(%v) len(%v)  flags(%v) fileflags(%v) quotaIds(%v) req(%v)",
+		ino, req.Offset, reqlen, req.Flags, req.FileFlags, f.info.QuotaInfos, req)
 	if proto.IsHot(f.super.volType) {
 		filesize, _ := f.fileSize(ino)
 		if req.Offset > int64(filesize) && reqlen == 1 && req.Data[0] == 0 {
 
 			// workaround: posix_fallocate would write 1 byte if fallocate is not supported.
-			err = f.super.ec.Truncate(f.super.mw, f.parentIno, ino, int(req.Offset)+reqlen)
+			fullPath := path.Join(f.getParentPath(), f.name)
+			err = f.super.ec.Truncate(f.super.mw, f.parentIno, ino, int(req.Offset)+reqlen, fullPath)
 			if err == nil {
 				resp.Size = reqlen
 			}
@@ -424,11 +417,30 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	defer func() {
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: f.super.volname})
 	}()
+
+	checkFunc := func() error {
+		if !f.super.mw.EnableQuota {
+			return nil
+		}
+		if ok := f.super.ec.UidIsLimited(req.Uid); ok {
+			return ParseError(syscall.ENOSPC)
+		}
+		var quotaIds []uint32
+		for quotaId := range f.info.QuotaInfos {
+			quotaIds = append(quotaIds, quotaId)
+		}
+		if limited := f.super.mw.IsQuotaLimited(quotaIds); limited {
+			return ParseError(syscall.ENOSPC)
+		}
+		return nil
+	}
 	var size int
 	if proto.IsHot(f.super.volType) {
 		f.super.ec.GetStreamer(ino).SetParentInode(f.parentIno)
-		size, err = f.super.ec.Write(ino, int(req.Offset), req.Data, flags)
-	} else { // if proto.IsCold(f.super.volType)
+		if size, err = f.super.ec.Write(ino, int(req.Offset), req.Data, flags, checkFunc); err == ParseError(syscall.ENOSPC) {
+			return
+		}
+	} else {
 		atomic.StoreInt32(&f.idle, 0)
 		size, err = f.fWriter.Write(ctx, int(req.Offset), req.Data, flags)
 	}
@@ -542,13 +554,21 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 
 	ino := f.info.Inode
 	start := time.Now()
-	//todo use master.proto
 	if req.Valid.Size() && proto.IsHot(f.super.volType) {
-		if err = f.super.ec.Flush(ino); err != nil {
+		// when use trunc param in open request through nfs client and mount on cfs mountPoint, cfs client may not recv open message but only setAttr,
+		// the streamer may not open and cause io error finally,so do a open no matter the stream be opened or not
+		if err := f.super.ec.OpenStream(ino); err != nil {
+			log.LogErrorf("Setattr: OpenStream ino(%v) size(%v) err(%v)", ino, req.Size, err)
+			return ParseError(err)
+		}
+		defer f.super.ec.CloseStream(ino)
+
+		if err := f.super.ec.Flush(ino); err != nil {
 			log.LogErrorf("Setattr: truncate wait for flush ino(%v) size(%v) err(%v)", ino, req.Size, err)
 			return ParseError(err)
 		}
-		if err := f.super.ec.Truncate(f.super.mw, f.parentIno, ino, int(req.Size)); err != nil {
+		fullPath := path.Join(f.getParentPath(), f.name)
+		if err := f.super.ec.Truncate(f.super.mw, f.parentIno, ino, int(req.Size), fullPath); err != nil {
 			log.LogErrorf("Setattr: truncate ino(%v) size(%v) err(%v)", ino, req.Size, err)
 			return ParseError(err)
 		}
@@ -738,4 +758,25 @@ func (f *File) fileSizeVersion2(ino uint64) (size int, gen uint64) {
 
 	log.LogDebugf("TRACE fileSizeVersion2: ino(%v) fileSize(%v) gen(%v) valid(%v)", ino, size, gen, valid)
 	return
+}
+
+// return true mean this file will not cache in block cache
+func (f *File) filterFilesSuffix(filterFiles string) bool {
+	if f.name == "" {
+		log.LogWarnf("this file inode[%v], name is nil", f.info)
+		return true
+	}
+	if filterFiles == "" {
+		return false
+	}
+	suffixs := strings.Split(filterFiles, ";")
+	for _, suffix := range suffixs {
+		//.py means one type of file
+		suffix = "." + suffix
+		if suffix != "." && strings.Contains(f.name, suffix) {
+			log.LogDebugf("fileName:%s,filter:%s,suffix:%s,suffixs:%v", f.name, filterFiles, suffix, suffixs)
+			return true
+		}
+	}
+	return false
 }

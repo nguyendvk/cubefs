@@ -14,11 +14,7 @@
 
 package config
 
-import (
-	"strings"
-
-	"github.com/cubefs/cubefs/blobstore/cli/common"
-)
+import "strings"
 
 var cacher = make(map[string]interface{})
 
@@ -71,15 +67,11 @@ func Vverbose() bool {
 	return false
 }
 
-func RedisAddrs() []string { return Get("Key-RedisAddrs").([]string) }
-func RedisUser() string    { return Get("Key-RedisUser").(string) }
-func RedisPass() string    { return Get("Key-RedisPass").(string) }
-
-// ClusterMgrClusters returns cluster manager clusters
-func ClusterMgrClusters() (clusters map[string][]string) {
+// Clusters returns cluster manager clusters
+func Clusters() (clusters map[string][]string) {
 	clusters = make(map[string][]string)
-	if AccessConsulAddr() != "" {
-		return common.GetClustersFromConsul(AccessConsulAddr(), Region())
+	if addr := AccessConsulAddr(); addr != "" && Region() != "" {
+		return getClustersFromConsul(addr, Region())
 	}
 	cs := Get("Key-ClusterMgrCluster").(map[string]string)
 	for key, value := range cs {

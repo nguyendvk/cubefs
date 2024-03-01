@@ -313,8 +313,10 @@ func (reader *Reader) readSliceRange(ctx context.Context, rs *rwSlice) (err erro
 	readLimitOn := false
 	//read cfs and cache to bcache
 	if rs.extentKey != (proto.ExtentKey{}) {
+
 		//check if dp is exist in preload sence
-		if err = reader.ec.CheckDataPartitionExsit(rs.extentKey.PartitionId); err == nil {
+		err = reader.ec.CheckDataPartitionExsit(rs.extentKey.PartitionId)
+		if err == nil || ctx.Value("objectnode") != nil {
 			readN, err, readLimitOn = reader.ec.ReadExtent(reader.ino, &rs.extentKey, buf, int(rs.rOffset), int(rs.rSize))
 			if err == nil && readN == int(rs.rSize) {
 
@@ -385,7 +387,7 @@ func (reader *Reader) asyncCache(ctx context.Context, cacheKey string, objExtent
 	}
 
 	if reader.needCacheL2() {
-		reader.ec.Write(reader.ino, int(objExtentKey.FileOffset), buf, proto.FlagsCache)
+		reader.ec.Write(reader.ino, int(objExtentKey.FileOffset), buf, proto.FlagsCache, nil)
 		log.LogDebugf("TRACE blobStore asyncCache(L2) Exit. cacheKey=%v", cacheKey)
 		return
 	}

@@ -30,8 +30,6 @@ func NewHandler(service *Service) *rpc.Router {
 
 	rpc.POST("/config/delete", service.ConfigDelete, rpc.OptArgsQuery())
 
-	rpc.GET("/config/list", service.ConfigList)
-
 	//==================disk==========================
 	rpc.RegisterArgsParser(&clustermgr.DiskInfoArgs{}, "json")
 	rpc.RegisterArgsParser(&clustermgr.ListOptionArgs{}, "json")
@@ -136,6 +134,8 @@ func NewHandler(service *Service) *rpc.Router {
 	rpc.GET("/kv/get/:key", service.KvGet, rpc.OptArgsURI())
 
 	rpc.POST("/kv/delete/:key", service.KvDelete, rpc.OptArgsURI())
+
+	rpc.POST("/kv/set/:key", service.KvSet, rpc.OptArgsBody())
 
 	rpc.POST("/kv/set", service.KvSet, rpc.OptArgsBody())
 

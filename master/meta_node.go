@@ -20,12 +20,15 @@ import (
 	"time"
 
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/util"
+	"github.com/cubefs/cubefs/util/log"
 )
 
 // MetaNode defines the structure of a meta node
 type MetaNode struct {
 	ID                        uint64
 	Addr                      string
+	DomainAddr                string
 	IsActive                  bool
 	Sender                    *AdminTaskManager `graphql:"-"`
 	ZoneName                  string            `json:"Zone"`
@@ -116,6 +119,7 @@ func (metaNode *MetaNode) updateMetric(resp *proto.MetaNodeHeartbeatResponse, th
 	metaNode.Lock()
 	defer metaNode.Unlock()
 
+	metaNode.DomainAddr = util.ParseIpAddrToDomainAddr(metaNode.Addr)
 	metaNode.metaPartitionInfos = resp.MetaPartitionReports
 	metaNode.MetaPartitionCount = len(metaNode.metaPartitionInfos)
 	metaNode.Total = resp.Total
@@ -125,7 +129,12 @@ func (metaNode *MetaNode) updateMetric(resp *proto.MetaNodeHeartbeatResponse, th
 	} else {
 		metaNode.Ratio = float64(resp.Used) / float64(resp.Total)
 	}
-	metaNode.MaxMemAvailWeight = resp.Total - resp.Used
+	left := int64(resp.Total - resp.Used)
+	if left < 0 {
+		metaNode.MaxMemAvailWeight = 0
+	} else {
+		metaNode.MaxMemAvailWeight = uint64(left)
+	}
 	metaNode.ZoneName = resp.ZoneName
 	metaNode.Threshold = threshold
 }
@@ -137,11 +146,12 @@ func (metaNode *MetaNode) reachesThreshold() bool {
 	return float32(float64(metaNode.Used)/float64(metaNode.Total)) > metaNode.Threshold
 }
 
-func (metaNode *MetaNode) createHeartbeatTask(masterAddr string) (task *proto.AdminTask) {
+func (metaNode *MetaNode) createHeartbeatTask(masterAddr string, fileStatsEnable bool) (task *proto.AdminTask) {
 	request := &proto.HeartBeatRequest{
 		CurrTime:   time.Now().Unix(),
 		MasterAddr: masterAddr,
 	}
+	request.FileStatsEnable = fileStatsEnable
 	task = proto.NewAdminTask(proto.OpMetaNodeHeartbeat, metaNode.Addr, request)
 	return
 }
@@ -151,5 +161,83 @@ func (metaNode *MetaNode) checkHeartbeat() {
 	defer metaNode.Unlock()
 	if time.Since(metaNode.ReportTime) > time.Second*time.Duration(defaultNodeTimeOutSec) {
 		metaNode.IsActive = false
+	}
+}
+
+// LeaderMetaNode define the leader metaPartitions in meta node
+type LeaderMetaNode struct {
+	addr           string
+	metaPartitions []*MetaPartition
+}
+
+type sortLeaderMetaNode struct {
+	nodes        []*LeaderMetaNode
+	leaderCountM map[string]int
+	average      int
+	mu           sync.RWMutex
+}
+
+func (s *sortLeaderMetaNode) Less(i, j int) bool {
+	return len(s.nodes[i].metaPartitions) > len(s.nodes[j].metaPartitions)
+}
+func (s *sortLeaderMetaNode) Swap(i, j int) {
+	s.nodes[i], s.nodes[j] = s.nodes[j], s.nodes[i]
+}
+func (s *sortLeaderMetaNode) Len() int {
+	return len(s.nodes)
+}
+
+func (s *sortLeaderMetaNode) getLeaderCount(addr string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.leaderCountM[addr]
+}
+
+func (s *sortLeaderMetaNode) changeLeader(l *LeaderMetaNode) {
+	for _, mp := range l.metaPartitions {
+		if count := s.getLeaderCount(l.addr); count <= s.average {
+			log.LogInfof("now leader count is[%d], average is[%d]", count, s.average)
+			break
+		}
+
+		// mp's leader not in this metaNode, skip it
+		oldLeader, err := mp.getMetaReplicaLeader()
+		if err != nil {
+			log.LogErrorf("mp[%v] no leader, can not change leader err[%v]", mp, err)
+			continue
+		}
+
+		// get the leader metaPartition count meta node which smaller than (old leader count - 1) addr as new leader
+		addr := oldLeader.Addr
+		s.mu.RLock()
+		for i := 0; i < len(mp.Replicas); i++ {
+			if s.leaderCountM[mp.Replicas[i].Addr] < s.leaderCountM[oldLeader.Addr]-1 {
+				addr = mp.Replicas[i].Addr
+			}
+		}
+		s.mu.RUnlock()
+
+		if addr == oldLeader.Addr {
+			log.LogDebugf("newAddr:%s,oldAddr:%s is same", addr, oldLeader.Addr)
+			continue
+		}
+
+		// one mp change leader failed not influence others
+		if err = mp.tryToChangeLeaderByHost(addr); err != nil {
+			log.LogErrorf("mp[%v] change to addr[%v] err[%v]", mp, addr, err)
+			continue
+		}
+		s.mu.Lock()
+		s.leaderCountM[addr]++
+		s.leaderCountM[oldLeader.Addr]--
+		s.mu.Unlock()
+		log.LogDebugf("mp[%v] oldLeader[%v,nowCount:%d] change to newLeader[%v,nowCount:%d] success", mp.PartitionID, oldLeader.Addr, s.leaderCountM[oldLeader.Addr], addr, s.leaderCountM[addr])
+	}
+}
+
+func (s *sortLeaderMetaNode) balanceLeader() {
+	for _, node := range s.nodes {
+		log.LogDebugf("node[%v] leader count is:%d,average:%d", node.addr, len(node.metaPartitions), s.average)
+		s.changeLeader(node)
 	}
 }

@@ -22,16 +22,14 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"path"
 
 	"github.com/desertbit/grumble"
 	pb "go.etcd.io/etcd/raft/v3/raftpb"
 
 	"github.com/cubefs/cubefs/blobstore/cli/common/fmt"
 	"github.com/cubefs/cubefs/blobstore/clustermgr/base"
-	"github.com/cubefs/cubefs/blobstore/clustermgr/volumemgr"
 )
-
-var logger *log.Logger
 
 func addCmdWalParse(cmd *grumble.Command) {
 	command := &grumble.Command{
@@ -46,34 +44,46 @@ func addCmdWalParse(cmd *grumble.Command) {
 		Help: "parse wal file or path",
 		Run:  cmdWalParse,
 		Args: func(a *grumble.Args) {
-			a.String("filename", "wal log filename", grumble.Default(""))
-			a.String("path", "wal log path", grumble.Default(""))
-			a.String("out", "pase result output", grumble.Default(""))
+			a.String("filepath", "wal log filepath")
+			a.String("out", "parse result output", grumble.Default(""))
 		},
 	})
 }
 
 func cmdWalParse(c *grumble.Context) error {
-	filename := c.Args.String("filename")
-	path := c.Args.String("path")
-	out := c.Args.String("out")
-
-	if filename == "" && path == "" {
-		return errors.New("wal log file path can't be null")
+	filepath := c.Args.String("filepath")
+	if filepath == "" {
+		return errors.New("wal log file path can't be empty")
 	}
+
+	printf := func(format string, opts ...interface{}) {
+		fmt.Printf(format, opts...)
+	}
+
+	out := c.Args.String("out")
 	if out != "" {
-		f, err := os.OpenFile(out, os.O_CREATE|os.O_APPEND, 0o755)
+		mode := os.O_CREATE | os.O_APPEND | os.O_RDWR
+		f, err := os.OpenFile(out, mode, 0o755)
 		if err != nil {
 			return err
 		}
-		logger = log.New(f, "", log.LstdFlags)
+		printf = log.New(f, "", log.LstdFlags).Printf
 	}
 
-	if filename != "" {
-		parse(filename)
-		return nil
+	file, err := os.Open(filepath)
+	if err != nil {
+		return err
 	}
-	fis, err := ioutil.ReadDir(path)
+
+	stat, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !stat.IsDir() {
+		return parse(filepath, printf)
+	}
+
+	fis, err := ioutil.ReadDir(filepath)
 	if err != nil {
 		return err
 	}
@@ -81,16 +91,19 @@ func cmdWalParse(c *grumble.Context) error {
 		if fis[i].IsDir() {
 			continue
 		}
-		parse(path + fis[i].Name())
+		if err := parse(path.Join(filepath, fis[i].Name()), printf); err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
-func parse(filename string) {
+func parse(filename string, printf func(format string, opts ...interface{})) error {
 	f, err := os.Open(filename)
 	if err != nil {
 		printf("open %s error: %v", filename, err)
-		return
+		return err
 	}
 
 	u64Buf := make([]byte, 8)
@@ -98,10 +111,11 @@ func parse(filename string) {
 	for {
 		n, err := io.ReadFull(f, u64Buf)
 		if err != nil {
-			if err != io.EOF {
-				printf("read data len offset=%d error: %v\n", offset, err)
+			if err == io.ErrUnexpectedEOF || err == io.EOF {
+				return nil
 			}
-			break
+			printf("read data len offset=%d error: %v\n", offset, err)
+			return err
 		}
 		offset = offset + int64(n)
 		dataLen := binary.BigEndian.Uint64(u64Buf)
@@ -110,14 +124,20 @@ func parse(filename string) {
 		data := make([]byte, dataLen+4)
 		n, err = io.ReadFull(tr, data[0:int(dataLen)])
 		if err != nil {
+			if err == io.ErrUnexpectedEOF || err == io.EOF {
+				return nil
+			}
 			printf("read data offset=%d error: %v\n", offset, err)
-			break
+			return err
 		}
 		offset = offset + int64(n)
 		n, err = io.ReadFull(f, data[dataLen:])
 		if err != nil {
+			if err == io.ErrUnexpectedEOF || err == io.EOF {
+				return nil
+			}
 			printf("read data crc offset=%d error: %v\n", offset, err)
-			break
+			return err
 		}
 		offset = offset + int64(n)
 
@@ -128,45 +148,34 @@ func parse(filename string) {
 		// checksum
 		if checksum != crc.Sum32() {
 			printf("error checksum=%d\n", checksum)
-			break
+			return errors.New("error checksum")
 		}
 
 		if recType != 1 {
 			fmt.Println("type: ", recType)
-			break
+			return errors.New("type illegal")
 		}
 
 		var entry pb.Entry
 		if err = entry.Unmarshal(data); err != nil {
 			printf("unmarshal error: %v\n", err)
-			break
+			return fmt.Errorf("data unmarshal error: %s\n", err.Error())
 		}
 		if entry.Type == pb.EntryConfChange {
 			var cc pb.ConfChange
-			cc.Unmarshal(entry.Data)
-			printf("term=%d index=%d ConfChange=%s\n", entry.Term, entry.Index, cc.String())
-		} else {
-			if len(entry.Data) == 0 {
-				printf("term=%d index=%d\n", entry.Term, entry.Index)
-			} else {
-				data := entry.Data[8:]
-				proposeInfo := base.DecodeProposeInfo(data)
-				if proposeInfo.Module == "VolumeMgr" && proposeInfo.OperType == volumemgr.OperTypeChunkReport {
-					printf("term=%d index=%d module=%s opertype=%d data=%v \n",
-						entry.Term, entry.Index, proposeInfo.Module, proposeInfo.OperType, proposeInfo.Data)
-				} else {
-					printf("term=%d index=%d module=%s opertype=%d data=%s \n",
-						entry.Term, entry.Index, proposeInfo.Module, proposeInfo.OperType, string(proposeInfo.Data))
-				}
+			if err := cc.Unmarshal(entry.Data); err != nil {
+				return err
 			}
+			printf("term=%d index=%d ConfChange=%s\n", entry.Term, entry.Index, cc.String())
+			return nil
 		}
-	}
-}
-
-func printf(format string, opts ...interface{}) {
-	if logger != nil {
-		logger.Printf(format, opts...)
-	} else {
-		fmt.Printf(format, opts...)
+		if len(entry.Data) == 0 {
+			printf("term=%d index=%d\n", entry.Term, entry.Index)
+		} else {
+			data := entry.Data[8:]
+			proposeInfo := base.DecodeProposeInfo(data)
+			printf("term=%d index=%d module=%s opertype=%d data=%s ReqID=%s\n",
+				entry.Term, entry.Index, proposeInfo.Module, proposeInfo.OperType, string(proposeInfo.Data), proposeInfo.Context.ReqID)
+		}
 	}
 }

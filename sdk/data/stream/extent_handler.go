@@ -16,11 +16,10 @@ package stream
 
 import (
 	"fmt"
+	"github.com/cubefs/cubefs/util/stat"
 	"net"
 	"sync/atomic"
 	"time"
-
-	"github.com/cubefs/cubefs/util/stat"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/wrapper"
@@ -133,13 +132,10 @@ func NewExtentHandler(stream *Streamer, offset int, storeMode int, size int) *Ex
 
 // String returns the string format of the extent handler.
 func (eh *ExtentHandler) String() string {
-	return fmt.Sprintf("ExtentHandler{ID(%v)Inode(%v)FileOffset(%v)StoreMode(%v)Status(%v)}",
-		eh.id, eh.inode, eh.fileOffset, eh.storeMode, eh.status)
+	return fmt.Sprintf("ExtentHandler{ID(%v)Inode(%v)FileOffset(%v)Size(%v)StoreMode(%v)Status(%v)}",
+		eh.id, eh.inode, eh.fileOffset, eh.size, eh.storeMode, eh.status)
 }
 
-// ExtentHandler write data bằng cách lần lươt write các block với size=blksize=eh.stream.tinySizeLimit() hoặc util.BlockSize
-//   - tạo các WritePacket để ghi block với op=proto.OpWrite,proto.OpSyncWrite;
-//   - push các Packet đi
 func (eh *ExtentHandler) write(data []byte, offset, size int, direct bool) (ek *proto.ExtentKey, err error) {
 	var total, write int
 
@@ -431,6 +427,7 @@ func (eh *ExtentHandler) appendExtentKey() (err error) {
 			var discard []proto.ExtentKey
 			discard = eh.stream.extents.Append(eh.key, true)
 			err = eh.stream.client.appendExtentKey(eh.stream.parentInode, eh.inode, *eh.key, discard)
+
 			if err == nil && len(discard) > 0 {
 				eh.stream.extents.RemoveDiscard(discard)
 			}

@@ -39,6 +39,7 @@ func (cmd *CubeFSCmd) newClusterCmd(client *master.MasterClient) *cobra.Command 
 		newClusterFreezeCmd(client),
 		newClusterSetThresholdCmd(client),
 		newClusterSetParasCmd(client),
+		newClusterDisableMpDecommissionCmd(client),
 	)
 	return clusterCmd
 }
@@ -53,6 +54,8 @@ const (
 	nodeMarkDeleteRateKey         = "markDeleteRate"
 	nodeDeleteWorkerSleepMs       = "deleteWorkerSleepMs"
 	nodeAutoRepairRateKey         = "autoRepairRate"
+	nodeMaxDpCntLimit             = "maxDpCntLimit"
+	cmdForbidMpDecommission       = "forbid meta partition decommission"
 )
 
 func newClusterInfoCmd(client *master.MasterClient) *cobra.Command {
@@ -64,26 +67,27 @@ func newClusterInfoCmd(client *master.MasterClient) *cobra.Command {
 			var cv *proto.ClusterView
 			var cn *proto.ClusterNodeInfo
 			var cp *proto.ClusterIP
-			var delPara map[string]string
+			var clusterPara map[string]string
 			if cv, err = client.AdminAPI().GetCluster(); err != nil {
-				errout("Error: %v", err)
+				errout("Error: %v\n", err)
 			}
 			if cn, err = client.AdminAPI().GetClusterNodeInfo(); err != nil {
-				errout("Error: %v", err)
+				errout("Error: %v\n", err)
 			}
 			if cp, err = client.AdminAPI().GetClusterIP(); err != nil {
-				errout("Error: %v", err)
+				errout("Error: %v\n", err)
 			}
 			stdout("[Cluster]\n")
 			stdout(formatClusterView(cv, cn, cp))
-			if delPara, err = client.AdminAPI().GetDeleteParas(); err != nil {
-				errout("Error: %v", err)
+			if clusterPara, err = client.AdminAPI().GetClusterParas(); err != nil {
+				errout("Error: %v\n", err)
 			}
 
-			stdout(fmt.Sprintf("  BatchCount         : %v\n", delPara[nodeDeleteBatchCountKey]))
-			stdout(fmt.Sprintf("  MarkDeleteRate     : %v\n", delPara[nodeMarkDeleteRateKey]))
-			stdout(fmt.Sprintf("  DeleteWorkerSleepMs: %v\n", delPara[nodeDeleteWorkerSleepMs]))
-			stdout(fmt.Sprintf("  AutoRepairRate     : %v\n", delPara[nodeAutoRepairRateKey]))
+			stdout(fmt.Sprintf("  BatchCount         : %v\n", clusterPara[nodeDeleteBatchCountKey]))
+			stdout(fmt.Sprintf("  MarkDeleteRate     : %v\n", clusterPara[nodeMarkDeleteRateKey]))
+			stdout(fmt.Sprintf("  DeleteWorkerSleepMs: %v\n", clusterPara[nodeDeleteWorkerSleepMs]))
+			stdout(fmt.Sprintf("  AutoRepairRate     : %v\n", clusterPara[nodeAutoRepairRateKey]))
+			stdout(fmt.Sprintf("  MaxDpCntLimit      : %v\n", clusterPara[nodeMaxDpCntLimit]))
 			stdout("\n")
 		},
 	}
@@ -101,7 +105,7 @@ func newClusterStatCmd(client *master.MasterClient) *cobra.Command {
 			)
 			defer func() {
 				if err != nil {
-					errout("Error: %v", err)
+					errout("Error: %v\n", err)
 				}
 			}()
 			if cs, err = client.AdminAPI().GetClusterStat(); err != nil {
@@ -135,7 +139,7 @@ If 'freeze=true', CubeFS WILL NOT automatically allocate new data partitions `,
 			)
 			defer func() {
 				if err != nil {
-					errout("Error: %v", err)
+					errout("Error: %v\n", err)
 				}
 			}()
 			if enable, err = strconv.ParseBool(args[0]); err != nil {
@@ -161,7 +165,7 @@ func newClusterSetThresholdCmd(client *master.MasterClient) *cobra.Command {
 		Short: cmdClusterThresholdShort,
 		Args:  cobra.MinimumNArgs(1),
 		Long: `Set the threshold of memory on each meta node.
-If the memory usage reaches this threshold, all the mata partition will be readOnly.`,
+If the memory usage reaches this threshold, all the meta partition will be readOnly.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			var (
 				err       error
@@ -169,7 +173,7 @@ If the memory usage reaches this threshold, all the mata partition will be readO
 			)
 			defer func() {
 				if err != nil {
-					errout("Error: %v", err)
+					errout("Error: %v\n", err)
 				}
 			}()
 			if threshold, err = strconv.ParseFloat(args[0], 64); err != nil {
@@ -190,7 +194,7 @@ If the memory usage reaches this threshold, all the mata partition will be readO
 }
 
 func newClusterSetParasCmd(client *master.MasterClient) *cobra.Command {
-	var optAutoRepairRate, optMarkDeleteRate, optDelBatchCount, optDelWorkerSleepMs, optLoadFactor string
+	var optAutoRepairRate, optMarkDeleteRate, optDelBatchCount, optDelWorkerSleepMs, optLoadFactor, opMaxDpCntLimit string
 	var cmd = &cobra.Command{
 		Use:   CliOpSetCluster,
 		Short: cmdClusterSetClusterInfoShort,
@@ -200,11 +204,11 @@ func newClusterSetParasCmd(client *master.MasterClient) *cobra.Command {
 			)
 			defer func() {
 				if err != nil {
-					errout("Error: %v", err)
+					errout("Error: %v\n", err)
 				}
 			}()
 
-			if err = client.AdminAPI().SetClusterParas(optDelBatchCount, optMarkDeleteRate, optDelWorkerSleepMs, optAutoRepairRate, optLoadFactor); err != nil {
+			if err = client.AdminAPI().SetClusterParas(optDelBatchCount, optMarkDeleteRate, optDelWorkerSleepMs, optAutoRepairRate, optLoadFactor, opMaxDpCntLimit); err != nil {
 				return
 			}
 			stdout("Cluster parameters has been set successfully. \n")
@@ -215,6 +219,44 @@ func newClusterSetParasCmd(client *master.MasterClient) *cobra.Command {
 	cmd.Flags().StringVar(&optMarkDeleteRate, CliFlagMarkDelRate, "", "DataNode batch mark delete limit rate. if 0 for no infinity limit")
 	cmd.Flags().StringVar(&optAutoRepairRate, CliFlagAutoRepairRate, "", "DataNode auto repair rate")
 	cmd.Flags().StringVar(&optDelWorkerSleepMs, CliFlagDelWorkerSleepMs, "", "MetaNode delete worker sleep time with millisecond. if 0 for no sleep")
+	cmd.Flags().StringVar(&opMaxDpCntLimit, CliFlagMaxDpCntLimit, "", "Maximum number of dp on each datanode, default 3000, 0 represents setting to default")
 
+	return cmd
+}
+
+func newClusterDisableMpDecommissionCmd(client *master.MasterClient) *cobra.Command {
+	var cmd = &cobra.Command{
+		Use:       CliOpForbidMpDecommission + " [true|false]",
+		ValidArgs: []string{"true", "false"},
+		Short:     cmdForbidMpDecommission,
+		Args:      cobra.MinimumNArgs(1),
+		Long: `Forbid or allow MetaPartition decommission in the cluster. 
+the forbid flag is false by default when cluster created
+If 'forbid=false', MetaPartition decommission/migrate and MetaNode decommission is allowed.
+If 'forbid=true', MetaPartition decommission/migrate and MetaNode decommission is forbidden.`,
+		Run: func(cmd *cobra.Command, args []string) {
+			var (
+				err    error
+				forbid bool
+			)
+			defer func() {
+				if err != nil {
+					errout("Error: %v", err)
+				}
+			}()
+			if forbid, err = strconv.ParseBool(args[0]); err != nil {
+				err = fmt.Errorf("Parse bool fail: %v\n", err)
+				return
+			}
+			if err = client.AdminAPI().SetForbidMpDecommission(forbid); err != nil {
+				return
+			}
+			if forbid {
+				stdout("Forbid MetaPartition decommission successful!\n")
+			} else {
+				stdout("Allow MetaPartition decommission successful!\n")
+			}
+		},
+	}
 	return cmd
 }

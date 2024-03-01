@@ -78,7 +78,7 @@ type DiskStorage struct {
 	// stats
 	stats atomic.Value // *core.DiskStats
 
-	// DiskQos (include io visualization function)
+	// DataQos (include io visualization function)
 	dataQos qos.Qos
 
 	// status
@@ -115,13 +115,12 @@ func (ds *DiskStorage) waitAllLoopsStop(ctx context.Context) {
 		close(done)
 	}()
 
-	shutdownTimer := time.NewTimer(30 * time.Second)
-	defer shutdownTimer.Stop()
+	warnTicker := time.NewTicker(30 * time.Second)
+	defer warnTicker.Stop()
 	for {
 		select {
-		case <-shutdownTimer.C:
+		case <-warnTicker.C:
 			span.Warnf("=== disk<%v> loop wait timed out. ===", ds.DiskID)
-			return
 		case <-done:
 			span.Infof("=== disk<%v> all loops done ===", ds.DiskID)
 			return
@@ -149,20 +148,23 @@ func (ds *DiskStorage) Close(ctx context.Context) {
 	if ds.closeCh != nil {
 		close(ds.closeCh)
 	}
+	// wait loop in goroutine
+	go func() {
+		// wait all loop done
+		ds.waitAllLoopsStop(ctx)
 
-	// wait all loop done
-	ds.waitAllLoopsStop(ctx)
+		// clean chunk map
+		ds.Chunks = make(map[proto.Vuid]core.ChunkAPI)
 
-	// clean chunk map
-	ds.Chunks = make(map[proto.Vuid]core.ChunkAPI)
+		// clean superblock
+		sb := ds.SuperBlock
+		if sb != nil {
+			sb.Close(ctx)
+			ds.SuperBlock = nil
+		}
 
-	// clean superblock
-	sb := ds.SuperBlock
-	if sb != nil {
-		ds.SuperBlock = nil
-	}
-
-	ds.closed = true
+		ds.closed = true
+	}()
 }
 
 func (ds *DiskStorage) DiskInfo() (info bnapi.DiskInfo) {
@@ -478,10 +480,10 @@ func newDiskStorage(ctx context.Context, conf core.Config) (ds *DiskStorage, err
 	diskView := flow.NewDiskViewer(dataios)
 
 	// init Qos Manager
-	conf.DiskQos.DiskViewer = diskView
-	conf.DiskQos.StatGetter = dataios
+	conf.DataQos.DiskViewer = diskView
+	conf.DataQos.StatGetter = dataios
 
-	dataQos, err := qos.NewQosManager(conf.DiskQos)
+	dataQos, err := qos.NewQosManager(conf.DataQos)
 	if err != nil {
 		span.Errorf("Failed new io qos, err:%v", err)
 		return nil, err
@@ -915,7 +917,7 @@ func (ds *DiskStorage) cleanReleasedChunks() (err error) {
 	span.Debugf("come in CleanChunks.")
 
 	// set io type
-	ctx = bnapi.Setiotype(ctx, bnapi.InternalIO)
+	ctx = bnapi.SetIoType(ctx, bnapi.InternalIO)
 
 	protectionPeriod := time.Duration(ds.Conf.ChunkReleaseProtectionM)
 	now := time.Now().UnixNano()

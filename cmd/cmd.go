@@ -19,21 +19,22 @@ import (
 	"fmt"
 	syslog "log"
 	"net/http"
-	_ "net/http/pprof"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 
+	"github.com/cubefs/cubefs/util/auditlog"
 	"github.com/cubefs/cubefs/util/errors"
+	sysutil "github.com/cubefs/cubefs/util/sys"
 
 	"github.com/cubefs/cubefs/console"
 	"github.com/cubefs/cubefs/proto"
-
-	sysutil "github.com/cubefs/cubefs/util/sys"
 
 	"github.com/cubefs/cubefs/objectnode"
 
@@ -56,6 +57,7 @@ const (
 	ConfigKeyProfPort          = "prof"
 	ConfigKeyWarnLogDir        = "warnLogDir"
 	ConfigKeyBuffersTotalLimit = "buffersTotalLimit"
+	ConfigKeyLogLeftSpaceLimit = "logLeftSpaceLimit"
 )
 
 const (
@@ -84,6 +86,7 @@ var (
 	configFile       = flag.String("c", "", "config file path")
 	configVersion    = flag.Bool("v", false, "show version")
 	configForeground = flag.Bool("f", false, "run foreground")
+	redirectSTD      = flag.Bool("redirect-std", true, "redirect standard output to file")
 )
 
 func interceptSignal(s common.Server) {
@@ -158,7 +161,12 @@ func main() {
 	profPort := cfg.GetString(ConfigKeyProfPort)
 	umpDatadir := cfg.GetString(ConfigKeyWarnLogDir)
 	buffersTotalLimit := cfg.GetInt64(ConfigKeyBuffersTotalLimit)
-
+	logLeftSpaceLimitStr := cfg.GetString(ConfigKeyLogLeftSpaceLimit)
+	logLeftSpaceLimit, err := strconv.ParseInt(logLeftSpaceLimitStr, 10, 64)
+	if err != nil || logLeftSpaceLimit == 0 {
+		log.LogErrorf("logLeftSpaceLimit is not a legal int value: %v", err.Error())
+		logLeftSpaceLimit = log.DefaultLogLeftSpaceLimit
+	}
 	// Init server instance with specified role configuration.
 	var (
 		server common.Server
@@ -203,11 +211,13 @@ func main() {
 		level = log.WarnLevel
 	case "error":
 		level = log.ErrorLevel
+	case "critical":
+		level = log.CriticalLevel
 	default:
 		level = log.ErrorLevel
 	}
 
-	_, err = log.InitLog(logDir, module, level, nil)
+	_, err = log.InitLog(logDir, module, level, nil, logLeftSpaceLimit)
 	if err != nil {
 		err = errors.NewErrorf("Fatal: failed to init log - %v", err)
 		fmt.Println(err)
@@ -216,20 +226,38 @@ func main() {
 	}
 	defer log.LogFlush()
 
-	// Init output file
-	outputFilePath := path.Join(logDir, module, LoggerOutput)
-	outputFile, err := os.OpenFile(outputFilePath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0666)
+	_, err = auditlog.InitAudit(logDir, module, auditlog.DefaultAuditLogSize)
 	if err != nil {
-		err = errors.NewErrorf("Fatal: failed to open output path - %v", err)
+		err = errors.NewErrorf("Fatal: failed to init audit log - %v", err)
 		fmt.Println(err)
 		daemonize.SignalOutcome(err)
 		os.Exit(1)
 	}
-	defer func() {
-		outputFile.Sync()
-		outputFile.Close()
-	}()
-	syslog.SetOutput(outputFile)
+	defer auditlog.StopAudit()
+
+	if *redirectSTD {
+		// Init output file
+		outputFilePath := path.Join(logDir, module, LoggerOutput)
+		outputFile, err := os.OpenFile(outputFilePath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0666)
+		if err != nil {
+			err = errors.NewErrorf("Fatal: failed to open output path - %v", err)
+			fmt.Println(err)
+			daemonize.SignalOutcome(err)
+			os.Exit(1)
+		}
+		defer func() {
+			outputFile.Sync()
+			outputFile.Close()
+		}()
+
+		syslog.SetOutput(outputFile)
+		if err = sysutil.RedirectFD(int(outputFile.Fd()), int(os.Stderr.Fd())); err != nil {
+			err = errors.NewErrorf("Fatal: failed to redirect fd - %v", err)
+			syslog.Println(err)
+			daemonize.SignalOutcome(err)
+			os.Exit(1)
+		}
+	}
 
 	if buffersTotalLimit < 0 {
 		syslog.Printf("invalid fields, BuffersTotalLimit(%v) must larger or equal than 0\n", buffersTotalLimit)
@@ -237,13 +265,6 @@ func main() {
 	}
 
 	proto.InitBufferPool(buffersTotalLimit)
-
-	if err = sysutil.RedirectFD(int(outputFile.Fd()), int(os.Stderr.Fd())); err != nil {
-		err = errors.NewErrorf("Fatal: failed to redirect fd - %v", err)
-		syslog.Println(err)
-		daemonize.SignalOutcome(err)
-		os.Exit(1)
-	}
 
 	syslog.Printf("Hello, CubeFS Storage\n%s\n", Version)
 
@@ -267,11 +288,27 @@ func main() {
 
 	if profPort != "" {
 		go func() {
+			mainMux := http.NewServeMux()
+			mux := http.NewServeMux()
 			http.HandleFunc(log.SetLogLevelPath, log.SetLogLevel)
-			e := http.ListenAndServe(fmt.Sprintf(":%v", profPort), nil)
+			mux.Handle("/debug/pprof", http.HandlerFunc(pprof.Index))
+			mux.Handle("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
+			mux.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
+			mux.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
+			mux.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
+			mux.Handle("/debug/", http.HandlerFunc(pprof.Index))
+			mainHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if strings.HasPrefix(req.URL.Path, "/debug/") {
+					mux.ServeHTTP(w, req)
+				} else {
+					http.DefaultServeMux.ServeHTTP(w, req)
+				}
+			})
+			mainMux.Handle("/", mainHandler)
+			e := http.ListenAndServe(fmt.Sprintf(":%v", profPort), mainMux)
 			if e != nil {
 				log.LogFlush()
-				err = errors.NewErrorf("cannot listen pprof %v err %v", profPort, err)
+				err = errors.NewErrorf("cannot listen pprof %v err %v", profPort, e)
 				syslog.Println(err)
 				daemonize.SignalOutcome(err)
 				os.Exit(1)

@@ -36,6 +36,7 @@ type DataPartitionMap struct {
 	responseCache          []byte
 	lastAutoCreateTime     time.Time
 	volName                string
+	readMutex              sync.RWMutex
 }
 
 func newDataPartitionMap(volName string) (dpMap *DataPartitionMap) {
@@ -139,6 +140,13 @@ func (dpMap *DataPartitionMap) setDataPartitionResponseCache(responseCache []byt
 func (dpMap *DataPartitionMap) updateResponseCache(needsUpdate bool, minPartitionID uint64, volType int) (body []byte, err error) {
 	responseCache := dpMap.getDataPartitionResponseCache()
 	if responseCache == nil || needsUpdate || len(responseCache) == 0 {
+		dpMap.readMutex.Lock()
+		defer dpMap.readMutex.Unlock()
+		responseCache = dpMap.getDataPartitionResponseCache()
+		if !(responseCache == nil || needsUpdate || len(responseCache) == 0) {
+			body = responseCache
+			return
+		}
 		dpResps := dpMap.getDataPartitionsView(minPartitionID)
 		if len(dpResps) == 0 && proto.IsHot(volType) {
 			log.LogError(fmt.Sprintf("action[updateDpResponseCache],volName[%v] minPartitionID:%v,err:%v",
@@ -169,6 +177,10 @@ func (dpMap *DataPartitionMap) getDataPartitionsView(minPartitionID uint64) (dpR
 	dpMap.RLock()
 	defer dpMap.RUnlock()
 	for _, dp := range dpMap.partitionMap {
+		if len(dp.Hosts) == 0 {
+			log.LogErrorf("getDataPartitionsView. dp %v host nil", dp.PartitionID)
+			continue
+		}
 		if dp.PartitionID <= minPartitionID {
 			continue
 		}
@@ -270,9 +282,14 @@ func (dpMap *DataPartitionMap) totalUsedSpace() (totalUsed uint64) {
 func (dpMap *DataPartitionMap) setAllDataPartitionsToReadOnly() {
 	dpMap.Lock()
 	defer dpMap.Unlock()
+	changedCnt := 0
 	for _, dp := range dpMap.partitions {
-		dp.Status = proto.ReadOnly
+		if proto.ReadWrite == dp.Status {
+			dp.Status = proto.ReadOnly
+			changedCnt++
+		}
 	}
+	log.LogDebugf("action[setAllDataPartitionsToReadOnly] ReadWrite->ReadOnly dp cnt: %v", changedCnt)
 }
 
 func (dpMap *DataPartitionMap) checkBadDiskDataPartitions(diskPath, nodeAddr string) (partitions []*DataPartition) {

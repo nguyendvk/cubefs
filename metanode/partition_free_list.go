@@ -31,7 +31,6 @@ import (
 
 const (
 	AsyncDeleteInterval           = 10 * time.Second
-	UpdateVolTicket               = 2 * time.Minute
 	BatchCounts                   = 128
 	OpenRWAppendOpt               = os.O_CREATE | os.O_RDWR | os.O_APPEND
 	TempFileValidTime             = 86400 //units: sec
@@ -46,33 +45,22 @@ func (mp *metaPartition) startFreeList() (err error) {
 		return
 	}
 
-	// start vol update ticket
-	go mp.updateVolWorker()
 	go mp.deleteWorker()
 	mp.startToDeleteExtents()
 	return
 }
 
-func (mp *metaPartition) updateVolView(convert func(view *proto.DataPartitionsView) *DataPartitionsView) (err error) {
-	volName := mp.config.VolName
-	dataView, err := masterClient.ClientAPI().GetDataPartitions(volName)
-	if err != nil {
-		err = fmt.Errorf("updateVolWorker: get data partitions view fail: volume(%v) err(%v)",
-			volName, err)
-		log.LogErrorf(err.Error())
-		return
-	}
-	mp.vol.UpdatePartitions(convert(dataView))
-	return nil
-}
-
-func (mp *metaPartition) updateVolWorker() {
-	t := time.NewTicker(UpdateVolTicket)
+func (mp *metaPartition) UpdateVolumeView(dataView *proto.DataPartitionsView, volumeView *proto.SimpleVolView) {
 	var convert = func(view *proto.DataPartitionsView) *DataPartitionsView {
 		newView := &DataPartitionsView{
 			DataPartitions: make([]*DataPartition, len(view.DataPartitions)),
 		}
 		for i := 0; i < len(view.DataPartitions); i++ {
+			if len(view.DataPartitions[i].Hosts) < 1 {
+				log.LogErrorf("action[UpdateVolumeView] dp id(%v) is invalid, DataPartitionResponse detail[%v]",
+					view.DataPartitions[i].PartitionID, view.DataPartitions[i])
+				continue
+			}
 			newView.DataPartitions[i] = &DataPartition{
 				PartitionID: view.DataPartitions[i].PartitionID,
 				Status:      view.DataPartitions[i].Status,
@@ -82,16 +70,8 @@ func (mp *metaPartition) updateVolWorker() {
 		}
 		return newView
 	}
-	mp.updateVolView(convert)
-	for {
-		select {
-		case <-mp.stopC:
-			t.Stop()
-			return
-		case <-t.C:
-			mp.updateVolView(convert)
-		}
-	}
+	mp.vol.UpdatePartitions(convert(dataView))
+	mp.vol.volDeleteLockTime = volumeView.DeleteLockTime
 }
 
 const (
@@ -139,16 +119,17 @@ func (mp *metaPartition) deleteWorker() {
 		batchCount := DeleteBatchCount()
 		delayDeleteInos := make([]uint64, 0)
 		for idx = 0; idx < int(batchCount); idx++ {
-			// batch get free inoded from the freeList
+			// batch get free inode from the freeList
 			ino := mp.freeList.Pop()
 			if ino == 0 {
 				break
 			}
 
-			//check inode nlink == 0 and deletMarkFlag unset
-			if inode, ok := mp.inodeTree.CopyGet(&Inode{Inode: ino}).(*Inode); ok {
-				if inode.ShouldDelayDelete() {
-					log.LogDebugf("[metaPartition] deleteWorker delay to remove inode: %v as NLink is 0", inode)
+			//check inode nlink == 0 and deleteMarkFlag unset
+			if inode, ok := mp.inodeTree.Get(&Inode{Inode: ino}).(*Inode); ok {
+				inTx, _ := mp.txProcessor.txResource.isInodeInTransction(inode)
+				if inode.ShouldDelayDelete() || inTx {
+					log.LogDebugf("[metaPartition] deleteWorker delay to remove inode: %v as NLink is 0, inTx %v", inode, inTx)
 					delayDeleteInos = append(delayDeleteInos, ino)
 					continue
 				}
@@ -179,7 +160,7 @@ func (mp *metaPartition) batchDeleteExtentsByPartition(partitionDeleteExtents ma
 		lock sync.Mutex
 	)
 
-	//wait all Partition do BatchDeleteExtents fininsh
+	//wait all Partition do BatchDeleteExtents finish
 	for partitionID, extents := range partitionDeleteExtents {
 		wg.Add(1)
 		go func(partitionID uint64, extents []*proto.ExtentKey) {
@@ -233,8 +214,13 @@ func (mp *metaPartition) deleteMarkedInodes(inoSlice []uint64) {
 	allInodes := make([]*Inode, 0)
 	for _, ino := range inoSlice {
 		ref := &Inode{Inode: ino}
-		inode, ok := mp.inodeTree.CopyGet(ref).(*Inode)
+		inode, ok := mp.inodeTree.Get(ref).(*Inode)
 		if !ok {
+			continue
+		}
+
+		if !inode.ShouldDelete() {
+			log.LogWarnf("deleteMarkedInodes: inode should not be deleted, ino %s", inode.String())
 			continue
 		}
 
@@ -350,16 +336,17 @@ func (mp *metaPartition) doDeleteMarkedInodes(ext *proto.ExtentKey) (err error) 
 	}
 
 	// delete the data node
+	if len(dp.Hosts) < 1 {
+		log.LogErrorf("doBatchDeleteExtentsByPartition dp id(%v) is invalid, detail[%v]", ext.PartitionId, dp)
+		err = errors.NewErrorf("dp id(%v) is invalid", ext.PartitionId)
+		return
+	}
 	addr := util.ShiftAddrPort(dp.Hosts[0], smuxPortShift)
 	conn, err := smuxPool.GetConnect(addr)
 	log.LogInfof("doDeleteMarkedInodes mp (%v) GetConnect (%v), ext(%s)", mp.config.PartitionId, addr, ext.String())
 
 	defer func() {
-		if err != nil {
-			smuxPool.PutConnect(conn, ForceClosedConnect)
-		} else {
-			smuxPool.PutConnect(conn, NoClosedConnect)
-		}
+		smuxPool.PutConnect(conn, ForceClosedConnect)
 		log.LogInfof("doDeleteMarkedInodes mp (%v) PutConnect (%v), ext(%s)", mp.config.PartitionId, addr, ext.String())
 	}()
 
@@ -417,6 +404,11 @@ func (mp *metaPartition) doBatchDeleteExtentsByPartition(partitionID uint64, ext
 	}
 
 	// delete the data node
+	if len(dp.Hosts) < 1 {
+		log.LogErrorf("doBatchDeleteExtentsByPartition dp id(%v) is invalid, detail[%v]", partitionID, dp)
+		err = errors.NewErrorf("dp id(%v) is invalid", partitionID)
+		return
+	}
 	addr := util.ShiftAddrPort(dp.Hosts[0], smuxPortShift)
 	conn, err := smuxPool.GetConnect(addr)
 	log.LogInfof("doBatchDeleteExtentsByPartition mp (%v) GetConnect (%v)", mp.config.PartitionId, addr)
@@ -424,11 +416,7 @@ func (mp *metaPartition) doBatchDeleteExtentsByPartition(partitionID uint64, ext
 	ResultCode := proto.OpOk
 
 	defer func() {
-		if err != nil && ResultCode != proto.OpAgain {
-			smuxPool.PutConnect(conn, ForceClosedConnect)
-		} else {
-			smuxPool.PutConnect(conn, NoClosedConnect)
-		}
+		smuxPool.PutConnect(conn, ForceClosedConnect)
 		log.LogInfof("doBatchDeleteExtentsByPartition mp (%v) PutConnect (%v)", mp.config.PartitionId, addr)
 	}()
 

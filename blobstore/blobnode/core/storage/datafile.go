@@ -71,8 +71,7 @@ const (
 )
 
 const (
-	_pagesize = 4 * 1024              // 4k
-	bufsize   = core.CrcBlockUnitSize // 64k
+	_pageSize = 4 * 1024 // 4k
 )
 
 const (
@@ -177,7 +176,7 @@ func NewChunkData(ctx context.Context, vm core.VuidMeta, file string, conf *core
 		ioQos:  ioQos,
 		pool: sync.Pool{
 			New: func() interface{} {
-				return make([]byte, bufsize)
+				return make([]byte, core.CrcBlockUnitSize)
 			},
 		},
 	}
@@ -219,7 +218,7 @@ func (cd *datafile) init(meta *core.VuidMeta) (err error) {
 		if err = cd.parseMeta(); err != nil {
 			return
 		}
-		cd.wOff = core.AlignSize(chunkSize, int64(_pagesize))
+		cd.wOff = core.AlignSize(chunkSize, int64(_pageSize))
 	}
 
 	return
@@ -294,7 +293,7 @@ func (cd *datafile) allocSpace(fsize int64) (pos int64, err error) {
 	pos = cd.wOff
 
 	cd.wOff += fsize
-	cd.wOff = core.AlignSize(cd.wOff, _pagesize)
+	cd.wOff = core.AlignSize(cd.wOff, _pageSize)
 
 	return pos, nil
 }
@@ -414,7 +413,7 @@ func (cd *datafile) Read(ctx context.Context, shard *core.Shard, from, to uint32
 	block := make([]byte, core.CrcBlockUnitSize)
 
 	// decode crc
-	decoder, err := crc32block.NewDecoderWithBlock(iosr, pos, int64(shard.Size), block, bufsize)
+	decoder, err := crc32block.NewDecoderWithBlock(iosr, pos, int64(shard.Size), block, cd.conf.BlockBufferSize)
 	if err != nil {
 		return nil, err
 	}
@@ -451,13 +450,13 @@ func (cd *datafile) Delete(ctx context.Context, shard *core.Shard) (err error) {
 		return ErrShardHeaderNotMatch
 	}
 
-	if shard.Offset%_pagesize != 0 {
+	if shard.Offset%_pageSize != 0 {
 		return ErrShardOffNotAlignment
 	}
 
 	// punch hole
 	discardSize = core.Alignphysize(int64(shard.Size))
-	discardSize = core.AlignSize(discardSize, _pagesize)
+	discardSize = core.AlignSize(discardSize, _pageSize)
 	err = cd.ef.Discard(shard.Offset, discardSize)
 
 	return err
@@ -506,17 +505,17 @@ func (cd *datafile) spaceInfo() (size int64, phySpace int64, err error) {
 }
 
 func (cd *datafile) qosReaderAt(ctx context.Context, reader io.ReaderAt) io.ReaderAt {
-	ioType := bnapi.Getiotype(ctx)
+	ioType := bnapi.GetIoType(ctx)
 	return cd.ioQos.ReaderAt(ctx, ioType, reader)
 }
 
 func (cd *datafile) qosWriterAt(ctx context.Context, writer io.WriterAt) io.WriterAt {
-	ioType := bnapi.Getiotype(ctx)
+	ioType := bnapi.GetIoType(ctx)
 	w := cd.ioQos.WriterAt(ctx, ioType, writer)
 	return w
 }
 
 func (cd *datafile) qosWriter(ctx context.Context, writer io.Writer) io.Writer {
-	ioType := bnapi.Getiotype(ctx)
+	ioType := bnapi.GetIoType(ctx)
 	return cd.ioQos.Writer(ctx, ioType, writer)
 }

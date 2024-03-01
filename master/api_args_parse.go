@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/cryptoutil"
 	"github.com/cubefs/cubefs/util/log"
 )
@@ -38,6 +40,100 @@ func parseRequestForRaftNode(r *http.Request) (id uint64, host string, err error
 	if arr := strings.Split(host, colonSplit); len(arr) < 2 {
 		err = unmatchedKey(addrKey)
 		return
+	}
+	return
+}
+
+func extractTxTimeout(r *http.Request) (timeout int64, err error) {
+	var txTimeout uint64
+	if txTimeout, err = extractUint64WithDefault(r, txTimeoutKey, proto.DefaultTransactionTimeout); err != nil {
+		return
+	}
+
+	if txTimeout == 0 || txTimeout > proto.MaxTransactionTimeout {
+		return timeout, fmt.Errorf("txTimeout(%d) value range [1-%v] minutes", txTimeout, proto.MaxTransactionTimeout)
+	}
+	timeout = int64(txTimeout)
+	return timeout, nil
+}
+
+func extractTxConflictRetryNum(r *http.Request) (retryNum int64, err error) {
+	var txRetryNum uint64
+	if txRetryNum, err = extractUint64WithDefault(r, txConflictRetryNumKey, proto.DefaultTxConflictRetryNum); err != nil {
+		return
+	}
+
+	if txRetryNum == 0 || txRetryNum > proto.MaxTxConflictRetryNum {
+		return retryNum, fmt.Errorf("txRetryNum(%d) value range [1-%v]", txRetryNum, proto.MaxTxConflictRetryNum)
+	}
+	retryNum = int64(txRetryNum)
+	return retryNum, nil
+}
+
+func extractTxConflictRetryInterval(r *http.Request) (interval int64, err error) {
+	var txInterval uint64
+	if txInterval, err = extractUint64WithDefault(r, txConflictRetryIntervalKey, proto.DefaultTxConflictRetryInterval); err != nil {
+		return
+	}
+
+	if txInterval < proto.MinTxConflictRetryInterval || txInterval > proto.MaxTxConflictRetryInterval {
+		return interval, fmt.Errorf("txInterval(%d) value range [%v-%v] ms",
+			txInterval, proto.MinTxConflictRetryInterval, proto.MaxTxConflictRetryInterval)
+	}
+	interval = int64(txInterval)
+	return interval, nil
+}
+
+func extractTxOpLimitInterval(r *http.Request, volLimit int) (limit int, err error) {
+	var txLimit int
+	if txLimit, err = extractUintWithDefault(r, txOpLimitKey, volLimit); err != nil {
+		return
+	}
+
+	limit = txLimit
+	return
+}
+
+func hasTxParams(r *http.Request) bool {
+	var (
+		maskStr    string
+		timeoutStr string
+	)
+	if maskStr = r.FormValue(enableTxMaskKey); maskStr != "" {
+		return true
+	}
+
+	if timeoutStr = r.FormValue(txTimeoutKey); timeoutStr != "" {
+		return true
+	}
+	return false
+}
+
+func parseTxMask(r *http.Request, oldMask proto.TxOpMask) (mask proto.TxOpMask, err error) {
+
+	var maskStr string
+	if maskStr = r.FormValue(enableTxMaskKey); maskStr == "" {
+		mask = oldMask
+		return
+	}
+
+	var reset bool
+	reset, err = extractBoolWithDefault(r, txForceResetKey, false)
+	if err != nil {
+		return
+	}
+
+	mask, err = proto.GetMaskFromString(maskStr)
+	if err != nil {
+		return
+	}
+
+	if reset {
+		return
+	}
+
+	if mask != proto.TxOpMaskOff {
+		mask = mask | oldMask
 	}
 	return
 }
@@ -75,6 +171,15 @@ func parseDecomNodeReq(r *http.Request) (nodeAddr string, limit int, err error) 
 	}
 
 	limit, err = parseUintParam(r, countKey)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func parseDecomDataNodeReq(r *http.Request) (nodeAddr string, err error) {
+	nodeAddr, err = parseAndExtractNodeAddr(r)
 	if err != nil {
 		return
 	}
@@ -198,6 +303,20 @@ func extractUint64WithDefault(r *http.Request, key string, def uint64) (val uint
 	return val, nil
 }
 
+func extractInt64WithDefault(r *http.Request, key string, def int64) (val int64, err error) {
+
+	var str string
+	if str = r.FormValue(key); str == "" {
+		return def, nil
+	}
+
+	if val, err = strconv.ParseInt(str, 10, 64); err != nil || val < 0 {
+		return 0, fmt.Errorf("parse [%s] is not valid int [%d], err %v", key, val, err)
+	}
+
+	return val, nil
+}
+
 func extractStrWithDefault(r *http.Request, key string, def string) (val string) {
 
 	if val = r.FormValue(key); val == "" {
@@ -221,17 +340,26 @@ func extractBoolWithDefault(r *http.Request, key string, def bool) (val bool, er
 }
 
 type updateVolReq struct {
-	name           string
-	authKey        string
-	capacity       uint64
-	followRead     bool
-	authenticate   bool
-	enablePosixAcl bool
-	zoneName       string
-	description    string
-	dpSelectorName string
-	dpSelectorParm string
-	coldArgs       *coldVolArgs
+	name                    string
+	authKey                 string
+	capacity                uint64
+	deleteLockTime          int64
+	followerRead            bool
+	authenticate            bool
+	enablePosixAcl          bool
+	enableTransaction       proto.TxOpMask
+	txTimeout               int64
+	txConflictRetryNum      int64
+	txConflictRetryInterval int64
+	txOpLimit               int
+	zoneName                string
+	description             string
+	dpSelectorName          string
+	dpSelectorParm          string
+	replicaNum              int
+	coldArgs                *coldVolArgs
+	dpReadOnlyWhenVolFull   bool
+	enableQuota             bool
 }
 
 func parseColdVolUpdateArgs(r *http.Request, vol *Vol) (args *coldVolArgs, err error) {
@@ -312,7 +440,43 @@ func parseVolUpdateReq(r *http.Request, vol *Vol, req *updateVolReq) (err error)
 		return
 	}
 
+	if req.deleteLockTime, err = extractInt64WithDefault(r, volDeleteLockTimeKey, vol.DeleteLockTime); err != nil {
+		return
+	}
+
 	if req.enablePosixAcl, err = extractBoolWithDefault(r, enablePosixAclKey, vol.enablePosixAcl); err != nil {
+		return
+	}
+
+	var txMask proto.TxOpMask
+	if txMask, err = parseTxMask(r, vol.enableTransaction); err != nil {
+		return
+	}
+	req.enableTransaction = txMask
+
+	if req.enableQuota, err = extractBoolWithDefault(r, enableQuota, vol.enableQuota); err != nil {
+		return
+	}
+
+	var txTimeout int64
+	if txTimeout, err = extractTxTimeout(r); err != nil {
+		return
+	}
+	req.txTimeout = txTimeout
+
+	var txConflictRetryNum int64
+	if txConflictRetryNum, err = extractTxConflictRetryNum(r); err != nil {
+		return
+	}
+	req.txConflictRetryNum = txConflictRetryNum
+
+	var txConflictRetryInterval int64
+	if txConflictRetryInterval, err = extractTxConflictRetryInterval(r); err != nil {
+		return
+	}
+	req.txConflictRetryInterval = txConflictRetryInterval
+
+	if req.txOpLimit, err = extractTxOpLimitInterval(r, vol.txOpLimit); err != nil {
 		return
 	}
 
@@ -320,7 +484,11 @@ func parseVolUpdateReq(r *http.Request, vol *Vol, req *updateVolReq) (err error)
 		return
 	}
 
-	if req.followRead, err = extractBoolWithDefault(r, followerReadKey, vol.FollowerRead); err != nil {
+	if req.followerRead, err = extractBoolWithDefault(r, followerReadKey, vol.FollowerRead); err != nil {
+		return
+	}
+
+	if req.dpReadOnlyWhenVolFull, err = extractBoolWithDefault(r, dpReadOnlyWhenVolFull, vol.DpReadOnlyWhenVolFull); err != nil {
 		return
 	}
 
@@ -335,30 +503,9 @@ func parseVolUpdateReq(r *http.Request, vol *Vol, req *updateVolReq) (err error)
 		req.dpSelectorName = vol.dpSelectorName
 		req.dpSelectorParm = vol.dpSelectorParm
 	}
-	var replicaNum int
-	if replicaNumStr := r.FormValue(replicaNumKey); replicaNumStr != "" {
-		if replicaNum, err = strconv.Atoi(replicaNumStr); err != nil {
-			err = unmatchedKey(replicaNumKey)
-			return
-		}
-	} else {
-		replicaNum = int(vol.dpReplicaNum)
-	}
-
-	if replicaNum != 0 && replicaNum != int(vol.dpReplicaNum) {
-		if replicaNum != 2 || vol.dpReplicaNum != 3 {
-			err = fmt.Errorf("replicaNum cann't be changed(3 to 2 is allowed)")
-			return
-		}
-		if !proto.IsHot(vol.VolType) {
-			err = fmt.Errorf("vol type(%v) replicaNum cann't be changed", vol.VolType)
-			return
-		}
-		vol.dpReplicaNum = 2
-	}
 
 	if proto.IsCold(vol.VolType) {
-		req.followRead = true
+		req.followerRead = true
 		req.coldArgs, err = parseColdVolUpdateArgs(r, vol)
 		if err != nil {
 			return
@@ -385,6 +532,30 @@ func parseBoolFieldToUpdateVol(r *http.Request, vol *Vol) (followerRead, authent
 	} else {
 		authenticate = vol.authenticate
 	}
+	return
+}
+
+func parseRequestToSetApiQpsLimit(r *http.Request) (name string, limit uint32, timeout uint32, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+
+	if name, err = extractName(r); err != nil {
+		return
+	}
+
+	if limit, err = extractUint32(r, Limit); err != nil {
+		return
+	}
+
+	if timeout, err = extractUint32(r, TimeOut); err != nil {
+		return
+	}
+
+	if timeout == 0 {
+		err = fmt.Errorf("timeout(seconds) args must be larger than 0")
+	}
+
 	return
 }
 
@@ -438,8 +609,9 @@ type createVolReq struct {
 	owner                                string
 	size                                 int
 	mpCount                              int
-	dpReplicaNum                         int
+	dpReplicaNum                         uint8
 	capacity                             int
+	deleteLockTime                       int64
 	followerRead                         bool
 	authenticate                         bool
 	crossZone                            bool
@@ -449,6 +621,12 @@ type createVolReq struct {
 	description                          string
 	volType                              int
 	enablePosixAcl                       bool
+	DpReadOnlyWhenVolFull                bool
+	enableTransaction                    proto.TxOpMask
+	enableQuota                          bool
+	txTimeout                            int64
+	txConflictRetryNum                   int64
+	txConflictRetryInterval              int64
 	qosLimitArgs                         *qosArgs
 	clientReqPeriod, clientHitTriggerCnt uint32
 	// cold vol args
@@ -524,9 +702,14 @@ func parseRequestToCreateVol(r *http.Request, req *createVolReq) (err error) {
 		return
 	}
 
-	if req.dpReplicaNum, err = extractUint(r, replicaNumKey); err != nil {
+	var parsedDpReplicaNum int
+	if parsedDpReplicaNum, err = extractUint(r, replicaNumKey); err != nil {
 		return
 	}
+	if parsedDpReplicaNum < 0 || parsedDpReplicaNum > math.MaxUint8 {
+		return fmt.Errorf("invalid arg dpReplicaNum: %v", parsedDpReplicaNum)
+	}
+	req.dpReplicaNum = uint8(parsedDpReplicaNum)
 
 	if req.size, err = extractUintWithDefault(r, dataPartitionSizeKey, 120); err != nil {
 		return
@@ -534,6 +717,10 @@ func parseRequestToCreateVol(r *http.Request, req *createVolReq) (err error) {
 
 	// default capacity 120
 	if req.capacity, err = extractUint(r, volCapacityKey); err != nil {
+		return
+	}
+
+	if req.deleteLockTime, err = extractInt64WithDefault(r, volDeleteLockTimeKey, 0); err != nil {
 		return
 	}
 
@@ -578,6 +765,38 @@ func parseRequestToCreateVol(r *http.Request, req *createVolReq) (err error) {
 
 	req.enablePosixAcl, err = extractPosixAcl(r)
 
+	if req.DpReadOnlyWhenVolFull, err = extractBoolWithDefault(r, dpReadOnlyWhenVolFull, false); err != nil {
+		return
+	}
+
+	var txMask proto.TxOpMask
+	if txMask, err = parseTxMask(r, proto.TxOpMaskOff); err != nil {
+		return
+	}
+	req.enableTransaction = txMask
+
+	var txTimeout int64
+	if txTimeout, err = extractTxTimeout(r); err != nil {
+		return
+	}
+	req.txTimeout = txTimeout
+
+	var txConflictRetryNum int64
+	if txConflictRetryNum, err = extractTxConflictRetryNum(r); err != nil {
+		return
+	}
+	req.txConflictRetryNum = txConflictRetryNum
+
+	var txConflictRetryInterval int64
+	if txConflictRetryInterval, err = extractTxConflictRetryInterval(r); err != nil {
+		return
+	}
+	req.txConflictRetryInterval = txConflictRetryInterval
+
+	if req.enableQuota, err = extractBoolWithDefault(r, enableQuota, false); err != nil {
+		return
+	}
+
 	return
 }
 
@@ -606,6 +825,16 @@ func parseRequestToGetDataPartition(r *http.Request) (ID uint64, volName string,
 		return
 	}
 	volName = r.FormValue(nameKey)
+	return
+}
+
+func parseRequestToBalanceMetaPartition(r *http.Request) (zones string, nodeSetIds string, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+	zones = r.FormValue(zoneNameKey)
+	nodeSetIds = r.FormValue(nodesetIdKey)
+
 	return
 }
 
@@ -679,6 +908,9 @@ func extractNodeAddr(r *http.Request) (nodeAddr string, err error) {
 		err = keyNotFound(addrKey)
 		return
 	}
+	if ipAddr, ok := util.ParseAddrToIpAddr(nodeAddr); ok {
+		nodeAddr = ipAddr
+	}
 	return
 }
 
@@ -697,6 +929,15 @@ func extractDiskPath(r *http.Request) (diskPath string, err error) {
 		return
 	}
 	return
+}
+
+func extractDiskDisable(r *http.Request) (diskDisable bool, err error) {
+	var value string
+	if value = r.FormValue(DiskDisableKey); value == "" {
+		diskDisable = false
+		return
+	}
+	return strconv.ParseBool(value)
 }
 
 func parseRequestToLoadMetaPartition(r *http.Request) (partitionID uint64, err error) {
@@ -767,6 +1008,30 @@ func extractCrossZone(r *http.Request) (crossZone bool, err error) {
 	if crossZone, err = strconv.ParseBool(value); err != nil {
 		return
 	}
+	return
+}
+
+func parseAndExtractDirLimit(r *http.Request) (limit uint32, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+	var value string
+
+	value = r.FormValue(dirLimitKey)
+	if value == "" {
+		value = r.FormValue(dirQuotaKey)
+		if value == "" {
+			err = keyNotFound(dirLimitKey)
+			return
+		}
+	}
+
+	var tmpLimit uint64
+	if tmpLimit, err = strconv.ParseUint(value, 10, 32); err != nil {
+		return
+	}
+
+	limit = uint32(tmpLimit)
 	return
 }
 
@@ -896,6 +1161,11 @@ func parseAndExtractSetNodeInfoParams(r *http.Request) (params map[string]interf
 		params[maxDpCntLimitKey] = val
 	}
 
+	if value = r.FormValue(clusterCreateTimeKey); value != "" {
+		noParams = false
+		params[clusterCreateTimeKey] = value
+	}
+
 	if noParams {
 		err = keyNotFound(nodeDeleteBatchCountKey)
 		return
@@ -945,7 +1215,7 @@ func extractAuthKey(r *http.Request) (authKey string, err error) {
 	return
 }
 
-func parseVolStatReq(r *http.Request) (name string, ver int, err error) {
+func parseVolStatReq(r *http.Request) (name string, ver int, byMeta bool, err error) {
 	if err = r.ParseForm(); err != nil {
 		return
 	}
@@ -959,7 +1229,10 @@ func parseVolStatReq(r *http.Request) (name string, ver int, err error) {
 	if err != nil {
 		return
 	}
-
+	byMeta, err = extractBoolWithDefault(r, CountByMeta, false)
+	if err != nil {
+		return
+	}
 	return
 }
 
@@ -995,14 +1268,16 @@ func extractName(r *http.Request) (name string, err error) {
 
 func extractUint(r *http.Request, key string) (val int, err error) {
 	var str string
+	var valParsed int64
 	if str = r.FormValue(key); str == "" {
 		return 0, nil
 	}
 
-	if val, err = strconv.Atoi(str); err != nil || val < 0 {
+	if valParsed, err = strconv.ParseInt(str, 10, 32); err != nil || valParsed < 0 {
 		return 0, fmt.Errorf("args [%s] is not legal, val %s", key, str)
 	}
 
+	val = int(valParsed)
 	return val, nil
 }
 
@@ -1030,6 +1305,20 @@ func extractUint64(r *http.Request, key string) (val uint64, err error) {
 	}
 
 	return val, nil
+}
+
+func extractUint32(r *http.Request, key string) (val uint32, err error) {
+	var str string
+	if str = r.FormValue(key); str == "" {
+		return 0, nil
+	}
+
+	var tmp uint64
+	if tmp, err = strconv.ParseUint(str, 10, 32); err != nil || val < 0 {
+		return 0, fmt.Errorf("args [%s] is not legal, val %s", key, str)
+	}
+
+	return uint32(tmp), nil
 }
 
 func extractPositiveUint64(r *http.Request, key string) (val uint64, err error) {
@@ -1172,7 +1461,7 @@ func sendOkReply(w http.ResponseWriter, r *http.Request, httpReply *proto.HTTPRe
 
 	reply, err := json.Marshal(httpReply)
 	if err != nil {
-		log.LogErrorf("fail to marshal http reply[%v]. URL[%v],remoteAddr[%v] err:[%v]", httpReply, r.URL, r.RemoteAddr, err)
+		log.LogErrorf("fail to marshal http reply. URL[%v],remoteAddr[%v] err:[%v]", r.URL, r.RemoteAddr, err)
 		http.Error(w, "fail to marshal http reply", http.StatusBadRequest)
 		return
 	}
@@ -1184,7 +1473,7 @@ func send(w http.ResponseWriter, r *http.Request, reply []byte) {
 	w.Header().Set("content-type", "application/json")
 	w.Header().Set("Content-Length", strconv.Itoa(len(reply)))
 	if _, err := w.Write(reply); err != nil {
-		log.LogErrorf("fail to write http reply[%s] len[%d].URL[%v],remoteAddr[%v] err:[%v]", string(reply), len(reply), r.URL, r.RemoteAddr, err)
+		log.LogErrorf("fail to write http len[%d].URL[%v],remoteAddr[%v] err:[%v]", len(reply), r.URL, r.RemoteAddr, err)
 		return
 	}
 	log.LogInfof("URL[%v],remoteAddr[%v],response ok", r.URL, r.RemoteAddr)
@@ -1192,10 +1481,10 @@ func send(w http.ResponseWriter, r *http.Request, reply []byte) {
 }
 
 func sendErrReply(w http.ResponseWriter, r *http.Request, httpReply *proto.HTTPReply) {
-	log.LogInfof("URL[%v],remoteAddr[%v],response err[%v]", r.URL, r.RemoteAddr, httpReply)
+	log.LogInfof("URL[%v],remoteAddr[%v],response", r.URL, r.RemoteAddr)
 	reply, err := json.Marshal(httpReply)
 	if err != nil {
-		log.LogErrorf("fail to marshal http reply[%v]. URL[%v],remoteAddr[%v] err:[%v]", httpReply, r.URL, r.RemoteAddr, err)
+		log.LogErrorf("fail to marshal http reply. URL[%v],remoteAddr[%v] err:[%v]", r.URL, r.RemoteAddr, err)
 		http.Error(w, "fail to marshal http reply", http.StatusBadRequest)
 		return
 	}
@@ -1203,8 +1492,181 @@ func sendErrReply(w http.ResponseWriter, r *http.Request, httpReply *proto.HTTPR
 	w.Header().Set("content-type", "application/json")
 	w.Header().Set("Content-Length", strconv.Itoa(len(reply)))
 	if _, err = w.Write(reply); err != nil {
-		log.LogErrorf("fail to write http reply[%s] len[%d].URL[%v],remoteAddr[%v] err:[%v]", string(reply), len(reply), r.URL, r.RemoteAddr, err)
+		log.LogErrorf("fail to write http len[%d].URL[%v],remoteAddr[%v] err:[%v]", len(reply), r.URL, r.RemoteAddr, err)
 	}
 
+	return
+}
+
+func parseRequestToUpdateDecommissionLimit(r *http.Request) (limit uint64, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+
+	var value string
+	if value = r.FormValue(decommissionLimit); value == "" {
+		err = keyNotFound(decommissionLimit)
+		return
+	}
+
+	limit, err = strconv.ParseUint(value, 10, 32)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func parseSetConfigParam(r *http.Request) (key string, value string, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+
+	if value = r.FormValue(cfgmetaPartitionInodeIdStep); value == "" {
+		err = keyNotFound("config")
+		return
+	}
+	key = cfgmetaPartitionInodeIdStep
+	log.LogInfo("parseSetConfigParam success.")
+	return
+}
+
+func parseGetConfigParam(r *http.Request) (key string, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+	if key = r.FormValue(configKey); key == "" {
+		err = keyNotFound("config")
+		return
+	}
+	log.LogInfo("parseGetConfigParam success.")
+	return
+}
+
+func parserSetQuotaParam(r *http.Request, req *proto.SetMasterQuotaReuqest) (err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+
+	if req.VolName, err = extractName(r); err != nil {
+		return
+	}
+
+	if req.MaxFiles, err = extractUint64WithDefault(r, MaxFilesKey, math.MaxUint64); err != nil {
+		return
+	}
+
+	if req.MaxBytes, err = extractUint64WithDefault(r, MaxBytesKey, math.MaxUint64); err != nil {
+		return
+	}
+	var body []byte
+	if body, err = ioutil.ReadAll(r.Body); err != nil {
+		return
+	}
+
+	if err = json.Unmarshal(body, &req.PathInfos); err != nil {
+		return
+	}
+
+	log.LogInfo("parserSetQuotaParam success.")
+	return
+}
+
+func parserUpdateQuotaParam(r *http.Request, req *proto.UpdateMasterQuotaReuqest) (err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+
+	if req.VolName, err = extractName(r); err != nil {
+		return
+	}
+
+	if req.QuotaId, err = extractQuotaId(r); err != nil {
+		return
+	}
+
+	if req.MaxFiles, err = extractUint64WithDefault(r, MaxFilesKey, math.MaxUint64); err != nil {
+		return
+	}
+
+	if req.MaxBytes, err = extractUint64WithDefault(r, MaxBytesKey, math.MaxUint64); err != nil {
+		return
+	}
+	log.LogInfo("parserUpdateQuotaParam success.")
+	return
+}
+
+func parseDeleteQuotaParam(r *http.Request) (volName string, quotaId uint32, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+
+	if volName, err = extractName(r); err != nil {
+		return
+	}
+
+	if quotaId, err = extractQuotaId(r); err != nil {
+		return
+	}
+
+	return
+}
+
+func parseGetQuotaParam(r *http.Request) (volName string, quotaId uint32, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+	if volName, err = extractName(r); err != nil {
+		return
+	}
+
+	if quotaId, err = extractQuotaId(r); err != nil {
+		return
+	}
+	return
+}
+
+func extractPath(r *http.Request) (fullPath string, err error) {
+	if fullPath = r.FormValue(fullPathKey); fullPath == "" {
+		err = keyNotFound(nameKey)
+		return
+	}
+	return
+}
+
+func extractQuotaId(r *http.Request) (quotaId uint32, err error) {
+	var value string
+	if value = r.FormValue(quotaKey); value == "" {
+		err = keyNotFound(quotaKey)
+		return
+	}
+	tmp, err := strconv.ParseUint(value, 10, 32)
+	quotaId = uint32(tmp)
+	return
+}
+
+func extractInodeId(r *http.Request) (inode uint64, err error) {
+	var value string
+	if value = r.FormValue(inodeKey); value == "" {
+		err = keyNotFound(inodeKey)
+		return
+	}
+	return strconv.ParseUint(value, 10, 64)
+}
+
+func parseRequestToSetTrashInterval(r *http.Request) (name, authKey string, interval int64, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+
+	if name, err = extractName(r); err != nil {
+		return
+	}
+	if authKey, err = extractAuthKey(r); err != nil {
+		return
+	}
+	if interval, err = extractInt64WithDefault(r, TrashIntervalKey, 0); err != nil {
+		return
+	}
 	return
 }

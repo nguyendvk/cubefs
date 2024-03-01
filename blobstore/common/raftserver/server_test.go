@@ -238,6 +238,7 @@ func submit(rs RaftServer, ctx context.Context, key string, value []byte) error 
 }
 
 func TestRaftServer(t *testing.T) {
+	log.SetOutputLevel(0)
 	os.RemoveAll("/tmp/raftserver")
 	go func() {
 		if err := http.ListenAndServe(":8080", nil); err != http.ErrServerClosed {
@@ -359,7 +360,9 @@ func TestRaftServer(t *testing.T) {
 	os.RemoveAll(cfgs[prevIdx].WalDir)   // clear raft wal
 	stores[prevIdx].kv.Delete("abcdefg") // clear data in kv storage
 	mbs := cfgs[prevIdx].Members
+	mbs[prevIdx].Host = "127.0.0.1:9096"
 	require.Equal(t, 3, len(mbs))
+	cfgs[prevIdx].ListenPort = 9096
 	rss[prevIdx], err = NewRaftServer(cfgs[prevIdx])
 	require.Nil(t, err)
 

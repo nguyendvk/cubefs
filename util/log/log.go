@@ -33,7 +33,7 @@ import (
 	"syscall"
 	"time"
 
-	blog "github.com/cubefs/blobstore/util/log"
+	blog "github.com/cubefs/cubefs/blobstore/util/log"
 )
 
 type Level uint8
@@ -95,10 +95,7 @@ func setBlobLogLevel(loglevel Level) {
 		blevel = blog.Lwarn
 	case ErrorLevel:
 		blevel = blog.Lerror
-	default:
-		blevel = blog.Lwarn
 	}
-
 	blog.SetOutputLevel(blevel)
 }
 
@@ -259,8 +256,8 @@ type Log struct {
 	readLogger     *LogObject
 	updateLogger   *LogObject
 	criticalLogger *LogObject
+	qosLogger      *LogObject
 	level          Level
-	msgC           chan string
 	rotate         *LogRotate
 	lastRolledTime time.Time
 }
@@ -273,6 +270,7 @@ var (
 	ReadLogFileName     = "_read.log"
 	UpdateLogFileName   = "_write.log"
 	CriticalLogFileName = "_critical.log"
+	QoSLogFileName      = "_qos.log"
 )
 
 var gLog *Log = nil
@@ -280,7 +278,7 @@ var gLog *Log = nil
 var LogDir string
 
 // InitLog initializes the log.
-func InitLog(dir, module string, level Level, rotate *LogRotate) (*Log, error) {
+func InitLog(dir, module string, level Level, rotate *LogRotate, logLeftSpaceLimit int64) (*Log, error) {
 	l := new(Log)
 	dir = path.Join(dir, module)
 	l.dir = dir
@@ -293,7 +291,7 @@ func InitLog(dir, module string, level Level, rotate *LogRotate) (*Log, error) {
 			return nil, errors.New(dir + " is not a directory")
 		}
 	}
-	_ = os.Chmod(dir, 0766)
+	_ = os.Chmod(dir, 0755)
 	if rotate == nil {
 		rotate = NewLogRotate()
 		fs := syscall.Statfs_t{}
@@ -301,13 +299,16 @@ func InitLog(dir, module string, level Level, rotate *LogRotate) (*Log, error) {
 			return nil, fmt.Errorf("[InitLog] stats disk space: %s",
 				err.Error())
 		}
-		var minRatio float64
+		var minLogLeftSpaceLimit float64
 		if float64(fs.Bavail*uint64(fs.Bsize)) < float64(fs.Blocks*uint64(fs.Bsize))*DefaultHeadRatio {
-			minRatio = float64(fs.Bavail*uint64(fs.Bsize)) * DefaultHeadRatio / 1024 / 1024
+			minLogLeftSpaceLimit = float64(fs.Bavail*uint64(fs.Bsize)) * DefaultHeadRatio / 1024 / 1024
 		} else {
-			minRatio = float64(fs.Blocks*uint64(fs.Bsize)) * DefaultHeadRatio / 1024 / 1024
+			minLogLeftSpaceLimit = float64(fs.Blocks*uint64(fs.Bsize)) * DefaultHeadRatio / 1024 / 1024
 		}
-		rotate.SetHeadRoomMb(int64(math.Min(minRatio, DefaultHeadRoom)))
+
+		minLogLeftSpaceLimit = math.Max(minLogLeftSpaceLimit, float64(logLeftSpaceLimit))
+
+		rotate.SetHeadRoomMb(int64(math.Min(minLogLeftSpaceLimit, DefaultHeadRoom)))
 
 		minRollingSize := int64(fs.Bavail * uint64(fs.Bsize) / uint64(len(levelPrefixes)))
 		if minRollingSize < DefaultMinRollingSize {
@@ -326,6 +327,18 @@ func InitLog(dir, module string, level Level, rotate *LogRotate) (*Log, error) {
 	gLog = l
 	setBlobLogLevel(level)
 	return l, nil
+}
+
+func TruncMsg(msg string) string {
+	return TruncMsgWith(msg, 100)
+}
+
+func TruncMsgWith(msg string, size int) string {
+	if len(msg) < size {
+		return msg
+	}
+
+	return msg[0:size]
 }
 
 func OutputPid(logDir, role string) error {
@@ -358,8 +371,8 @@ func (l *Log) initLog(logDir, module string, level Level) error {
 		return
 	}
 	var err error
-	logHandles := [...]**LogObject{&l.debugLogger, &l.infoLogger, &l.warnLogger, &l.errorLogger, &l.readLogger, &l.updateLogger, &l.criticalLogger}
-	logNames := [...]string{DebugLogFileName, InfoLogFileName, WarnLogFileName, ErrLogFileName, ReadLogFileName, UpdateLogFileName, CriticalLogFileName}
+	logHandles := [...]**LogObject{&l.debugLogger, &l.infoLogger, &l.warnLogger, &l.errorLogger, &l.readLogger, &l.updateLogger, &l.criticalLogger, &l.qosLogger}
+	logNames := [...]string{DebugLogFileName, InfoLogFileName, WarnLogFileName, ErrLogFileName, ReadLogFileName, UpdateLogFileName, CriticalLogFileName, QoSLogFileName}
 	for i := range logHandles {
 		if *logHandles[i], err = newLog(logNames[i]); err != nil {
 			return err
@@ -483,7 +496,6 @@ func LogWarn(v ...interface{}) {
 	s := fmt.Sprintln(v...)
 	s = gLog.SetPrefix(s, levelPrefixes[2])
 	gLog.warnLogger.Output(2, s)
-	gLog.infoLogger.Output(2, s)
 }
 
 // LogWarnf indicates the warnings with specific format.
@@ -497,7 +509,6 @@ func LogWarnf(format string, v ...interface{}) {
 	s := fmt.Sprintf(format, v...)
 	s = gLog.SetPrefix(s, levelPrefixes[2])
 	gLog.warnLogger.Output(2, s)
-	gLog.infoLogger.Output(2, s)
 }
 
 // LogInfo indicates log the information. TODO explain
@@ -526,6 +537,13 @@ func LogInfof(format string, v ...interface{}) {
 	gLog.infoLogger.Output(2, s)
 }
 
+func EnableInfo() bool {
+	if gLog == nil {
+		return false
+	}
+	return InfoLevel&gLog.level == gLog.level
+}
+
 // LogError logs the errors.
 func LogError(v ...interface{}) {
 	if gLog == nil {
@@ -536,7 +554,6 @@ func LogError(v ...interface{}) {
 	}
 	s := fmt.Sprintln(v...)
 	s = gLog.SetPrefix(s, levelPrefixes[3])
-	gLog.infoLogger.Output(2, s)
 	gLog.errorLogger.Output(2, s)
 }
 
@@ -551,7 +568,6 @@ func LogErrorf(format string, v ...interface{}) {
 	s := fmt.Sprintf(format, v...)
 	s = gLog.SetPrefix(s, levelPrefixes[3])
 	gLog.errorLogger.Print(s)
-	gLog.infoLogger.Output(2, s)
 }
 
 // LogDebug logs the debug information.
@@ -578,6 +594,14 @@ func LogDebugf(format string, v ...interface{}) {
 	s := fmt.Sprintf(format, v...)
 	s = gLog.SetPrefix(s, levelPrefixes[0])
 	gLog.debugLogger.Output(2, s)
+}
+
+func EnableDebug() bool {
+	if gLog == nil {
+		return false
+	}
+
+	return DebugLevel&gLog.level == gLog.level
 }
 
 // LogFatal logs the fatal errors.
@@ -650,6 +674,32 @@ func LogReadf(format string, v ...interface{}) {
 	gLog.readLogger.Output(2, s)
 }
 
+// QosWrite
+func QosWrite(v ...interface{}) {
+	if gLog == nil {
+		return
+	}
+	if UpdateLevel&gLog.level != gLog.level {
+		return
+	}
+	s := fmt.Sprintln(v...)
+	s = gLog.SetPrefix(s, levelPrefixes[0])
+	gLog.qosLogger.Output(2, s)
+}
+
+// QosWriteDebugf TODO not used
+func QosWriteDebugf(format string, v ...interface{}) {
+	if gLog == nil {
+		return
+	}
+	if DebugLevel&gLog.level != gLog.level {
+		return
+	}
+	s := fmt.Sprintf(format, v...)
+	s = gLog.SetPrefix(s, levelPrefixes[0])
+	gLog.qosLogger.Output(2, s)
+}
+
 // LogWrite
 func LogWrite(v ...interface{}) {
 	if gLog == nil {
@@ -691,10 +741,14 @@ func (l *Log) checkLogRotation(logDir, module string) {
 		fs := syscall.Statfs_t{}
 		if err := syscall.Statfs(logDir, &fs); err != nil {
 			LogErrorf("check disk space: %s", err.Error())
+			time.Sleep(DefaultRollingInterval)
 			continue
 		}
 		diskSpaceLeft := int64(fs.Bavail * uint64(fs.Bsize))
 		diskSpaceLeft -= l.rotate.headRoom * 1024 * 1024
+		if diskSpaceLeft <= 0 {
+			LogDebugf("logLeftSpaceLimit has been reached, need to clear %v Mb of Space", (-diskSpaceLeft)/1024/1024)
+		}
 		err := l.removeLogFile(logDir, diskSpaceLeft, module)
 		if err != nil {
 			time.Sleep(DefaultRollingInterval)
@@ -737,6 +791,7 @@ func (l *Log) removeLogFile(logDir string, diskSpaceLeft int64, module string) (
 	var needDelFiles RolledFile
 	for _, info := range fInfos {
 		if DeleteFileFilter(info, diskSpaceLeft, module) {
+			LogDebugf("%v will be put into needDelFiles", info.Name())
 			needDelFiles = append(needDelFiles, info)
 		}
 	}

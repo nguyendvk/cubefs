@@ -20,15 +20,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/golang/mock/gomock"
 
 	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
 	cmapi "github.com/cubefs/cubefs/blobstore/api/clustermgr"
+	"github.com/cubefs/cubefs/blobstore/api/proxy"
 	"github.com/cubefs/cubefs/blobstore/common/codemode"
 	errcode "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
-	"github.com/cubefs/cubefs/blobstore/common/redis"
 	"github.com/cubefs/cubefs/blobstore/testing/mocks"
 	_ "github.com/cubefs/cubefs/blobstore/testing/nolog"
 	"github.com/cubefs/cubefs/blobstore/util/errors"
@@ -40,12 +39,14 @@ const (
 )
 
 var (
+	A = gomock.Any()
+	C = gomock.NewController
+
 	vid404      = proto.Vid(404)
 	errNotFound = errors.New("not found")
 
-	redismr  *miniredis.Miniredis
-	rediscli *redis.ClusterClient
 	cmcli    cmapi.APIAccess
+	proxycli proxy.Cacher
 
 	dataCalled  map[proto.Vid]int
 	dataNodes   map[string]cmapi.ServiceInfo
@@ -101,40 +102,42 @@ func init() {
 		},
 	}
 
-	redismr, _ = miniredis.Run()
-	rediscli = redis.NewClusterClient(&redis.ClusterConfig{
-		Addrs: []string{redismr.Addr()},
-	})
-
-	ctr := gomock.NewController(&testing.T{})
-	cli := mocks.NewMockClientAPI(ctr)
-	cli.EXPECT().GetConfig(gomock.Any(), gomock.Any()).AnyTimes().Return("abc", nil)
-	cli.EXPECT().GetService(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
+	cli := mocks.NewMockClientAPI(C(&testing.T{}))
+	cli.EXPECT().GetConfig(A, A).AnyTimes().Return("abc", nil)
+	cli.EXPECT().GetService(A, A).AnyTimes().DoAndReturn(
 		func(ctx context.Context, args cmapi.GetServiceArgs) (cmapi.ServiceInfo, error) {
 			if val, ok := dataNodes[args.Name]; ok {
 				return val, nil
 			}
 			return cmapi.ServiceInfo{}, errNotFound
 		})
-	cli.EXPECT().GetVolumeInfo(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
-		func(ctx context.Context, args *cmapi.GetVolumeArgs) (*cmapi.VolumeInfo, error) {
-			if val, ok := dataVolumes[args.Vid]; ok {
-				dataCalled[args.Vid]++
-				if args.Vid == vid404 {
+	cli.EXPECT().ListDisk(A, A).AnyTimes().Return(cmapi.ListDiskRet{}, nil)
+	cmcli = cli
+
+	pcli := mocks.NewMockProxyClient(C(&testing.T{}))
+	pcli.EXPECT().GetCacheVolume(A, A, A).AnyTimes().DoAndReturn(
+		func(_ context.Context, _ string, args *proxy.CacheVolumeArgs) (*proxy.VersionVolume, error) {
+			volume := new(proxy.VersionVolume)
+			vid := args.Vid
+			dataCalled[vid]++
+			if val, ok := dataVolumes[vid]; ok {
+				if vid == vid404 {
 					return nil, errcode.ErrVolumeNotExist
 				}
+				volume.VolumeInfo = val
+				volume.Version = volume.GetVersion()
+				return volume, nil
+			}
+			return nil, errNotFound
+		})
+	pcli.EXPECT().GetCacheDisk(A, A, A).AnyTimes().DoAndReturn(
+		func(_ context.Context, _ string, args *proxy.CacheDiskArgs) (*bnapi.DiskInfo, error) {
+			if val, ok := dataDisks[args.DiskID]; ok {
 				return &val, nil
 			}
 			return nil, errNotFound
 		})
-	cli.EXPECT().DiskInfo(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
-		func(ctx context.Context, id proto.DiskID) (*bnapi.DiskInfo, error) {
-			if val, ok := dataDisks[id]; ok {
-				return &val, nil
-			}
-			return nil, errNotFound
-		})
-	cmcli = cli
+	proxycli = pcli
 
 	initCluster()
 }

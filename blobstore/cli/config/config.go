@@ -33,10 +33,6 @@ type Config struct {
 	Verbose  bool `json:"verbose" cache:"Flag-Verbose" help:"enable verbose mode"`
 	Vverbose bool `json:"vverbose" cache:"Flag-Vverbose" help:"enable verbose verbose mode"`
 
-	RedisAddrs []string `json:"redis_addrs" cache:"Key-RedisAddrs" help:"redis addrs"`
-	RedisUser  string   `json:"redis_user" cache:"Key-RedisUser" help:"redis username"`
-	RedisPass  string   `json:"redis_pass" cache:"Key-RedisPass" help:"redis password"`
-
 	ClusterMgrCluster map[string]string `json:"cm_cluster" cache:"Key-ClusterMgrCluster" help:"cluster manager addrs"`
 	ClusterMgrSecret  string            `json:"cm_secret" cache:"Key-ClusterMgrSecret" help:"cluster manager secret"`
 
@@ -101,24 +97,24 @@ var (
 		case reflect.Int:
 			return func(val string) interface{} { v, _ := strconv.Atoi(val); return int(v) }
 		case reflect.Int8:
-			return func(val string) interface{} { v, _ := strconv.Atoi(val); return int8(v) }
+			return func(val string) interface{} { v, _ := strconv.ParseInt(val, 10, 8); return int8(v) }
 		case reflect.Int16:
-			return func(val string) interface{} { v, _ := strconv.Atoi(val); return int16(v) }
+			return func(val string) interface{} { v, _ := strconv.ParseInt(val, 10, 16); return int16(v) }
 		case reflect.Int32:
-			return func(val string) interface{} { v, _ := strconv.Atoi(val); return int32(v) }
+			return func(val string) interface{} { v, _ := strconv.ParseInt(val, 10, 32); return int32(v) }
 		case reflect.Int64:
-			return func(val string) interface{} { v, _ := strconv.Atoi(val); return int64(v) }
+			return func(val string) interface{} { v, _ := strconv.ParseInt(val, 10, 64); return v }
 
 		case reflect.Uint:
 			return func(val string) interface{} { v, _ := strconv.Atoi(val); return uint(v) }
 		case reflect.Uint8:
-			return func(val string) interface{} { v, _ := strconv.Atoi(val); return uint8(v) }
+			return func(val string) interface{} { v, _ := strconv.ParseUint(val, 10, 8); return uint8(v) }
 		case reflect.Uint16:
-			return func(val string) interface{} { v, _ := strconv.Atoi(val); return uint16(v) }
+			return func(val string) interface{} { v, _ := strconv.ParseUint(val, 10, 16); return uint16(v) }
 		case reflect.Uint32:
-			return func(val string) interface{} { v, _ := strconv.Atoi(val); return uint32(v) }
+			return func(val string) interface{} { v, _ := strconv.ParseUint(val, 10, 32); return uint32(v) }
 		case reflect.Uint64:
-			return func(val string) interface{} { v, _ := strconv.Atoi(val); return uint64(v) }
+			return func(val string) interface{} { v, _ := strconv.ParseUint(val, 10, 64); return v }
 
 		case reflect.Float32:
 			return func(val string) interface{} { v, _ := strconv.ParseFloat(val, 32); return float32(v) }

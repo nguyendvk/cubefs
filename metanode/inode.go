@@ -76,6 +76,79 @@ type Inode struct {
 
 type InodeBatch []*Inode
 
+type TxInode struct {
+	Inode  *Inode
+	TxInfo *proto.TransactionInfo
+}
+
+func NewTxInode(ino uint64, t uint32, txInfo *proto.TransactionInfo) *TxInode {
+	ti := &TxInode{
+		Inode:  NewInode(ino, t),
+		TxInfo: txInfo,
+	}
+	return ti
+}
+
+func (ti *TxInode) Marshal() (result []byte, err error) {
+	buff := bytes.NewBuffer(make([]byte, 0))
+
+	bs, err := ti.Inode.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	if err = binary.Write(buff, binary.BigEndian, uint32(len(bs))); err != nil {
+		return nil, err
+	}
+	if _, err := buff.Write(bs); err != nil {
+		return nil, err
+	}
+
+	bs, err = ti.TxInfo.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	if err = binary.Write(buff, binary.BigEndian, uint32(len(bs))); err != nil {
+		return nil, err
+	}
+	if _, err := buff.Write(bs); err != nil {
+		return nil, err
+	}
+	result = buff.Bytes()
+	return
+}
+
+func (ti *TxInode) Unmarshal(raw []byte) (err error) {
+	buff := bytes.NewBuffer(raw)
+
+	var dataLen uint32
+	if err = binary.Read(buff, binary.BigEndian, &dataLen); err != nil {
+		return
+	}
+	data := make([]byte, int(dataLen))
+	if _, err = buff.Read(data); err != nil {
+		return
+	}
+	ino := NewInode(0, 0)
+	if err = ino.Unmarshal(data); err != nil {
+		return
+	}
+	ti.Inode = ino
+
+	if err = binary.Read(buff, binary.BigEndian, &dataLen); err != nil {
+		return
+	}
+	data = make([]byte, int(dataLen))
+	if _, err = buff.Read(data); err != nil {
+		return
+	}
+	txInfo := proto.NewTransactionInfo(0, proto.TxTypeUndefined)
+	if err = txInfo.Unmarshal(data); err != nil {
+		return
+	}
+	ti.TxInfo = txInfo
+	return
+}
+
 // String returns the string format of the inode.
 func (i *Inode) String() string {
 	i.RLock()
@@ -105,7 +178,7 @@ func (i *Inode) String() string {
 // NewInode returns a new Inode instance with specified Inode ID, name and type.
 // The AccessTime and ModifyTime will be set to the current time.
 func NewInode(ino uint64, t uint32) *Inode {
-	ts := Now.GetCurrentTime().Unix()
+	ts := Now.GetCurrentTimeUnix()
 	i := &Inode{
 		Inode:      ino,
 		Type:       t,
@@ -281,6 +354,7 @@ func (i *Inode) MarshalValue() (val []byte) {
 	buff := bytes.NewBuffer(make([]byte, 0, 128))
 	buff.Grow(64)
 	i.RLock()
+	defer i.RUnlock()
 	if err = binary.Write(buff, binary.BigEndian, &i.Type); err != nil {
 		panic(err)
 	}
@@ -362,7 +436,6 @@ func (i *Inode) MarshalValue() (val []byte) {
 	}
 
 	val = buff.Bytes()
-	i.RUnlock()
 	return
 }
 
@@ -463,6 +536,14 @@ func (i *Inode) UnmarshalValue(val []byte) (err error) {
 	return
 }
 
+func (i *Inode) GetSpaceSize() (extSize uint64) {
+	if i.IsTempFile() {
+		return
+	}
+	extSize += i.Extents.LayerSize()
+	return
+}
+
 // AppendExtents append the extent to the btree.
 func (i *Inode) AppendExtents(eks []proto.ExtentKey, ct int64, volType int) (delExtents []proto.ExtentKey) {
 	if proto.IsCold(volType) {
@@ -524,9 +605,9 @@ func (i *Inode) AppendExtentWithCheck(ek proto.ExtentKey, ct int64, discardExten
 	return
 }
 
-func (i *Inode) ExtentsTruncate(length uint64, ct int64) (delExtents []proto.ExtentKey) {
+func (i *Inode) ExtentsTruncate(length uint64, ct int64, doOnLastKey func(*proto.ExtentKey)) (delExtents []proto.ExtentKey) {
 	i.Lock()
-	delExtents = i.Extents.Truncate(length)
+	delExtents = i.Extents.Truncate(length, doOnLastKey)
 	i.Size = length
 	i.ModifyTime = ct
 	i.Generation++
@@ -562,7 +643,7 @@ func (i *Inode) GetNLink() uint32 {
 
 func (i *Inode) IsTempFile() bool {
 	i.RLock()
-	ok := i.NLink == 0
+	ok := i.NLink == 0 && !proto.IsDir(i.Type)
 	i.RUnlock()
 	return ok
 }
@@ -638,7 +719,7 @@ func (i *Inode) DoReadFunc(fn func()) {
 
 // SetMtime sets mtime to the current time.
 func (i *Inode) SetMtime() {
-	mtime := Now.GetCurrentTime().Unix()
+	mtime := Now.GetCurrentTimeUnix()
 	i.Lock()
 	defer i.Unlock()
 	i.ModifyTime = mtime
@@ -661,29 +742,3 @@ func (i *Inode) CopyTinyExtents() (delExtents []proto.ExtentKey) {
 	defer i.RUnlock()
 	return i.Extents.CopyTinyExtents()
 }
-
-// ReplaceExtents replace eks with curEks, delEks are which need to deleted.
-// func (i *Inode) ReplaceExtents(curEks []proto.ExtentKey, mtime int64) (delEks []proto.ExtentKey) {
-// 	i.Lock()
-// 	defer i.Unlock()
-// 	oldEks := i.Extents.eks
-// 	delEks = make([]proto.ExtentKey, len(oldEks)-len(curEks))
-// 	for _, key := range oldEks {
-// 		exist := false
-// 		for _, delKey := range curEks {
-// 			if key.FileOffset == delKey.FileOffset && key.ExtentId == delKey.ExtentId &&
-// 				key.ExtentOffset == delKey.ExtentOffset && key.PartitionId == delKey.PartitionId &&
-// 				key.Size == delKey.Size {
-// 				exist = true
-// 				break
-// 			}
-// 		}
-// 		if !exist {
-// 			delEks = append(delEks, key)
-// 		}
-// 	}
-// 	i.ModifyTime = mtime
-// 	i.Generation++
-// 	i.Extents.eks = curEks
-// 	return
-// }

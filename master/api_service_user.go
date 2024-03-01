@@ -8,6 +8,7 @@ import (
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util/errors"
+	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -16,6 +17,11 @@ func (m *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		userInfo *proto.UserInfo
 		err      error
 	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.UserCreate))
+	defer func() {
+		doStatAndMetric(proto.UserCreate, metric, err, nil)
+	}()
+
 	var bytes []byte
 	if bytes, err = ioutil.ReadAll(r.Body); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
@@ -46,6 +52,11 @@ func (m *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 		userID string
 		err    error
 	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.UserDelete))
+	defer func() {
+		doStatAndMetric(proto.UserDelete, metric, err, nil)
+	}()
+
 	if userID, err = parseUser(r); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
@@ -64,6 +75,11 @@ func (m *Server) updateUser(w http.ResponseWriter, r *http.Request) {
 		userInfo *proto.UserInfo
 		err      error
 	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.UserUpdate))
+	defer func() {
+		doStatAndMetric(proto.UserUpdate, metric, err, nil)
+	}()
+
 	var bytes []byte
 	if bytes, err = ioutil.ReadAll(r.Body); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
@@ -91,6 +107,11 @@ func (m *Server) getUserAKInfo(w http.ResponseWriter, r *http.Request) {
 		userInfo *proto.UserInfo
 		err      error
 	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.UserGetAKInfo))
+	defer func() {
+		doStatAndMetric(proto.UserGetAKInfo, metric, err, nil)
+	}()
+
 	if ak, err = parseAccessKey(r); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
@@ -108,6 +129,11 @@ func (m *Server) getUserInfo(w http.ResponseWriter, r *http.Request) {
 		userInfo *proto.UserInfo
 		err      error
 	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.UserGetInfo))
+	defer func() {
+		doStatAndMetric(proto.UserGetInfo, metric, err, nil)
+	}()
+
 	if userID, err = parseUser(r); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
@@ -125,6 +151,11 @@ func (m *Server) updateUserPolicy(w http.ResponseWriter, r *http.Request) {
 		bytes    []byte
 		err      error
 	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.UserUpdatePolicy))
+	defer func() {
+		doStatAndMetric(proto.UserUpdatePolicy, metric, err, nil)
+	}()
+
 	if bytes, err = ioutil.ReadAll(r.Body); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
@@ -151,6 +182,11 @@ func (m *Server) removeUserPolicy(w http.ResponseWriter, r *http.Request) {
 		bytes    []byte
 		err      error
 	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.UserRemovePolicy))
+	defer func() {
+		doStatAndMetric(proto.UserRemovePolicy, metric, err, nil)
+	}()
+
 	if bytes, err = ioutil.ReadAll(r.Body); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
@@ -176,6 +212,11 @@ func (m *Server) deleteUserVolPolicy(w http.ResponseWriter, r *http.Request) {
 		vol string
 		err error
 	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.UserDeleteVolPolicy))
+	defer func() {
+		doStatAndMetric(proto.UserDeleteVolPolicy, metric, err, map[string]string{exporter.Vol: vol})
+	}()
+
 	if vol, err = parseVolName(r); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
@@ -193,9 +234,15 @@ func (m *Server) transferUserVol(w http.ResponseWriter, r *http.Request) {
 	var (
 		bytes    []byte
 		vol      *Vol
+		volName  string
 		userInfo *proto.UserInfo
 		err      error
 	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.UserTransferVol))
+	defer func() {
+		doStatAndMetric(proto.UserTransferVol, metric, err, map[string]string{exporter.Vol: volName})
+	}()
+
 	if bytes, err = ioutil.ReadAll(r.Body); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
@@ -205,6 +252,7 @@ func (m *Server) transferUserVol(w http.ResponseWriter, r *http.Request) {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
 	}
+	volName = param.Volume
 	if vol, err = m.cluster.getVol(param.Volume); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeVolNotExists, Msg: err.Error()})
 		return
@@ -234,6 +282,11 @@ func (m *Server) getAllUsers(w http.ResponseWriter, r *http.Request) {
 		users    []*proto.UserInfo
 		err      error
 	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.UserList))
+	defer func() {
+		doStatAndMetric(proto.UserList, metric, err, nil)
+	}()
+
 	if keywords, err = parseKeywords(r); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
@@ -248,6 +301,11 @@ func (m *Server) getUsersOfVol(w http.ResponseWriter, r *http.Request) {
 		users   []string
 		err     error
 	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.UsersOfVol))
+	defer func() {
+		doStatAndMetric(proto.UsersOfVol, metric, err, map[string]string{exporter.Vol: volName})
+	}()
+
 	if volName, err = parseVolName(r); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return

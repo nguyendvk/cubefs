@@ -18,9 +18,10 @@ import (
 	"context"
 	"errors"
 	"os"
-	"runtime"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
 	bncom "github.com/cubefs/cubefs/blobstore/blobnode/base"
@@ -72,8 +73,8 @@ type metadb struct {
 	delReqs   chan Request
 	config    MetaConfig
 
-	iostat  *flow.IOFlowStat     // io visualization
-	limiter []limitio.Controller // io control
+	iostat  *flow.IOFlowStat // io visualization
+	limiter []*rate.Limiter  // io limiter
 
 	closeCh chan struct{}
 	closed  bool
@@ -97,7 +98,7 @@ func (md *metadb) SetIOStat(stat *flow.IOFlowStat) {
 }
 
 func (md *metadb) Get(ctx context.Context, key []byte) (value []byte, err error) {
-	mgr, iot := md.getiotype(ctx)
+	mgr, iot := md.getIoType(ctx)
 
 	mgr.ReadBegin(1)
 	defer mgr.ReadEnd(time.Now())
@@ -133,7 +134,7 @@ func (md *metadb) Put(ctx context.Context, kv rdb.KV) (err error) {
 		Data: kv,
 	}
 
-	mgr, iot := md.getiotype(ctx)
+	mgr, iot := md.getIoType(ctx)
 
 	mgr.WriteBegin(1)
 	defer mgr.WriteEnd(time.Now())
@@ -157,7 +158,7 @@ func (md *metadb) Delete(ctx context.Context, key []byte) (err error) {
 		Data: rdb.KV{Key: key},
 	}
 
-	mgr, iot := md.getiotype(ctx)
+	mgr, iot := md.getIoType(ctx)
 
 	mgr.WriteBegin(1)
 	defer mgr.WriteEnd(time.Now())
@@ -181,7 +182,7 @@ func (md *metadb) DeleteRange(ctx context.Context, start, end []byte) (err error
 		Data: rdb.Range{Start: start, Limit: end},
 	}
 
-	mgr, iot := md.getiotype(ctx)
+	mgr, iot := md.getIoType(ctx)
 
 	mgr.WriteBegin(1)
 	defer mgr.WriteEnd(time.Now())
@@ -324,8 +325,8 @@ func (md *metadb) doBatch(ctx context.Context, reqs []Request) (err error) {
 	return err
 }
 
-func (md *metadb) getiotype(ctx context.Context) (iostat.StatMgrAPI, bnapi.IOType) {
-	iot := bnapi.Getiotype(ctx)
+func (md *metadb) getIoType(ctx context.Context) (iostat.StatMgrAPI, bnapi.IOType) {
+	iot := bnapi.GetIoType(ctx)
 	mgr := md.iostat.GetStatMgr(iot)
 	return mgr, iot
 }
@@ -337,12 +338,23 @@ func (md *metadb) applyToken(ctx context.Context, iot bnapi.IOType) (n int64) {
 	if limiter == nil {
 		return
 	}
-
-	n, limited := limiter.Assign(1)
-	if limited {
-		addTrackTag(ctx, _limited)
+	now := time.Now()
+	reserve := limiter.ReserveN(now, 1)
+	delay := reserve.DelayFrom(now)
+	if delay == 0 {
+		return
 	}
-	return n
+	t := time.NewTimer(delay)
+	defer t.Stop()
+	addTrackTag(ctx, _limited)
+
+	select {
+	case <-t.C:
+		return
+	case <-ctx.Done():
+		reserve.Cancel()
+		return
+	}
 }
 
 func addTrackTag(ctx context.Context, name string) {
@@ -402,7 +414,7 @@ func newMetaDB(dirpath string, config MetaConfig) (md *metadb, err error) {
 	}
 
 	priLevels := pri.GetLevels()
-	md.limiter = make([]limitio.Controller, len(priLevels))
+	md.limiter = make([]*rate.Limiter, len(priLevels))
 
 	for priority, name := range priLevels {
 		para, exist := config.MetaQos[name]
@@ -410,7 +422,7 @@ func newMetaDB(dirpath string, config MetaConfig) (md *metadb, err error) {
 			// No flow control by default without configuration
 			continue
 		}
-		controller := limitio.NewController(para.Iops)
+		controller := rate.NewLimiter(rate.Limit(para.Iops), 2*int(para.Iops))
 		md.limiter[priority] = controller
 	}
 
@@ -428,11 +440,6 @@ func NewMetaHandler(dirpath string, config MetaConfig) (mh MetaHandler, err erro
 	}
 
 	w := &MetaDBWapper{metadb: md}
-
-	// close db when gc
-	runtime.SetFinalizer(w, func(wapper *MetaDBWapper) {
-		wapper.Close(context.Background())
-	})
 
 	return w, nil
 }

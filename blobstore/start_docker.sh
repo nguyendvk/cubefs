@@ -1,21 +1,7 @@
 #!/bin/bash
 
-consul=$1
-
 if [ ! -d ./run/logs ]; then
   mkdir -p ./run/logs
-fi
-
-# start consul
-if [ "${consul}" == "--consul" ]; then
-  nohup ./bin/consul agent -dev -client 0.0.0.0 >> ./run/logs/consul.log 2>&1 &
-  # check consul running
-  sleep 1
-  num=`ps -ef | egrep ./bin/consul | egrep -v "grep|vi|tail" | wc -l`
-  if [ ${num} -lt 1 ];then
-    echo "Failed to start consul."
-    exit 1
-  fi
 fi
 
 # start kafka
@@ -31,13 +17,14 @@ if [ ${num} -le 1 ];then
 fi
 
 # Start the clustermgr
-nohup ./bin/clustermgr -f conf/clustermgr.conf >> ./run/logs/clustermgr.log  2>&1 &
 nohup ./bin/clustermgr -f conf/clustermgr1.conf >> ./run/logs/clustermgr1.log  2>&1 &
 nohup ./bin/clustermgr -f conf/clustermgr2.conf >> ./run/logs/clustermgr2.log  2>&1 &
+nohup ./bin/clustermgr -f conf/clustermgr3.conf >> ./run/logs/clustermgr3.log  2>&1 &
 sleep 5
 num=`ps -ef | egrep "./bin/clustermgr" |  egrep -v "vi|tail|grep" | wc -l`
 if [ $num -ne 3 ]; then
   echo "Failed to start clustermgr"
+  exit 1
 fi
 
 sleep 15
@@ -92,12 +79,6 @@ echo "start blobstore service successfully, wait minutes for internal state prep
 
 # wait for docker, avoid container exit
 while true
- do
+do
     sleep 300
 done
-
-
-
-
-
-

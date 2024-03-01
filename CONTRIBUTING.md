@@ -10,7 +10,7 @@ Recommend the standard GitHub flow based on forking and pull requests.
 
 The following diagram and practice steps show the basic process of contributing code to CubeFS:
 
-<img src="https://user-images.githubusercontent.com/5708406/87878246-9ddf4300-ca15-11ea-97a4-cffd1febffa1.png" height="520" alt="How to make contributing to CubeFS"></img>
+<img src="https://ocs-cn-north1.heytapcs.com/cubefs/github/workflow.png" height="520" alt="How to make contributing to CubeFS"></img>
 
 1. Fork CubeFS to your repository.
 2. Add remote for your forked repository.<br>(Example: `$ git remote add me https://github.com/your/cubefs`)
@@ -32,3 +32,34 @@ Please use the fixes keyword in the pull request to associate the pull request w
 
 **Note 3:**<br>
 Every pull request that merges code to the master branch needs to be approved by at least one core maintainer for code review and pass all checks (including the DCO check) before it can be merged.
+
+## Development Guide
+
+### Coding style
+
+- Follow the [coding standards](https://go.dev/doc/effective_go) of Go.
+- Ensure that your code is formatted using `go fmt` or `gofumpt` before submitting it.
+- Ensure that each new source file starts with a license header.
+- Ensure that there are enough unit tests.
+- Ensure that there are enough comments.
+
+### Commit message guidelines
+
+- Follow the [Angular commit guidelines](https://github.com/angular/angular/blob/main/CONTRIBUTING.md#commit).
+- Commits must be signed and the signature must match the author.
+- If there is an issue, you need to link to related issues.
+
+Example:
+
+> For example, the author information must match the Signed-off-by information.
+
+```shell
+Author: users <users@cubefs.groups.io>
+Date:   Thu Apr 27 09:40:02 2023 +0800
+
+    feat(cubefs): this is an example
+    
+    close: #1
+    
+    Signed-off-by: users <users@cubefs.groups.io>
+```

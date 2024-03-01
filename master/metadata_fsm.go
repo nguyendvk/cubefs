@@ -17,12 +17,14 @@ package master
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/cubefs/cubefs/depends/tiglabs/raft"
-	"github.com/cubefs/cubefs/depends/tiglabs/raft/proto"
-	"github.com/cubefs/cubefs/raftstore"
-	"github.com/cubefs/cubefs/util/log"
 	"io"
 	"strconv"
+
+	"github.com/cubefs/cubefs/depends/tiglabs/raft"
+	"github.com/cubefs/cubefs/depends/tiglabs/raft/proto"
+	raftstore "github.com/cubefs/cubefs/raftstore/raftstore_db"
+	"github.com/cubefs/cubefs/util/log"
+	"github.com/cubefs/cubefs/util/stat"
 )
 
 const (
@@ -47,6 +49,7 @@ type MetadataFsm struct {
 	peerChangeHandler   raftPeerChangeHandler
 	snapshotHandler     raftApplySnapshotHandler
 	UserAppCmdHandler   raftUserCmdApplyHandler
+	onSnapshot          bool
 }
 
 func newMetadataFsm(store *raftstore.RocksDBStore, retainsLog uint64, rs *raft.RaftServer) (fsm *MetadataFsm) {
@@ -125,14 +128,16 @@ func (mf *MetadataFsm) Apply(command []byte, index uint64) (resp interface{}, er
 
 	switch cmd.Op {
 	case opSyncDeleteDataNode, opSyncDeleteMetaNode, opSyncDeleteVol, opSyncDeleteDataPartition, opSyncDeleteMetaPartition,
-		opSyncDeleteUserInfo, opSyncDeleteAKUser, opSyncDeleteVolUser:
+		opSyncDeleteUserInfo, opSyncDeleteAKUser, opSyncDeleteVolUser, opSyncDeleteQuota:
 		if err = mf.delKeyAndPutIndex(cmd.K, cmdMap); err != nil {
 			panic(err)
 		}
-	case opSyncDataPartitionsView:
+	case opSyncPutFollowerApiLimiterInfo, opSyncPutApiLimiterInfo:
 		mf.UserAppCmdHandler(cmd.Op, cmd.K, cmdMap)
-		prefix := volCachePrefix
-		if err = mf.delKeyAndPutIndex(prefix+cmd.K, cmdMap); err != nil {
+		//if err = mf.delKeyAndPutIndex(cmd.K, cmdMap); err != nil {
+		//	panic(err)
+		//}
+		if err = mf.store.BatchPut(cmdMap, true); err != nil {
 			panic(err)
 		}
 	default:
@@ -174,25 +179,52 @@ func (mf *MetadataFsm) Snapshot() (proto.Snapshot, error) {
 
 // ApplySnapshot implements the interface of raft.StateMachine
 func (mf *MetadataFsm) ApplySnapshot(peers []proto.Peer, iterator proto.SnapIterator) (err error) {
-	log.LogInfof(fmt.Sprintf("action[ApplySnapshot] begin,applied[%v]", mf.applied))
+	log.LogWarnf(fmt.Sprintf("action[ApplySnapshot] reset rocksdb before applying snapshot"))
+	snap := mf.store.RocksDBSnapshot()
+	mf.onSnapshot = true
+	it := mf.store.Iterator(snap)
+
+	defer func() {
+		mf.store.ReleaseSnapshot(snap)
+		it.Close()
+		mf.onSnapshot = false
+	}()
+
+	for it.SeekToFirst(); it.Valid(); it.Next() {
+		key := string(it.Key().Data())
+		log.LogInfof("deleting Key: %v Value: %v", key, it.Value().Data())
+		mf.store.Del(key, false)
+	}
+
+	log.LogWarnf(fmt.Sprintf("action[ApplySnapshot] begin,applied[%v]", mf.applied))
 	var data []byte
 	for err == nil {
+		bgTime := stat.BeginStat()
 		if data, err = iterator.Next(); err != nil {
 			break
 		}
+		stat.EndStat("ApplySnapshot-Next", err, bgTime, 1)
 		cmd := &RaftCmd{}
 		if err = json.Unmarshal(data, cmd); err != nil {
 			goto errHandler
 		}
-		if _, err = mf.store.Put(cmd.K, cmd.V, true); err != nil {
+		bgTime = stat.BeginStat()
+		if _, err = mf.store.Put(cmd.K, cmd.V, false); err != nil {
 			goto errHandler
 		}
+		stat.EndStat("ApplySnapshot-Put", err, bgTime, 1)
 	}
 	if err != nil && err != io.EOF {
 		goto errHandler
 	}
+
+	if err = mf.store.Flush(); err != nil {
+		log.LogError(fmt.Sprintf("action[ApplySnapshot] Flush failed,err:%v", err.Error()))
+		goto errHandler
+	}
+
 	mf.snapshotHandler()
-	log.LogInfof(fmt.Sprintf("action[ApplySnapshot] success,applied[%v]", mf.applied))
+	log.LogWarnf(fmt.Sprintf("action[ApplySnapshot] success,applied[%v]", mf.applied))
 	return nil
 errHandler:
 	log.LogError(fmt.Sprintf("action[ApplySnapshot] failed,err:%v", err.Error()))

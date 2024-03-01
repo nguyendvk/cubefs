@@ -51,6 +51,7 @@ import (
 	"github.com/cubefs/cubefs/blobstore/common/trace"
 	"github.com/cubefs/cubefs/blobstore/util/errors"
 	"github.com/cubefs/cubefs/blobstore/util/log"
+	"github.com/cubefs/cubefs/blobstore/util/retry"
 	"github.com/hashicorp/consul/api"
 )
 
@@ -76,6 +77,7 @@ const (
 	defaultHeartbeatNotifyIntervalS = 10
 	defaultMaxHeartbeatNotifyNum    = 2000
 	defaultMetricReportIntervalM    = 2
+	defaultCheckConsistentIntervalM = 360
 )
 
 var (
@@ -105,6 +107,7 @@ type Config struct {
 	MaxHeartbeatNotifyNum    int                       `json:"max_heartbeat_notify_num"`
 	ChunkSize                uint64                    `json:"chunk_size"`
 	MetricReportIntervalM    int                       `json:"metric_report_interval_m"`
+	ConsistentCheckIntervalM int                       `json:"consistent_check_interval_m"`
 
 	cmd.Config
 }
@@ -169,6 +172,7 @@ func setUp() (*rpc.Router, []rpc.ProgressHandler) {
 }
 
 func tearDown() {
+	service.Close()
 }
 
 func New(cfg *Config) (*Service, error) {
@@ -222,28 +226,28 @@ func New(cfg *Config) (*Service, error) {
 	// module manager initial
 	scopeMgr, err := scopemgr.NewScopeMgr(normalDB)
 	if err != nil {
-		log.Fatalf("New scopeMgr failed, err: %v", err)
+		log.Fatalf("new scopeMgr failed, err: %v", err)
 	}
 	diskMgr, err := diskmgr.New(scopeMgr, normalDB, cfg.DiskMgrConfig)
 	if err != nil {
-		log.Fatalf("New diskMgr failed, err: %v", err)
+		log.Fatalf("new diskMgr failed, err: %v", err)
 	}
 
-	configMgr, err := configmgr.New(normalDB, cfg.ClusterCfg)
+	kvMgr, err := kvmgr.NewKvMgr(kvDB)
 	if err != nil {
-		log.Fatalf("fail to new configMgr, error: %v", err)
+		log.Fatalf("new kvMgr failed, error: %v", errors.Detail(err))
+	}
+
+	configMgr, err := configmgr.New(kvMgr, cfg.ClusterCfg)
+	if err != nil {
+		log.Fatalf("new configMg failed, error: %v", err)
 	}
 
 	serviceMgr := servicemgr.NewServiceMgr(normaldb.OpenServiceTable(normalDB))
 
 	volumeMgr, err := volumemgr.NewVolumeMgr(cfg.VolumeMgrConfig, diskMgr, scopeMgr, configMgr, volumeDB)
 	if err != nil {
-		log.Fatalf("fail to new volumeMgr, error: %v", errors.Detail(err))
-	}
-
-	kvMgr, err := kvmgr.NewKvMgr(kvDB)
-	if err != nil {
-		log.Fatalf("fail to new kvMgr, error: %v", errors.Detail(err))
+		log.Fatalf("new volumeMgr failed, error: %v", errors.Detail(err))
 	}
 
 	service.KvMgr = kvMgr
@@ -308,6 +312,7 @@ func New(cfg *Config) (*Service, error) {
 
 	// start service background loop
 	go service.loop()
+
 	return service, nil
 }
 
@@ -528,6 +533,9 @@ func (s *Service) loop() {
 	if s.MetricReportIntervalM <= 0 {
 		s.MetricReportIntervalM = defaultMetricReportIntervalM
 	}
+	if s.ConsistentCheckIntervalM <= 0 {
+		s.ConsistentCheckIntervalM = defaultCheckConsistentIntervalM
+	}
 
 	reportTicker := time.NewTicker(time.Duration(s.ClusterReportIntervalS) * time.Second)
 	defer reportTicker.Stop()
@@ -537,10 +545,13 @@ func (s *Service) loop() {
 	metricReportTicker := time.NewTicker(time.Duration(s.MetricReportIntervalM) * time.Minute)
 	defer metricReportTicker.Stop()
 
+	checkTicker := time.NewTicker(time.Duration(s.ConsistentCheckIntervalM) * time.Minute)
+	defer checkTicker.Stop()
+
 	for {
 		select {
 		case <-reportTicker.C:
-			if !s.raftNode.IsLeader() || s.ConsulAgentAddr == "" {
+			if s.ConsulAgentAddr == "" {
 				continue
 			}
 			clusterInfo := clustermgr.ClusterInfo{
@@ -552,7 +563,7 @@ func (s *Service) loop() {
 			spaceStatInfo := s.DiskMgr.Stat(ctx)
 			clusterInfo.Capacity = spaceStatInfo.TotalSpace
 			clusterInfo.Available = spaceStatInfo.WritableSpace
-			// filter leaner node
+			// filter learner node
 			peers := s.raftNode.Status().Peers
 			peersM := make(map[uint64]raftserver.Peer)
 			for i := range peers {
@@ -598,6 +609,49 @@ func (s *Service) loop() {
 			}
 		case <-metricReportTicker.C:
 			s.metricReport(ctx)
+		case <-checkTicker.C:
+			if !s.raftNode.IsLeader() {
+				continue
+			}
+			go func() {
+				clis := make([]*clustermgr.Client, 0)
+				peers := s.raftNode.Status().Peers
+				peersM := make(map[uint64]raftserver.Peer)
+				for i := range peers {
+					peersM[peers[i].Id] = peers[i]
+				}
+				for id, node := range s.raftNode.GetNodes() {
+					if peersM[id].IsLearner {
+						continue
+					}
+					host := s.RaftConfig.RaftNodeConfig.NodeProtocol + node
+					cli := clustermgr.New(&clustermgr.Config{LbConfig: rpc.LbConfig{Hosts: []string{host}}})
+					clis = append(clis, cli)
+				}
+				if len(clis) <= 1 {
+					return
+				}
+
+				iVids, err := s.checkVolInfos(ctx, clis)
+				if err != nil {
+					span.Errorf("get checkVolInfos failed:%v", err)
+					return
+				}
+
+				if len(iVids) != 0 {
+					// readIndex request may be aggregated,which could temporarily lead to each nodes volume info not equal
+					// so use get volume do double check
+					actualIVids, err := s.doubleCheckVolInfos(ctx, clis, iVids)
+					if err != nil {
+						span.Errorf("double check vids:%v volume info failed:%v", iVids, err)
+						return
+					}
+					if len(actualIVids) != 0 {
+						s.reportInConsistentVols(actualIVids)
+					}
+				}
+			}()
+
 		case <-s.closeCh:
 			return
 		}
@@ -609,4 +663,93 @@ func (s *Service) metricReport(ctx context.Context) {
 	s.report(ctx)
 	s.VolumeMgr.Report(ctx, s.Region, s.ClusterID)
 	s.DiskMgr.Report(ctx, s.Region, s.ClusterID, isLeader)
+}
+
+func (s *Service) checkVolInfos(ctx context.Context, clis []*clustermgr.Client) ([]proto.Vid, error) {
+	span := trace.SpanFromContextSafe(ctx)
+	inconsistentVids := make([]proto.Vid, 0)
+	marker := proto.Vid(0)
+	listCnt := 2000
+	volInfos := make([]clustermgr.ListVolumes, len(clis))
+	for {
+		var (
+			nextMarker proto.Vid
+			lastCnt    int
+			err        error
+		)
+		for i, cli := range clis {
+			if err = retry.Timed(3, 200).On(func() error {
+				volInfos[i], err = cli.ListVolume(ctx, &clustermgr.ListVolumeArgs{Marker: marker, Count: listCnt})
+				return err
+			}); err != nil {
+				span.Errorf("list volume: marker[%d], listCnt[%d], code[%d], error[%v]",
+					marker, listCnt, rpc.DetectStatusCode(err), err)
+				return nil, err
+			}
+			if len(volInfos[i].Volumes) < listCnt {
+				lastCnt = len(volInfos[i].Volumes)
+			}
+			nextMarker = volInfos[i].Marker
+		}
+
+		inconsistentVids = append(inconsistentVids, getInconsistent(ctx, volInfos)...)
+
+		if lastCnt < listCnt || nextMarker == proto.Vid(0) {
+			span.Debugf("list volume finished, last marker vid is:%d,last list cnt:%d", marker, lastCnt)
+			break
+		}
+		marker = nextMarker
+	}
+
+	return inconsistentVids, nil
+}
+
+func (s *Service) doubleCheckVolInfos(ctx context.Context, clis []*clustermgr.Client, vids []proto.Vid) (iVids []proto.Vid, err error) {
+	span := trace.SpanFromContextSafe(ctx)
+	for _, vid := range vids {
+		vidInfo := make([]*clustermgr.VolumeInfo, len(clis))
+		for i, cli := range clis {
+			vidInfo[i], err = cli.GetVolumeInfo(ctx, &clustermgr.GetVolumeArgs{Vid: vid})
+			if err != nil {
+				span.Errorf("get vid:%d info failed:%v", vid, err)
+				return
+			}
+		}
+		for i := 1; i < len(vidInfo); i++ {
+			if !vidInfo[0].Equal(vidInfo[i]) {
+				iVids = append(iVids, vidInfo[0].Vid)
+			}
+		}
+	}
+	return
+}
+
+func getInconsistent(ctx context.Context, allVols []clustermgr.ListVolumes) []proto.Vid {
+	span := trace.SpanFromContextSafe(ctx)
+	inConsistentVids := make([]proto.Vid, 0)
+	if len(allVols) <= 1 {
+		return nil
+	}
+
+	// if allVols's volumes length not match, add all volumes to inconsistenVids
+	volLen := len(allVols[0].Volumes)
+	for i := 1; i < len(allVols); i++ {
+		if len(allVols[i].Volumes) != volLen {
+			for _, vol := range allVols[0].Volumes {
+				inConsistentVids = append(inConsistentVids, vol.Vid)
+			}
+			span.Error("list volume length not match")
+			return inConsistentVids
+		}
+	}
+
+	for i := 0; i < len(allVols[0].Volumes); i++ {
+		for j := 1; j < len(allVols); j++ {
+			if !allVols[0].Volumes[i].Equal(allVols[j].Volumes[i]) {
+				span.Errorf("volume not match,src:%v, dst:%v", allVols[j].Volumes[i], allVols[0].Volumes[i])
+				inConsistentVids = append(inConsistentVids, allVols[0].Volumes[i].Vid)
+			}
+		}
+	}
+	return inConsistentVids
 }

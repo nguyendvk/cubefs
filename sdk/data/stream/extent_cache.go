@@ -356,10 +356,6 @@ func (cache *ExtentCache) PrepareReadRequests(offset, size int, data []byte) []*
 }
 
 // PrepareWriteRequests TODO explain
-// Dieu chinh lai cac extent lien quan den data trong khoang [OFFSET, OFFSET + SIZE]:
-//   - lower = offset lon nhat nhung <= OFFSET
-//   - upper = OFFSET + SIZE
-//   - khoi tao []*ExtentRequest gom cac extent cũ (ExtentKey != nil) và extent mới (ExtentKey == nil)
 func (cache *ExtentCache) PrepareWriteRequests(offset, size int, data []byte) []*ExtentRequest {
 	requests := make([]*ExtentRequest, 0)
 	pivot := &proto.ExtentKey{FileOffset: uint64(offset)}
@@ -371,9 +367,6 @@ func (cache *ExtentCache) PrepareWriteRequests(offset, size int, data []byte) []
 	defer cache.RUnlock()
 
 	lower := &proto.ExtentKey{}
-
-	// DescendLessOrEqual: ek la extent co FileOffset lon nhat nhung <= offset.
-	// return false -> chi set lower.FileOffset 1 lan
 	cache.root.DescendLessOrEqual(pivot, func(i btree.Item) bool {
 		ek := i.(*proto.ExtentKey)
 		lower.FileOffset = ek.FileOffset

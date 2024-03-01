@@ -44,13 +44,14 @@ func (se *SortedExtents) MarshalBinary() ([]byte, error) {
 	se.RLock()
 	defer se.RUnlock()
 
+	data = make([]byte, 0, proto.ExtentLength*len(se.eks))
+	ekdata := make([]byte, proto.ExtentLength)
+
 	for _, ek := range se.eks {
-		ekdata, err := ek.MarshalBinary()
-		if err != nil {
-			return nil, err
-		}
+		ek.MarshalBinaryExt(ekdata)
 		data = append(data, ekdata...)
 	}
+
 	return data, nil
 }
 
@@ -147,10 +148,7 @@ func (se *SortedExtents) AppendWithCheck(ek proto.ExtentKey, discard []proto.Ext
 	}
 	firstKey := se.eks[0]
 	if firstKey.FileOffset >= endOffset {
-		eks := se.doCopyExtents()
-		se.eks = se.eks[:0]
-		se.eks = append(se.eks, ek)
-		se.eks = append(se.eks, eks...)
+		se.insert(ek, 0)
 		return
 	}
 
@@ -197,16 +195,17 @@ func (se *SortedExtents) AppendWithCheck(ek proto.ExtentKey, discard []proto.Ext
 		return deleteExtents, proto.OpConflictExtentsErr
 	}
 
+	if len(invalidExtents) == 0 {
+		se.insert(ek, startIndex)
+		return
+	}
+
 	endIndex = startIndex + len(invalidExtents)
-	upperExtents := make([]proto.ExtentKey, len(se.eks)-endIndex)
-	copy(upperExtents, se.eks[endIndex:])
-	se.eks = se.eks[:startIndex]
-	se.eks = append(se.eks, ek)
-	se.eks = append(se.eks, upperExtents...)
+	se.instertWithDiscard(ek, startIndex, endIndex)
 	return
 }
 
-func (se *SortedExtents) Truncate(offset uint64) (deleteExtents []proto.ExtentKey) {
+func (se *SortedExtents) Truncate(offset uint64, doOnLastKey func(*proto.ExtentKey)) (deleteExtents []proto.ExtentKey) {
 	var endIndex int
 
 	se.Lock()
@@ -232,16 +231,56 @@ func (se *SortedExtents) Truncate(offset uint64) (deleteExtents []proto.ExtentKe
 	if numKeys > 0 {
 		lastKey := &se.eks[numKeys-1]
 		if lastKey.FileOffset+uint64(lastKey.Size) > offset {
+			if doOnLastKey != nil {
+				doOnLastKey(&proto.ExtentKey{Size: uint32(lastKey.FileOffset + uint64(lastKey.Size) - offset)})
+			}
 			lastKey.Size = uint32(offset - lastKey.FileOffset)
 		}
 	}
 	return
 }
 
+func (se *SortedExtents) insert(ek proto.ExtentKey, startIdx int) {
+	se.eks = append(se.eks, ek)
+	size := len(se.eks)
+
+	for idx := size - 1; idx > startIdx; idx-- {
+		se.eks[idx] = se.eks[idx-1]
+	}
+
+	se.eks[startIdx] = ek
+}
+
+func (se *SortedExtents) instertWithDiscard(ek proto.ExtentKey, startIdx, endIdx int) {
+	upperSize := len(se.eks) - endIdx
+	se.eks[startIdx] = ek
+
+	for idx := 0; idx < upperSize; idx++ {
+		se.eks[startIdx+1+idx] = se.eks[endIdx+idx]
+	}
+
+	se.eks = se.eks[:startIdx+1+upperSize]
+}
+
 func (se *SortedExtents) Len() int {
 	se.RLock()
 	defer se.RUnlock()
 	return len(se.eks)
+}
+
+// Returns the file size
+func (se *SortedExtents) LayerSize() (layerSize uint64) {
+	se.RLock()
+	defer se.RUnlock()
+
+	last := len(se.eks)
+	if last <= 0 {
+		return uint64(0)
+	}
+	for _, ek := range se.eks {
+		layerSize += uint64(ek.Size)
+	}
+	return
 }
 
 // Returns the file size

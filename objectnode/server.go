@@ -17,19 +17,23 @@ package objectnode
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
+	"path"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/cubefs/cubefs/util/config"
-	"github.com/cubefs/cubefs/util/exporter"
-
+	"github.com/cubefs/cubefs/blobstore/api/access"
+	"github.com/cubefs/cubefs/blockcache/bcache"
 	"github.com/cubefs/cubefs/cmd/common"
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/sdk/master"
+	"github.com/cubefs/cubefs/util/config"
+	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
+
 	"github.com/gorilla/mux"
 )
 
@@ -48,9 +52,9 @@ const (
 	// Example:
 	//		{
 	//			"masterAddr":[
-	//				"master1.chubao.io",
-	//				"master2.chubao.io",
-	//				"master3.chubao.io"
+	//				"master1.cube.io",
+	//				"master2.cube.io",
+	//				"master3.cube.io"
 	//			]
 	//		}
 	configMasterAddr = proto.MasterAddr
@@ -71,25 +75,60 @@ const (
 	// Example:
 	//		{
 	//			"domains": [
-	//				"object.chubao.io"
+	//				"object.cube.io"
 	//			]
 	//		}
-	// The configuration in the example will allow ObjectNode to automatically resolve "* .object.chubao.io".
+	// The configuration in the example will allow ObjectNode to automatically resolve "* .object.cube.io".
 	configDomains = "domains"
 
 	disabledActions               = "disabledActions"
 	configSignatureIgnoredActions = "signatureIgnoredActions"
+
+	//ObjMetaCache takes each path hierarchy of the path-like S3 object key as the cache key,
+	//and map it to the corresponding posix-compatible inode
+	// when enabled, the maxDentryCacheNum must at least be the minimum of defaultMaxDentryCacheNum
+	// Example:
+	//		{
+	//			"enableObjMetaCache": true
+	//		}
+	configObjMetaCache = "enableObjMetaCache"
+	// Example:
+	//		{
+	//			"cacheRefreshInterval": 600
+	//			"maxDentryCacheNum": 10000000
+	//			"maxInodeAttrCacheNum": 10000000
+	//		}
+	configCacheRefreshInterval = "cacheRefreshInterval"
+	configMaxDentryCacheNum    = "maxDentryCacheNum"
+	configMaxInodeAttrCacheNum = "maxInodeAttrCacheNum"
+
+	//enable block cache when reading data in cold volume
+	enableBcache = "enableBcache"
+	//define thread numbers for writing and reading ebs
+	ebsWriteThreads = "bStoreWriteThreads"
+	ebsReadThreads  = "bStoreReadThreads"
 )
 
 // Default of configuration value
 const (
-	defaultListen = "80"
+	defaultListen               = "80"
+	defaultCacheRefreshInterval = 10 * 60
+	defaultMaxDentryCacheNum    = 10000000
+	defaultMaxInodeAttrCacheNum = 10000000
+	//ebs
+	MaxSizePutOnce = int64(1) << 23
 )
 
 var (
 	// Regular expression used to verify the configuration of the service listening port.
 	// A valid service listening port configuration is a string containing only numbers.
-	regexpListen = regexp.MustCompile("^(\\d)+$")
+	regexpListen     = regexp.MustCompile("^(\\d)+$")
+	objMetaCache     *ObjMetaCache
+	blockCache       *bcache.BcacheClient
+	ebsClient        *blobstore.BlobStoreClient
+	writeThreads     = 4
+	readThreads      = 4
+	enableBlockcache bool
 )
 
 type ObjectNode struct {
@@ -106,8 +145,6 @@ type ObjectNode struct {
 
 	signatureIgnoredActions proto.Actions // signature ignored actions
 	disabledActions         proto.Actions // disabled actions
-
-	encodedRegion []byte
 
 	control common.Control
 }
@@ -180,13 +217,39 @@ func (o *ObjectNode) loadConfig(cfg *config.Config) (err error) {
 	o.vm = NewVolumeManager(masters, strict)
 	o.userStore = NewUserInfoStore(masters, strict)
 
+	// parse inode cache
+	cacheEnable := cfg.GetBool(configObjMetaCache)
+	if cacheEnable {
+
+		cacheRefreshInterval := uint64(cfg.GetInt64(configCacheRefreshInterval))
+		if cacheRefreshInterval <= 0 {
+			cacheRefreshInterval = defaultCacheRefreshInterval
+		}
+
+		maxDentryCacheNum := cfg.GetInt64(configMaxDentryCacheNum)
+		if maxDentryCacheNum < defaultMaxDentryCacheNum {
+			maxDentryCacheNum = defaultMaxDentryCacheNum
+		}
+
+		maxInodeAttrCacheNum := cfg.GetInt64(configMaxInodeAttrCacheNum)
+		if maxInodeAttrCacheNum < defaultMaxInodeAttrCacheNum {
+			maxInodeAttrCacheNum = defaultMaxInodeAttrCacheNum
+		}
+		objMetaCache = NewObjMetaCache(maxDentryCacheNum, maxInodeAttrCacheNum, cacheRefreshInterval)
+		log.LogInfof("loadConfig: enableObjMetaCache: %v, maxDentryCacheNum: %v, maxInodeAttrCacheNum: %v"+
+			", cacheRefreshInterval: %v", cacheEnable, maxDentryCacheNum, maxInodeAttrCacheNum, cacheRefreshInterval)
+	}
+
+	enableBlockcache = cfg.GetBool(enableBcache)
+	if enableBlockcache {
+		blockCache = bcache.NewBcacheClient()
+	}
+
 	return
 }
 
 func (o *ObjectNode) updateRegion(region string) {
 	o.region = region
-	o.encodedRegion =
-		[]byte(fmt.Sprintf(fmt.Sprintf("<LocationConstraint>%s</LocationConstraint>", o.region)))
 }
 
 func handleStart(s common.Server, cfg *config.Config) (err error) {
@@ -198,7 +261,6 @@ func handleStart(s common.Server, cfg *config.Config) (err error) {
 	if err = o.loadConfig(cfg); err != nil {
 		return
 	}
-
 	// Get cluster info from master
 	var ci *proto.ClusterInfo
 	if ci, err = o.mc.AdminAPI().GetClusterInfo(); err != nil {
@@ -206,6 +268,21 @@ func handleStart(s common.Server, cfg *config.Config) (err error) {
 	}
 	o.updateRegion(ci.Cluster)
 	log.LogInfof("handleStart: get cluster information: region(%v)", o.region)
+	if ci.EbsAddr != "" {
+		err = newEbsClient(ci, cfg)
+		if err != nil {
+			log.LogWarnf("handleStart: new ebsClient err(%v)", err)
+			return err
+		}
+		wt := cfg.GetInt(ebsWriteThreads)
+		if wt != 0 {
+			writeThreads = wt
+		}
+		rt := cfg.GetInt(ebsReadThreads)
+		if rt != 0 {
+			readThreads = rt
+		}
+	}
 
 	// start rest api
 	if err = o.startMuxRestAPI(); err != nil {
@@ -218,6 +295,20 @@ func handleStart(s common.Server, cfg *config.Config) (err error) {
 
 	log.LogInfo("object subsystem start success")
 	return
+}
+
+func newEbsClient(ci *proto.ClusterInfo, cfg *config.Config) (err error) {
+	ebsClient, err = blobstore.NewEbsClient(access.Config{
+		ConnMode: access.NoLimitConnMode,
+		Consul: access.ConsulConfig{
+			Address: ci.EbsAddr,
+		},
+		MaxSizePutOnce: MaxSizePutOnce,
+		Logger: &access.Logger{
+			Filename: path.Join(cfg.GetString("logDir"), "ebs.log"),
+		},
+	})
+	return err
 }
 
 func handleShutdown(s common.Server) {
@@ -233,16 +324,18 @@ func (o *ObjectNode) startMuxRestAPI() (err error) {
 	o.registerApiRouters(router)
 	router.Use(
 		o.expectMiddleware,
-		o.corsMiddleware,
 		o.traceMiddleware,
+		o.corsMiddleware,
 		o.authMiddleware,
 		o.policyCheckMiddleware,
 		o.contentMiddleware,
 	)
 
 	var server = &http.Server{
-		Addr:    ":" + o.listen,
-		Handler: router,
+		Addr:         ":" + o.listen,
+		Handler:      router,
+		ReadTimeout:  5 * time.Minute,
+		WriteTimeout: 5 * time.Minute,
 	}
 
 	go func() {

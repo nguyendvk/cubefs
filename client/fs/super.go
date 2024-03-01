@@ -15,8 +15,10 @@
 package fs
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -24,31 +26,32 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cubefs/blobstore/api/access"
-	"github.com/hashicorp/consul/api"
-
-	"golang.org/x/net/context"
-
+	"github.com/cubefs/cubefs/blobstore/api/access"
+	"github.com/cubefs/cubefs/blockcache/bcache"
+	"github.com/cubefs/cubefs/client/common"
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse"
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse/fs"
-
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/sdk/data/stream"
 	"github.com/cubefs/cubefs/sdk/meta"
+	"github.com/cubefs/cubefs/util"
+	"github.com/cubefs/cubefs/util/auditlog"
 	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/log"
 	"github.com/cubefs/cubefs/util/ump"
-
-	"github.com/cubefs/cubefs/blockcache/bcache"
-	"github.com/cubefs/cubefs/sdk/data/blobstore"
 )
 
 // Super defines the struct of a super block.
 type Super struct {
 	cluster     string
 	volname     string
+	masters     string
+	mountPoint  string
+	subDir      string
 	owner       string
 	ic          *InodeCache
+	dc          *Dcache
 	mw          *meta.MetaWrapper
 	ec          *stream.ExtentClient
 	orphan      *OrphanInodeList
@@ -67,19 +70,27 @@ type Super struct {
 	sockaddr  string
 	suspendCh chan interface{}
 
-	//data lake
-	volType        int
-	ebsEndpoint    string
-	CacheAction    int
-	CacheThreshold int
-	EbsBlockSize   int
-	enableBcache   bool
-	bcacheDir      string
-	readThreads    int
-	writeThreads   int
-	bc             *bcache.BcacheClient
-	ebsc           *blobstore.BlobStoreClient
-	sc             *SummaryCache
+	// data lake
+	volType             int
+	ebsEndpoint         string
+	CacheAction         int
+	CacheThreshold      int
+	EbsBlockSize        int
+	enableBcache        bool
+	bcacheDir           string
+	bcacheFilterFiles   string
+	bcacheCheckInterval int64
+	bcacheBatchCnt      int64
+
+	readThreads  int
+	writeThreads int
+	bc           *bcache.BcacheClient
+	ebsc         *blobstore.BlobStoreClient
+	sc           *SummaryCache
+
+	taskPool     []common.TaskPool
+	closeC       chan struct{}
+	disableTrash bool
 }
 
 // Functions that Super needs to implement
@@ -88,7 +99,10 @@ var (
 	_ fs.FSStatfser = (*Super)(nil)
 )
 
-const BlobWriterIdleTimeoutPeriod = 10
+const (
+	BlobWriterIdleTimeoutPeriod = 10
+	DefaultTaskPoolSize         = 30
+)
 
 // NewSuper returns a new Super.
 func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
@@ -103,13 +117,23 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 		ValidateOwner:   opt.Authenticate || opt.AccessKey == "",
 		EnableSummary:   opt.EnableSummary && opt.EnableXattr,
 		MetaSendTimeout: opt.MetaSendTimeout,
+		//EnableTransaction: opt.EnableTransaction,
+		SubDir:                     opt.SubDir,
+		TrashRebuildGoroutineLimit: int(opt.TrashRebuildGoroutineLimit),
+		TrashTraverseLimit:         int(opt.TrashDeleteExpiredDirGoroutineLimit),
 	}
 	s.mw, err = meta.NewMetaWrapper(metaConfig)
 	if err != nil {
 		return nil, errors.Trace(err, "NewMetaWrapper failed!"+err.Error())
 	}
 
+	s.SetTransaction(opt.EnableTransaction, opt.TxTimeout, opt.TxConflictRetryNum, opt.TxConflictRetryInterval)
+	s.mw.EnableQuota = opt.EnableQuota
+
 	s.volname = opt.Volname
+	s.masters = opt.Master
+	s.mountPoint = opt.MountPoint
+	s.subDir = opt.SubDir
 	s.owner = opt.Owner
 	s.cluster = s.mw.Cluster()
 	inodeExpiration := DefaultInodeExpiration
@@ -125,13 +149,25 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	if opt.EnSyncWrite > 0 {
 		s.enSyncWrite = true
 	}
+
 	s.keepCache = opt.KeepCache
-	s.ic = NewInodeCache(inodeExpiration, MaxInodeCache)
+	if opt.MaxStreamerLimit > 0 {
+		s.ic = NewInodeCache(inodeExpiration, MaxInodeCache)
+		s.dc = NewDcache(inodeExpiration, MaxInodeCache)
+	} else {
+		s.ic = NewInodeCache(inodeExpiration, DefaultMaxInodeCache)
+		s.dc = NewDcache(inodeExpiration, DefaultMaxInodeCache)
+	}
 	s.orphan = NewOrphanInodeList()
 	s.nodeCache = make(map[uint64]fs.Node)
 	s.disableDcache = opt.DisableDcache
 	s.fsyncOnClose = opt.FsyncOnClose
 	s.enableXattr = opt.EnableXattr
+	s.bcacheCheckInterval = opt.BcacheCheckIntervalS
+	s.bcacheFilterFiles = opt.BcacheFilterFiles
+	s.bcacheBatchCnt = opt.BcacheBatchCnt
+	s.closeC = make(chan struct{}, 1)
+	s.taskPool = []common.TaskPool{common.New(DefaultTaskPoolSize, DefaultTaskPoolSize), common.New(DefaultTaskPoolSize, DefaultTaskPoolSize)}
 
 	if s.mw.EnableSummary {
 		s.sc = NewSummaryCache(DefaultSummaryExpiration, MaxSummaryCache)
@@ -140,7 +176,6 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	if opt.MaxStreamerLimit > 0 {
 		DisableMetaCache = false
 		s.fsyncOnClose = false
-
 	}
 
 	if !strings.HasSuffix(opt.MountPoint, "/") {
@@ -152,6 +187,12 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	if opt.BcacheDir != "" && !strings.HasSuffix(opt.BcacheDir, "/") {
 		opt.BcacheDir = opt.BcacheDir + "/"
 	}
+
+	// use block cache and default use mountPoint as bcache dir
+	if opt.EnableBcache && opt.BcacheDir == "" {
+		s.bcacheDir = opt.MountPoint
+	}
+
 	if s.bcacheDir == opt.MountPoint {
 		s.bcacheDir = "/"
 	} else {
@@ -174,7 +215,7 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 		s.bc = bcache.NewBcacheClient()
 	}
 
-	var extentConfig = &stream.ExtentConfig{
+	extentConfig := &stream.ExtentConfig{
 		Volume:            opt.Volname,
 		Masters:           masters,
 		FollowerRead:      opt.FollowerRead,
@@ -193,7 +234,8 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 		OnCacheBcache:     s.bc.Put,
 		OnEvictBcache:     s.bc.Evict,
 
-		DisableMetaCache: DisableMetaCache,
+		DisableMetaCache:             DisableMetaCache,
+		MinWriteAbleDataPartitionCnt: opt.MinWriteAbleDataPartitionCnt,
 	}
 
 	s.ec, err = stream.NewExtentClient(extentConfig)
@@ -203,7 +245,7 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	if proto.IsCold(opt.VolType) {
 		s.ebsc, err = blobstore.NewEbsClient(access.Config{
 			ConnMode: access.NoLimitConnMode,
-			Consul: api.Config{
+			Consul: access.ConsulConfig{
 				Address: opt.EbsEndpoint,
 			},
 			MaxSizePutOnce: MaxSizePutOnce,
@@ -223,12 +265,12 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	if s.rootIno, err = s.mw.GetRootIno(opt.SubDir); err != nil {
 		return nil, err
 	}
+
 	s.suspendCh = make(chan interface{})
 	if proto.IsCold(opt.VolType) {
 		go s.scheduleFlush()
 	}
 	if s.mw.EnableSummary {
-
 		s.sc = NewSummaryCache(DefaultSummaryExpiration, MaxSummaryCache)
 	}
 
@@ -238,6 +280,9 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 
 	log.LogInfof("NewSuper: cluster(%v) volname(%v) icacheExpiration(%v) LookupValidDuration(%v) AttrValidDuration(%v) state(%v)",
 		s.cluster, s.volname, inodeExpiration, LookupValidDuration, AttrValidDuration, s.state)
+
+	go s.loopSyncMeta()
+
 	return s, nil
 }
 
@@ -287,7 +332,7 @@ func (s *Super) Node(ino, pino uint64, mode uint32) (fs.Node, error) {
 	if proto.OsMode(fakeInfo.Mode).IsDir() {
 		node = NewDir(s, fakeInfo, pino, "")
 	} else {
-		node = NewFile(s, fakeInfo, DefaultFlag, pino)
+		node = NewFile(s, fakeInfo, DefaultFlag, pino, "")
 		// The node is saved in FuseContextNodes list, that means
 		// the node is not evict. So we create a streamer for it,
 		// and streamer's refcnt is 0.
@@ -320,6 +365,7 @@ func (s *Super) Statfs(ctx context.Context, req *fuse.StatfsRequest, resp *fuse.
 func (s *Super) ClusterName() string {
 	return s.cluster
 }
+
 func (s *Super) GetRate(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(s.ec.GetRate()))
 }
@@ -448,6 +494,90 @@ func (s *Super) SetResume(w http.ResponseWriter, r *http.Request) {
 	replySucc(w, r, "set resume successfully")
 }
 
+func (s *Super) DisableTrash(w http.ResponseWriter, r *http.Request) {
+	var (
+		err error
+	)
+	if err = r.ParseForm(); err != nil {
+		replyFail(w, r, err.Error())
+		return
+	}
+	flag := r.FormValue("flag")
+	switch strings.ToLower(flag) {
+	case "true":
+		s.mw.DisableTrashByClient(true)
+	case "false":
+		s.mw.DisableTrashByClient(false)
+	default:
+		err = fmt.Errorf("flag only can be set :true of false")
+		replyFail(w, r, err.Error())
+		return
+	}
+	replySucc(w, r, fmt.Sprintf("set disable flag to %v\n", flag))
+}
+
+func (s *Super) QueryTrash(w http.ResponseWriter, r *http.Request) {
+	flag := s.mw.QueryTrashDisableByClient()
+	if !flag {
+		replySucc(w, r, fmt.Sprintf("Trash is now enable interval[%v]\n", s.mw.TrashInterval))
+	} else {
+		replySucc(w, r, fmt.Sprintf("Trash is now disable\n"))
+	}
+}
+
+func (s *Super) EnableAuditLog(w http.ResponseWriter, r *http.Request) {
+	var err error
+	if err = r.ParseForm(); err != nil {
+		auditlog.BuildFailureResp(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	logPath := r.FormValue("path")
+	if logPath == "" {
+		err = fmt.Errorf("path cannot be empty")
+		auditlog.BuildFailureResp(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	prefix := r.FormValue("prefix")
+	if prefix == "" {
+		err = fmt.Errorf("prefix cannot be empty")
+		auditlog.BuildFailureResp(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	logSize := 0
+
+	if logSizeStr := r.FormValue("logsize"); logSizeStr != "" {
+		val, err := strconv.Atoi(logSizeStr)
+		if err != nil {
+			err = fmt.Errorf("logSize error")
+			auditlog.BuildFailureResp(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		logSize = val
+	} else {
+		logSize = auditlog.DefaultAuditLogSize
+	}
+
+	dir, logModule, logMaxSize, err := auditlog.GetAuditLogInfo()
+	if err != nil {
+
+		_, err = auditlog.InitAuditWithPrefix(logPath, prefix, int64(auditlog.DefaultAuditLogSize),
+			auditlog.NewAuditPrefix(s.masters, s.volname, s.subDir, s.mountPoint))
+		if err != nil {
+			err = errors.NewErrorf("Init audit log fail: %v\n", err)
+			auditlog.BuildFailureResp(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		info := fmt.Sprintf("audit log is initialized with params: logDir(%v) logModule(%v) logMaxSize(%v)",
+			logPath, prefix, logSize)
+		auditlog.BuildSuccessResp(w, info)
+	} else {
+		info := fmt.Sprintf("audit log is already initialized with params: logDir(%v) logModule(%v) logMaxSize(%v)",
+			dir, logModule, logMaxSize)
+		auditlog.BuildSuccessResp(w, info)
+	}
+}
+
 func (s *Super) State() (state fs.FSStatType, sockaddr string) {
 	return fs.FSStatType(atomic.LoadUint32((*uint32)(&s.state))), s.sockaddr
 }
@@ -461,4 +591,189 @@ func (s *Super) Notify(stat fs.FSStatType, msg interface{}) {
 		s.sockaddr = ""
 		s.fslock.Unlock()
 	}
+}
+
+func (s *Super) loopSyncMeta() {
+	if s.bcacheDir == "" {
+		return
+	}
+	for {
+		finishC := s.syncMeta()
+		select {
+		case <-finishC:
+			time.Sleep(time.Second * time.Duration(s.bcacheCheckInterval))
+		case <-s.closeC:
+			return
+		}
+	}
+}
+
+func (s *Super) syncMeta() <-chan struct{} {
+	finishC := make(chan struct{})
+	start := time.Now()
+	cacheLen := s.ic.lruList.Len()
+
+	allInodes := func() <-chan uint64 {
+		out := make(chan uint64)
+		go func() {
+			for i := s.ic.lruList.Front(); i != nil; i = i.Next() {
+				oldInfo := i.Value.(*proto.InodeInfo)
+				out <- oldInfo.Inode
+			}
+			close(out)
+		}()
+		return out
+	}()
+
+	getChanged := func(in <-chan uint64, batchCnt int64) <-chan uint64 {
+		out := make(chan uint64)
+		changed := make([]uint64, 0)
+		s.taskPool[0].Run(func() {
+			tmpInodes := make([]uint64, 0, batchCnt)
+			for i := range in {
+				tmpInodes = append(tmpInodes, i)
+				if len(tmpInodes) == int(batchCnt) {
+					changed = append(changed, s.getModifyInodes(tmpInodes)...)
+					tmpInodes = tmpInodes[:0]
+				}
+			}
+			if len(tmpInodes) != 0 {
+				changed = append(changed, s.getModifyInodes(tmpInodes)...)
+			}
+			for i := range changed {
+				out <- changed[i]
+			}
+			close(out)
+		})
+		return out
+	}
+
+	batCh := make([]<-chan uint64, DefaultTaskPoolSize/3)
+	for i := range batCh {
+		batCh[i] = getChanged(allInodes, s.bcacheBatchCnt)
+	}
+
+	mergeChanged := func(cs []<-chan uint64) <-chan uint64 {
+		var wg sync.WaitGroup
+		out := make(chan uint64)
+		wg.Add(len(cs))
+		for _, c := range cs {
+			go func(c <-chan uint64) {
+				for n := range c {
+					out <- n
+				}
+				wg.Done()
+			}(c)
+		}
+		go func() {
+			wg.Wait()
+			close(out)
+		}()
+		return out
+	}
+
+	var changeCnt int
+
+	for ino := range mergeChanged(batCh) {
+		inode := ino
+		changeCnt++
+		log.LogDebugf("sync meta,inode:%d changed", inode)
+		s.ic.Delete(inode)
+		s.taskPool[1].Run(func() {
+			common.Timed(3, 100).On(func() error {
+				extents := s.ec.GetExtents(inode)
+				if err := s.ec.ForceRefreshExtentsCache(inode); err != nil {
+					if err != os.ErrNotExist {
+						log.LogErrorf("ForceRefreshExtentsCache failed:%v", err)
+					}
+				}
+				log.LogDebugf("inode:%d,extents is :%v", inode, extents)
+				for _, extent := range extents {
+					cacheKey := util.GenerateRepVolKey(s.volname, inode, extent.PartitionId, extent.ExtentId, extent.FileOffset)
+					// retry to make possible evict success
+					if s.bc != nil {
+						common.Timed(3, 100).On(func() error {
+							return s.bc.Evict(cacheKey)
+						})
+					}
+
+				}
+				return nil
+			})
+		})
+	}
+
+	log.LogDebugf("total cache cnt:%d,changedCnt:%d,sync meta cost:%v", cacheLen, changeCnt, time.Since(start))
+	close(finishC)
+
+	return finishC
+}
+
+func (s *Super) getModifyInodes(inodes []uint64) (changedNodes []uint64) {
+	inodeInfos := s.mw.BatchInodeGet(inodes)
+
+	// get deleted files
+	if len(inodeInfos) != len(inodes) {
+		changedNodes = append(changedNodes, getDelInodes(inodes, inodeInfos)...)
+		log.LogDebugf("len inodes is %d, len get inode infos is :%d, del inodes is:%v", len(inodes), len(inodeInfos), changedNodes)
+	}
+
+	for _, newInfo := range inodeInfos {
+		oldInfo := s.ic.Get(newInfo.Inode)
+		if oldInfo == nil {
+			continue
+		}
+		if !oldInfo.ModifyTime.Equal(newInfo.ModifyTime) || newInfo.Generation != s.ec.GetExtentCacheGen(newInfo.Inode) {
+			log.LogDebugf("oldInfo:ino(%d) modifyTime(%v) gen(%d),newInfo:ino(%d) modifyTime(%d) gen(%d)", oldInfo.Inode, oldInfo.ModifyTime.Unix(), s.ec.GetExtentCacheGen(newInfo.Inode), newInfo.Inode, newInfo.ModifyTime.Unix(), newInfo.Generation)
+			changedNodes = append(changedNodes, newInfo.Inode)
+		} else {
+			log.LogDebugf("oldInfo:ino(%d) modifyTime(%v) gen(%d),newInfo:ino(%d) modifyTime(%d) gen(%d)", oldInfo.Inode, oldInfo.ModifyTime.Unix(), s.ec.GetExtentCacheGen(newInfo.Inode), newInfo.Inode, newInfo.ModifyTime.Unix(), newInfo.Generation)
+		}
+	}
+	return
+}
+
+func getDelInodes(src []uint64, act []*proto.InodeInfo) []uint64 {
+	delInodes := make([]uint64, 0)
+	m := make(map[uint64]struct{})
+	for _, iInfo := range act {
+		m[iInfo.Inode] = struct{}{}
+	}
+	for _, inode := range src {
+		if _, ok := m[inode]; !ok {
+			delInodes = append(delInodes, inode)
+		}
+	}
+	return delInodes
+}
+
+func (s *Super) Close() {
+	close(s.closeC)
+}
+
+func (s *Super) SetTransaction(txMaskStr string, timeout int64, retryNum int64, retryInterval int64) {
+	//maskStr := proto.GetMaskString(txMask)
+	mask, err := proto.GetMaskFromString(txMaskStr)
+	if err != nil {
+		log.LogErrorf("SetTransaction: err[%v], op[%v], timeout[%v]", err, txMaskStr, timeout)
+		return
+	}
+
+	s.mw.EnableTransaction = mask
+	if timeout <= 0 {
+		timeout = proto.DefaultTransactionTimeout
+	}
+	s.mw.TxTimeout = timeout
+
+	if retryNum <= 0 {
+		retryNum = proto.DefaultTxConflictRetryNum
+	}
+	s.mw.TxConflictRetryNum = retryNum
+
+	if retryInterval <= 0 {
+		retryInterval = proto.DefaultTxConflictRetryInterval
+	}
+	s.mw.TxConflictRetryInterval = retryInterval
+	log.LogDebugf("SetTransaction: mask[%v], op[%v], timeout[%v], retryNum[%v], retryInterval[%v ms]",
+		mask, txMaskStr, timeout, retryNum, retryInterval)
 }

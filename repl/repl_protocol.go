@@ -58,6 +58,9 @@ type ReplProtocol struct {
 	operatorFunc func(p *Packet, c net.Conn) error // operator
 	postFunc     func(p *Packet) error             // post-processing packet
 
+	getSmuxConn func(addr string) (c net.Conn, err error)
+	putSmuxConn func(conn net.Conn, force bool)
+
 	isError int32
 	replId  int64
 }
@@ -72,16 +75,10 @@ type FollowerTransport struct {
 	isclosed int32
 }
 
-func NewFollowersTransport(addr string) (ft *FollowerTransport, err error) {
-	var (
-		conn net.Conn
-	)
-	if conn, err = gConnPool.GetConnect(addr); err != nil {
-		return
-	}
+func NewFollowersTransport(addr string, c net.Conn) (ft *FollowerTransport, err error) {
 	ft = new(FollowerTransport)
 	ft.addr = addr
-	ft.conn = conn
+	ft.conn = c
 	ft.sendCh = make(chan *FollowerPacket, 200)
 	ft.recvCh = make(chan *FollowerPacket, 200)
 	ft.exitCh = make(chan struct{})
@@ -147,7 +144,7 @@ func (ft *FollowerTransport) readFollowerResult(request *FollowerPacket) (err er
 		return
 	}
 	timeOut := proto.ReadDeadlineTime
-	if request.IsBatchDeleteExtents() {
+	if request.IsBatchDeleteExtents() || request.IsBatchLockNormalExtents() || request.IsBatchUnlockNormalExtents() {
 		timeOut = proto.BatchDeleteExtentReadDeadLineTime
 	}
 	if err = reply.ReadFromConn(ft.conn, timeOut); err != nil {
@@ -210,6 +207,11 @@ func NewReplProtocol(inConn net.Conn, prepareFunc func(p *Packet) error,
 	go rp.writeResponseToClientGoRroutine()
 
 	return rp
+}
+
+func (rp *ReplProtocol) SetSmux(f func(addr string) (net.Conn, error), putSmux func(conn net.Conn, force bool)) {
+	rp.getSmuxConn = f
+	rp.putSmuxConn = putSmux
 }
 
 // ServerConn keeps reading data from the socket to analyze the follower address, execute the prepare function,
@@ -281,6 +283,7 @@ func (rp *ReplProtocol) readPkgAndPrepare() (err error) {
 		err = rp.putResponse(request)
 		return
 	}
+
 	err = rp.putToBeProcess(request)
 
 	return
@@ -358,10 +361,10 @@ func (rp *ReplProtocol) writeResponseToClientGoRroutine() {
 
 }
 
-func (rp *ReplProtocol) operatorFuncWithWaitGroup(wg *sync.WaitGroup, request *Packet) {
-	defer wg.Done()
-	rp.operatorFunc(request, rp.sourceConn)
-}
+// func (rp *ReplProtocol) operatorFuncWithWaitGroup(wg *sync.WaitGroup, request *Packet) {
+// 	defer wg.Done()
+// 	rp.operatorFunc(request, rp.sourceConn)
+// }
 
 // Read a packet from the list, scan all the connections of the followers of this packet and read the responses.
 // If failed to read the response, then mark the packet as failure, and delete it from the list.
@@ -438,6 +441,19 @@ func (rp *ReplProtocol) Stop() {
 
 }
 
+type SmuxConn struct {
+	once sync.Once
+	net.Conn
+	put func(conn net.Conn, force bool)
+}
+
+func (d *SmuxConn) Close() error {
+	d.once.Do(func() {
+		d.put(d.Conn, true)
+	})
+	return nil
+}
+
 // Allocate the connections to the followers. We use partitionId + extentId + followerAddr as the key.
 // Note that we need to ensure the order of packets sent to the datanode is consistent here.
 func (rp *ReplProtocol) allocateFollowersConns(p *Packet, index int) (transport *FollowerTransport, err error) {
@@ -445,10 +461,33 @@ func (rp *ReplProtocol) allocateFollowersConns(p *Packet, index int) (transport 
 	transport = rp.followerConnects[p.followersAddrs[index]]
 	rp.lock.RUnlock()
 	if transport == nil {
-		transport, err = NewFollowersTransport(p.followersAddrs[index])
+		addr := p.followersAddrs[index]
+
+		var conn net.Conn
+		if (p.IsMarkDeleteExtentOperation() || p.IsBatchDeleteExtents()) && rp.getSmuxConn != nil {
+			var smuxCon net.Conn
+			smuxCon, err = rp.getSmuxConn(addr)
+			if err != nil {
+				return
+			}
+
+			conn = &SmuxConn{
+				Conn: smuxCon,
+				put:  rp.putSmuxConn,
+			}
+
+		} else {
+			conn, err = gConnPool.GetConnect(addr)
+			if err != nil {
+				return
+			}
+		}
+
+		transport, err = NewFollowersTransport(addr, conn)
 		if err != nil {
 			return
 		}
+
 		rp.lock.Lock()
 		rp.followerConnects[p.followersAddrs[index]] = transport
 		rp.lock.Unlock()

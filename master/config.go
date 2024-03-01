@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"github.com/cubefs/cubefs/depends/tiglabs/raft/proto"
+	pt "github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/raftstore"
 )
 
@@ -31,6 +32,8 @@ const (
 	cfgPeers   = "peers"
 	// if the data partition has not been reported within this interval  (in terms of seconds), it will be considered as missing.
 	missingDataPartitionInterval        = "missingDataPartitionInterval"
+	cfgDpNoLeaderReportIntervalSec      = "dpNoLeaderReportIntervalSec"
+	cfgMpNoLeaderReportIntervalSec      = "mpNoLeaderReportIntervalSec"
 	dataPartitionTimeOutSec             = "dataPartitionTimeOutSec"
 	NumberOfDataPartitionsToLoad        = "numberOfDataPartitionsToLoad"
 	secondsToFreeDataPartitionAfterLoad = "secondsToFreeDataPartitionAfterLoad"
@@ -41,6 +44,14 @@ const (
 	faultDomain                         = "faultDomain"
 	cfgDomainBatchGrpCnt                = "faultDomainGrpBatchCnt"
 	cfgDomainBuildAsPossible            = "faultDomainBuildAsPossible"
+	cfgmetaPartitionInodeIdStep         = "metaPartitionInodeIdStep"
+	cfgMaxQuotaNumPerVol                = "maxQuotaNumPerVol"
+	disableAutoCreate                   = "disableAutoCreate"
+	cfgMonitorPushAddr                  = "monitorPushAddr"
+	intervalToScanS3Expiration          = "intervalToScanS3Expiration"
+
+	cfgVolForceDeletion           = "volForceDeletion"
+	cfgVolDeletionDentryThreshold = "volDeletionDentryThreshold"
 )
 
 //default value
@@ -57,7 +68,8 @@ const (
 	defaultNodeTimeOutSec                      = noHeartBeatTimes * defaultIntervalToCheckHeartbeat
 	defaultDataPartitionTimeOutSec             = 5 * defaultIntervalToCheckHeartbeat
 	defaultMissingDataPartitionInterval        = 24 * 3600
-
+	defaultDpNoLeaderReportIntervalSec         = 10 * 60
+	defaultMpNoLeaderReportIntervalSec         = 5
 	defaultIntervalToAlarmMissingDataPartition = 60 * 60
 	timeToWaitForResponse                      = 120         // time to wait for response by the master during loading partition
 	defaultPeriodToLoadAllDataPartitions       = 60 * 60 * 4 // how long we need to load all the data partitions on the master every time
@@ -72,8 +84,10 @@ const (
 	defaultMaxMetaPartitionCountOnEachNode             = 10000
 	defaultReplicaNum                                  = 3
 	defaultDiffSpaceUsage                              = 1024 * 1024 * 1024
+	defaultDiffReplicaFileCount                        = 20
 	defaultNodeSetGrpStep                              = 1
 	defaultMasterMinQosAccept                          = 20000
+	defaultMaxDpCntLimit                               = 3000
 )
 
 // AddrDatabase is a map that stores the address of a given host (e.g., the leader)
@@ -83,6 +97,8 @@ type clusterConfig struct {
 	secondsToFreeDataPartitionAfterLoad int64
 	NodeTimeOutSec                      int64
 	MissingDataPartitionInterval        int64
+	DpNoLeaderReportIntervalSec         int64
+	MpNoLeaderReportIntervalSec         int64
 	DataPartitionTimeOutSec             int64
 	IntervalToAlarmMissingDataPartition int64
 	PeriodToLoadALLDataPartitions       int64
@@ -96,19 +112,30 @@ type clusterConfig struct {
 	ClusterLoadFactor                   float32
 	MetaNodeDeleteBatchCount            uint64 //metanode delete batch count
 	DataNodeDeleteLimitRate             uint64 //datanode delete limit rate
-	MetaNodeDeleteWorkerSleepMs         uint64 //datanode delete limit rate
-	MaxDpCntLimit                       uint64
+	MetaNodeDeleteWorkerSleepMs         uint64 //metaNode delete worker sleep time with millisecond. if 0 for no sleep
+	MaxDpCntLimit                       uint64 //datanode data partition limit
 	DataNodeAutoRepairLimitRate         uint64 //datanode autorepair limit rate
 	peers                               []raftstore.PeerAddress
 	peerAddrs                           []string
 	heartbeatPort                       int64
 	replicaPort                         int64
-	diffSpaceUsage                      uint64
+	diffReplicaSpaceUsage               uint64
+	diffReplicaFileCount                uint32
 	faultDomain                         bool
 	DefaultNormalZoneCnt                int
 	DomainBuildAsPossible               bool
 	DataPartitionUsageThreshold         float64
 	QosMasterAcceptLimit                uint64
+	DirChildrenNumLimit                 uint32
+	MetaPartitionInodeIdStep            uint64
+	MaxQuotaNumPerVol                   int
+	DisableAutoCreate                   bool
+	MonitorPushAddr                     string
+	IntervalToScanS3Expiration          int64
+	MaxConcurrentLcNodes                uint64
+
+	volForceDeletion           bool   // when delete a volume, ignore it's dentry count or not
+	volDeletionDentryThreshold uint64 // in case of volForceDeletion is set to false, define the dentry count threshold to allow volume deletion
 }
 
 func newClusterConfig() (cfg *clusterConfig) {
@@ -117,6 +144,8 @@ func newClusterConfig() (cfg *clusterConfig) {
 	cfg.secondsToFreeDataPartitionAfterLoad = defaultSecondsToFreeDataPartitionAfterLoad
 	cfg.NodeTimeOutSec = defaultNodeTimeOutSec
 	cfg.MissingDataPartitionInterval = defaultMissingDataPartitionInterval
+	cfg.DpNoLeaderReportIntervalSec = defaultDpNoLeaderReportIntervalSec
+	cfg.MpNoLeaderReportIntervalSec = defaultMpNoLeaderReportIntervalSec
 	cfg.DataPartitionTimeOutSec = defaultDataPartitionTimeOutSec
 	cfg.IntervalToCheckDataPartition = defaultIntervalToCheckDataPartition
 	cfg.IntervalToCheckQos = defaultIntervalToCheckQos
@@ -125,9 +154,14 @@ func newClusterConfig() (cfg *clusterConfig) {
 	cfg.PeriodToLoadALLDataPartitions = defaultPeriodToLoadAllDataPartitions
 	cfg.MetaNodeThreshold = defaultMetaPartitionMemUsageThreshold
 	cfg.ClusterLoadFactor = defaultOverSoldFactor
+	cfg.MaxDpCntLimit = defaultMaxDpCntLimit
 	cfg.metaNodeReservedMem = defaultMetaNodeReservedMem
-	cfg.diffSpaceUsage = defaultDiffSpaceUsage
+	cfg.diffReplicaSpaceUsage = defaultDiffSpaceUsage
+	cfg.diffReplicaFileCount = defaultDiffReplicaFileCount
 	cfg.QosMasterAcceptLimit = defaultMasterMinQosAccept
+	cfg.DirChildrenNumLimit = pt.DefaultDirChildrenNumLimit
+	cfg.MetaPartitionInodeIdStep = defaultMetaPartitionInodeIDStep
+	cfg.MaxQuotaNumPerVol = defaultMaxQuotaNumPerVol
 	return
 }
 

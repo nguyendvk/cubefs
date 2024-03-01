@@ -16,6 +16,7 @@ package scheduler
 
 import (
 	"fmt"
+	"math/rand"
 	"net/http"
 
 	api "github.com/cubefs/cubefs/blobstore/api/scheduler"
@@ -43,10 +44,11 @@ type Service struct {
 	manualMigMgr  IManualMigrator
 	inspectMgr    IVolumeInspector
 
-	shardRepairMgr ITaskRunner
-	blobDeleteMgr  ITaskRunner
-	volCache       IVolumeCache
-	volumeUpdater  client.IVolumeUpdater
+	shardRepairMgr  ITaskRunner
+	blobDeleteMgr   ITaskRunner
+	clusterTopology IClusterTopology
+	volumeUpdater   client.IVolumeUpdater
+	kafkaMonitors   []*base.KafkaTopicMonitor
 
 	clusterMgrCli client.ClusterMgrAPI
 }
@@ -65,6 +67,16 @@ func (svr *Service) mgrByType(typ proto.TaskType) (Migrator, error) {
 	return nil, errIllegalTaskType
 }
 
+func (svr *Service) diskMgrByType(typ proto.TaskType) (IDisKMigrator, error) {
+	switch typ {
+	case proto.TaskTypeDiskDrop:
+		return svr.diskDropMgr, nil
+	case proto.TaskTypeDiskRepair:
+		return svr.diskRepairMgr, nil
+	}
+	return nil, errIllegalTaskType
+}
+
 // HTTPTaskAcquire acquire task
 func (svr *Service) HTTPTaskAcquire(c *rpc.Context) {
 	args := new(api.AcquireArgs)
@@ -73,13 +85,16 @@ func (svr *Service) HTTPTaskAcquire(c *rpc.Context) {
 		return
 	}
 
-	// acquire task ordered
+	// acquire task ordered: returns disk repair task first and other random
 	ctx := c.Request.Context()
-	for _, acquire := range []Migrator{
-		svr.manualMigMgr, svr.diskRepairMgr, svr.diskDropMgr, svr.balanceMgr,
-	} {
-		if task, err := acquire.AcquireTask(ctx, args.IDC); err == nil {
-			c.RespondJSON(task)
+	migrators := []Migrator{svr.diskRepairMgr, svr.manualMigMgr, svr.diskDropMgr, svr.balanceMgr}
+	shuffledMigrators := migrators[1:]
+	rand.Shuffle(len(shuffledMigrators), func(i, j int) {
+		shuffledMigrators[i], shuffledMigrators[j] = shuffledMigrators[j], shuffledMigrators[i]
+	})
+	for _, acquire := range migrators {
+		if migrateTask, err := acquire.AcquireTask(ctx, args.IDC); err == nil {
+			c.RespondJSON(migrateTask)
 			return
 		}
 	}
@@ -257,6 +272,26 @@ func (svr *Service) HTTPMigrateTaskDetail(c *rpc.Context) {
 	c.RespondJSON(detail)
 }
 
+// HTTPDiskMigratingStats returns disk migrating stats
+func (svr *Service) HTTPDiskMigratingStats(c *rpc.Context) {
+	args := new(api.DiskMigratingStatsArgs)
+	if err := c.ParseArgs(args); err != nil {
+		c.RespondError(err)
+		return
+	}
+	querier, err := svr.diskMgrByType(args.TaskType)
+	if err != nil {
+		c.RespondError(err)
+		return
+	}
+	stats, err := querier.DiskProgress(c.Request.Context(), args.DiskID)
+	if err != nil {
+		c.RespondError(err)
+		return
+	}
+	c.RespondJSON(stats)
+}
+
 // HTTPStats returns service stats
 func (svr *Service) HTTPStats(c *rpc.Context) {
 	ctx := c.Request.Context()
@@ -290,20 +325,20 @@ func (svr *Service) HTTPStats(c *rpc.Context) {
 	}
 
 	// stats repair tasks
-	repairDiskID, totalTasksCnt, repairedTasksCnt := svr.diskRepairMgr.Progress(ctx)
+	repairDisks, totalTasksCnt, repairedTasksCnt := svr.diskRepairMgr.Progress(ctx)
 	taskStats.DiskRepair = &api.DiskRepairTasksStat{
 		Enable:           svr.diskRepairMgr.Enabled(),
-		RepairingDiskID:  repairDiskID,
+		RepairingDisks:   repairDisks,
 		TotalTasksCnt:    totalTasksCnt,
 		RepairedTasksCnt: repairedTasksCnt,
 		MigrateTasksStat: svr.diskRepairMgr.Stats(),
 	}
 
 	// stats drop tasks
-	dropDiskID, totalTasksCnt, droppedTasksCnt := svr.diskDropMgr.Progress(ctx)
+	dropDisks, totalTasksCnt, droppedTasksCnt := svr.diskDropMgr.Progress(ctx)
 	taskStats.DiskDrop = &api.DiskDropTasksStat{
 		Enable:           svr.diskDropMgr.Enabled(),
-		DroppingDiskID:   dropDiskID,
+		DroppingDisks:    dropDisks,
 		TotalTasksCnt:    totalTasksCnt,
 		DroppedTasksCnt:  droppedTasksCnt,
 		MigrateTasksStat: svr.diskDropMgr.Stats(),
@@ -362,7 +397,7 @@ func (svr *Service) HTTPUpdateVolume(c *rpc.Context) {
 	span := trace.SpanFromContextSafe(ctx)
 
 	// update local cache of volume
-	_, err := svr.volCache.Update(args.Vid)
+	_, err := svr.clusterTopology.UpdateVolume(args.Vid)
 	if err != nil {
 		span.Errorf("local volume cache update failed: vid[%d], err[%+v]", args.Vid, err)
 		c.RespondError(err)

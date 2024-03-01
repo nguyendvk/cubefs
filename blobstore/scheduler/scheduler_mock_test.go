@@ -37,6 +37,18 @@ func (m *MockTaskRunner) EXPECT() *MockTaskRunnerMockRecorder {
 	return m.recorder
 }
 
+// Close mocks base method.
+func (m *MockTaskRunner) Close() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "Close")
+}
+
+// Close indicates an expected call of Close.
+func (mr *MockTaskRunnerMockRecorder) Close() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Close", reflect.TypeOf((*MockTaskRunner)(nil).Close))
+}
+
 // Enabled mocks base method.
 func (m *MockTaskRunner) Enabled() bool {
 	m.ctrl.T.Helper()
@@ -81,16 +93,16 @@ func (mr *MockTaskRunnerMockRecorder) GetTaskStats() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetTaskStats", reflect.TypeOf((*MockTaskRunner)(nil).GetTaskStats))
 }
 
-// RunTask mocks base method.
-func (m *MockTaskRunner) RunTask() {
+// Run mocks base method.
+func (m *MockTaskRunner) Run() {
 	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "RunTask")
+	m.ctrl.Call(m, "Run")
 }
 
-// RunTask indicates an expected call of RunTask.
-func (mr *MockTaskRunnerMockRecorder) RunTask() *gomock.Call {
+// Run indicates an expected call of Run.
+func (mr *MockTaskRunnerMockRecorder) Run() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RunTask", reflect.TypeOf((*MockTaskRunner)(nil).RunTask))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Run", reflect.TypeOf((*MockTaskRunner)(nil).Run))
 }
 
 // MockVolumeCache is a mock of IVolumeCache interface.
@@ -116,48 +128,48 @@ func (m *MockVolumeCache) EXPECT() *MockVolumeCacheMockRecorder {
 	return m.recorder
 }
 
-// Get mocks base method.
-func (m *MockVolumeCache) Get(arg0 proto.Vid) (*client.VolumeInfoSimple, error) {
+// GetVolume mocks base method.
+func (m *MockVolumeCache) GetVolume(arg0 proto.Vid) (*client.VolumeInfoSimple, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Get", arg0)
+	ret := m.ctrl.Call(m, "GetVolume", arg0)
 	ret0, _ := ret[0].(*client.VolumeInfoSimple)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// Get indicates an expected call of Get.
-func (mr *MockVolumeCacheMockRecorder) Get(arg0 interface{}) *gomock.Call {
+// GetVolume indicates an expected call of GetVolume.
+func (mr *MockVolumeCacheMockRecorder) GetVolume(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Get", reflect.TypeOf((*MockVolumeCache)(nil).Get), arg0)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetVolume", reflect.TypeOf((*MockVolumeCache)(nil).GetVolume), arg0)
 }
 
-// Load mocks base method.
-func (m *MockVolumeCache) Load() error {
+// LoadVolumes mocks base method.
+func (m *MockVolumeCache) LoadVolumes() error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Load")
+	ret := m.ctrl.Call(m, "LoadVolumes")
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
-// Load indicates an expected call of Load.
-func (mr *MockVolumeCacheMockRecorder) Load() *gomock.Call {
+// LoadVolumes indicates an expected call of LoadVolumes.
+func (mr *MockVolumeCacheMockRecorder) LoadVolumes() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Load", reflect.TypeOf((*MockVolumeCache)(nil).Load))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LoadVolumes", reflect.TypeOf((*MockVolumeCache)(nil).LoadVolumes))
 }
 
-// Update mocks base method.
-func (m *MockVolumeCache) Update(arg0 proto.Vid) (*client.VolumeInfoSimple, error) {
+// UpdateVolume mocks base method.
+func (m *MockVolumeCache) UpdateVolume(arg0 proto.Vid) (*client.VolumeInfoSimple, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Update", arg0)
+	ret := m.ctrl.Call(m, "UpdateVolume", arg0)
 	ret0, _ := ret[0].(*client.VolumeInfoSimple)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// Update indicates an expected call of Update.
-func (mr *MockVolumeCacheMockRecorder) Update(arg0 interface{}) *gomock.Call {
+// UpdateVolume indicates an expected call of UpdateVolume.
+func (mr *MockVolumeCacheMockRecorder) UpdateVolume(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Update", reflect.TypeOf((*MockVolumeCache)(nil).Update), arg0)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateVolume", reflect.TypeOf((*MockVolumeCache)(nil).UpdateVolume), arg0)
 }
 
 // MockMigrater is a mock of MMigrator interface.
@@ -238,6 +250,18 @@ func (mr *MockMigraterMockRecorder) CancelTask(arg0, arg1 interface{}) *gomock.C
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CancelTask", reflect.TypeOf((*MockMigrater)(nil).CancelTask), arg0, arg1)
 }
 
+// ClearDeletedTaskByID mocks base method.
+func (m *MockMigrater) ClearDeletedTaskByID(arg0 proto.DiskID, arg1 string) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "ClearDeletedTaskByID", arg0, arg1)
+}
+
+// ClearDeletedTaskByID indicates an expected call of ClearDeletedTaskByID.
+func (mr *MockMigraterMockRecorder) ClearDeletedTaskByID(arg0, arg1 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ClearDeletedTaskByID", reflect.TypeOf((*MockMigrater)(nil).ClearDeletedTaskByID), arg0, arg1)
+}
+
 // ClearDeletedTasks mocks base method.
 func (m *MockMigrater) ClearDeletedTasks(arg0 proto.DiskID) {
 	m.ctrl.T.Helper()
@@ -274,6 +298,35 @@ func (m *MockMigrater) CompleteTask(arg0 context.Context, arg1 *scheduler.Operat
 func (mr *MockMigraterMockRecorder) CompleteTask(arg0, arg1 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CompleteTask", reflect.TypeOf((*MockMigrater)(nil).CompleteTask), arg0, arg1)
+}
+
+// DeletedTasks mocks base method.
+func (m *MockMigrater) DeletedTasks() []DeletedTask {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DeletedTasks")
+	ret0, _ := ret[0].([]DeletedTask)
+	return ret0
+}
+
+// DeletedTasks indicates an expected call of DeletedTasks.
+func (mr *MockMigraterMockRecorder) DeletedTasks() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeletedTasks", reflect.TypeOf((*MockMigrater)(nil).DeletedTasks))
+}
+
+// DiskProgress mocks base method.
+func (m *MockMigrater) DiskProgress(arg0 context.Context, arg1 proto.DiskID) (*scheduler.DiskMigratingStats, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DiskProgress", arg0, arg1)
+	ret0, _ := ret[0].(*scheduler.DiskMigratingStats)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// DiskProgress indicates an expected call of DiskProgress.
+func (mr *MockMigraterMockRecorder) DiskProgress(arg0, arg1 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DiskProgress", reflect.TypeOf((*MockMigrater)(nil).DiskProgress), arg0, arg1)
 }
 
 // Done mocks base method.
@@ -418,10 +471,10 @@ func (mr *MockMigraterMockRecorder) Load() *gomock.Call {
 }
 
 // Progress mocks base method.
-func (m *MockMigrater) Progress(arg0 context.Context) (proto.DiskID, int, int) {
+func (m *MockMigrater) Progress(arg0 context.Context) ([]proto.DiskID, int, int) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "Progress", arg0)
-	ret0, _ := ret[0].(proto.DiskID)
+	ret0, _ := ret[0].([]proto.DiskID)
 	ret1, _ := ret[1].(int)
 	ret2, _ := ret[2].(int)
 	return ret0, ret1, ret2
@@ -500,8 +553,20 @@ func (mr *MockMigraterMockRecorder) Run() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Run", reflect.TypeOf((*MockMigrater)(nil).Run))
 }
 
+// SetClearJunkTasksWhenLoadingFunc mocks base method.
+func (m *MockMigrater) SetClearJunkTasksWhenLoadingFunc(arg0 clearJunkTasksFunc) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "SetClearJunkTasksWhenLoadingFunc", arg0)
+}
+
+// SetClearJunkTasksWhenLoadingFunc indicates an expected call of SetClearJunkTasksWhenLoadingFunc.
+func (mr *MockMigraterMockRecorder) SetClearJunkTasksWhenLoadingFunc(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetClearJunkTasksWhenLoadingFunc", reflect.TypeOf((*MockMigrater)(nil).SetClearJunkTasksWhenLoadingFunc), arg0)
+}
+
 // SetLockFailHandleFunc mocks base method.
-func (m *MockMigrater) SetLockFailHandleFunc(arg0 func(context.Context, *proto.MigrateTask)) {
+func (m *MockMigrater) SetLockFailHandleFunc(arg0 lockFailFunc) {
 	m.ctrl.T.Helper()
 	m.ctrl.Call(m, "SetLockFailHandleFunc", arg0)
 }
@@ -746,4 +811,76 @@ func (m *MockClusterTopology) GetIDCs() map[string]*IDC {
 func (mr *MockClusterTopologyMockRecorder) GetIDCs() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetIDCs", reflect.TypeOf((*MockClusterTopology)(nil).GetIDCs))
+}
+
+// GetVolume mocks base method.
+func (m *MockClusterTopology) GetVolume(arg0 proto.Vid) (*client.VolumeInfoSimple, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetVolume", arg0)
+	ret0, _ := ret[0].(*client.VolumeInfoSimple)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetVolume indicates an expected call of GetVolume.
+func (mr *MockClusterTopologyMockRecorder) GetVolume(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetVolume", reflect.TypeOf((*MockClusterTopology)(nil).GetVolume), arg0)
+}
+
+// IsBrokenDisk mocks base method.
+func (m *MockClusterTopology) IsBrokenDisk(arg0 proto.DiskID) bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "IsBrokenDisk", arg0)
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// IsBrokenDisk indicates an expected call of IsBrokenDisk.
+func (mr *MockClusterTopologyMockRecorder) IsBrokenDisk(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsBrokenDisk", reflect.TypeOf((*MockClusterTopology)(nil).IsBrokenDisk), arg0)
+}
+
+// LoadVolumes mocks base method.
+func (m *MockClusterTopology) LoadVolumes() error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "LoadVolumes")
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// LoadVolumes indicates an expected call of LoadVolumes.
+func (mr *MockClusterTopologyMockRecorder) LoadVolumes() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LoadVolumes", reflect.TypeOf((*MockClusterTopology)(nil).LoadVolumes))
+}
+
+// MaxFreeChunksDisk mocks base method.
+func (m *MockClusterTopology) MaxFreeChunksDisk(arg0 string) *client.DiskInfoSimple {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "MaxFreeChunksDisk", arg0)
+	ret0, _ := ret[0].(*client.DiskInfoSimple)
+	return ret0
+}
+
+// MaxFreeChunksDisk indicates an expected call of MaxFreeChunksDisk.
+func (mr *MockClusterTopologyMockRecorder) MaxFreeChunksDisk(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MaxFreeChunksDisk", reflect.TypeOf((*MockClusterTopology)(nil).MaxFreeChunksDisk), arg0)
+}
+
+// UpdateVolume mocks base method.
+func (m *MockClusterTopology) UpdateVolume(arg0 proto.Vid) (*client.VolumeInfoSimple, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "UpdateVolume", arg0)
+	ret0, _ := ret[0].(*client.VolumeInfoSimple)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// UpdateVolume indicates an expected call of UpdateVolume.
+func (mr *MockClusterTopologyMockRecorder) UpdateVolume(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateVolume", reflect.TypeOf((*MockClusterTopology)(nil).UpdateVolume), arg0)
 }

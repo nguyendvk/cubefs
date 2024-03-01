@@ -31,8 +31,10 @@ type LeaderInfo struct {
 func (m *Server) handleLeaderChange(leader uint64) {
 	if leader == 0 {
 		log.LogWarnf("action[handleLeaderChange] but no leader")
+		WarnMetrics.reset()
 		return
 	}
+
 	oldLeaderAddr := m.leaderInfo.addr
 	m.leaderInfo.addr = AddrDatabase[leader]
 	log.LogWarnf("action[handleLeaderChange] change leader to [%v] ", m.leaderInfo.addr)
@@ -42,17 +44,25 @@ func (m *Server) handleLeaderChange(leader uint64) {
 		Warn(m.clusterName, fmt.Sprintf("clusterID[%v] leader is changed to %v",
 			m.clusterName, m.leaderInfo.addr))
 		if oldLeaderAddr != m.leaderInfo.addr {
+			m.cluster.checkPersistClusterValue()
+
 			m.loadMetadata()
+			m.cluster.metaReady = true
 			m.metaReady = true
 		}
 		m.cluster.checkDataNodeHeartbeat()
 		m.cluster.checkMetaNodeHeartbeat()
 		m.cluster.followerReadManager.reSet()
+
 	} else {
 		Warn(m.clusterName, fmt.Sprintf("clusterID[%v] leader is changed to %v",
 			m.clusterName, m.leaderInfo.addr))
 		m.clearMetadata()
 		m.metaReady = false
+		m.cluster.metaReady = false
+		m.cluster.masterClient.AddNode(m.leaderInfo.addr)
+		m.cluster.masterClient.SetLeader(m.leaderInfo.addr)
+		WarnMetrics.reset()
 	}
 }
 
@@ -86,11 +96,9 @@ func (m *Server) handleApplySnapshot() {
 func (m *Server) handleRaftUserCmd(opt uint32, key string, cmdMap map[string][]byte) (err error) {
 	log.LogInfof("action[handleRaftUserCmd] opt %v, key %v, map len %v", opt, key, len(cmdMap))
 	switch opt {
-	case opSyncDataPartitionsView:
-		// cluster may not have been init when the raft log recovery,message can be ignored,
-		// Later, we can consider changing their two priorities
-		if m.cluster != nil {
-			m.cluster.followerReadManager.updateVolViewFromLeader(key, cmdMap[key])
+	case opSyncPutFollowerApiLimiterInfo, opSyncPutApiLimiterInfo:
+		if m.cluster != nil && !m.partition.IsRaftLeader() {
+			m.cluster.apiLimiter.updateLimiterInfoFromLeader(cmdMap[key])
 		}
 	default:
 		log.LogErrorf("action[handleRaftUserCmd] opt %v not supported,key %v, map len %v", opt, key, len(cmdMap))
@@ -165,6 +173,10 @@ func (m *Server) loadMetadata() {
 	if err = m.cluster.loadDataPartitions(); err != nil {
 		panic(err)
 	}
+
+	if err = m.cluster.startDecommissionListTraverse(); err != nil {
+		panic(err)
+	}
 	log.LogInfo("action[loadMetadata] end")
 
 	log.LogInfo("action[loadUserInfo] begin")
@@ -185,6 +197,17 @@ func (m *Server) loadMetadata() {
 	}
 	log.LogInfo("action[refreshUser] end")
 
+	log.LogInfo("action[loadApiLimiterInfo] begin")
+	if err = m.cluster.loadApiLimiterInfo(); err != nil {
+		panic(err)
+	}
+	log.LogInfo("action[loadApiLimiterInfo] end")
+
+	log.LogInfo("action[loadQuota] begin")
+	if err = m.cluster.loadQuota(); err != nil {
+		panic(err)
+	}
+	log.LogInfo("action[loadQuota] end")
 }
 
 func (m *Server) clearMetadata() {
@@ -196,6 +219,7 @@ func (m *Server) clearMetadata() {
 	m.user.clearAKStore()
 	m.user.clearVolUsers()
 	m.cluster.t = newTopology()
+	//m.cluster.apiLimiter.Clear()
 }
 
 func (m *Server) refreshUser() (err error) {

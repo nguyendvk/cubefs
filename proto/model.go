@@ -26,6 +26,7 @@ const (
 type MetaNodeInfo struct {
 	ID                        uint64
 	Addr                      string
+	DomainAddr                string
 	IsActive                  bool
 	IsWriteAble               bool
 	ZoneName                  string `json:"Zone"`
@@ -51,6 +52,7 @@ type DataNodeInfo struct {
 	ID                        uint64
 	ZoneName                  string `json:"Zone"`
 	Addr                      string
+	DomainAddr                string
 	ReportTime                time.Time
 	IsActive                  bool
 	IsWriteAble               bool
@@ -63,6 +65,7 @@ type DataNodeInfo struct {
 	PersistenceDataPartitions []uint64
 	BadDisks                  []string
 	RdOnly                    bool
+	MaxDpCntLimit             uint32 `json:"maxDpCntLimit"`
 }
 
 // MetaPartition defines the structure of a meta partition
@@ -81,6 +84,7 @@ type MetaPartitionInfo struct {
 	Hosts         []string
 	Peers         []Peer
 	Zones         []string
+	NodeSets      []uint64
 	OfflinePeerID uint64
 	MissNodes     map[string]int64
 	LoadResponse  []*MetaPartitionLoadResponse
@@ -88,29 +92,37 @@ type MetaPartitionInfo struct {
 
 // MetaReplica defines the replica of a meta partition
 type MetaReplicaInfo struct {
-	Addr       string
-	ReportTime int64
-	Status     int8 // unavailable, readOnly, readWrite
-	IsLeader   bool
+	Addr        string
+	DomainAddr  string
+	MaxInodeID  uint64
+	ReportTime  int64
+	Status      int8 // unavailable, readOnly, readWrite
+	IsLeader    bool
+	InodeCount  uint64
+	MaxInode    uint64
+	DentryCount uint64
 }
 
 // ClusterView provides the view of a cluster.
 type ClusterView struct {
-	Name                string
-	LeaderAddr          string
-	DisableAutoAlloc    bool
-	MetaNodeThreshold   float32
-	Applied             uint64
-	MaxDataPartitionID  uint64
-	MaxMetaNodeID       uint64
-	MaxMetaPartitionID  uint64
-	DataNodeStatInfo    *NodeStatInfo
-	MetaNodeStatInfo    *NodeStatInfo
-	VolStatInfo         []*VolStatInfo
-	BadPartitionIDs     []BadPartitionView
-	BadMetaPartitionIDs []BadPartitionView
-	MetaNodes           []NodeView
-	DataNodes           []NodeView
+	Name                 string
+	CreateTime           string
+	LeaderAddr           string
+	DisableAutoAlloc     bool
+	ForbidMpDecommission bool
+	MetaNodeThreshold    float32
+	Applied              uint64
+	MaxDataPartitionID   uint64
+	MaxMetaNodeID        uint64
+	MaxMetaPartitionID   uint64
+	DataNodeStatInfo     *NodeStatInfo
+	MetaNodeStatInfo     *NodeStatInfo
+	VolStatInfo          []*VolStatInfo
+	BadPartitionIDs      []BadPartitionView
+	BadMetaPartitionIDs  []BadPartitionView
+	MasterNodes          []NodeView
+	MetaNodes            []NodeView
+	DataNodes            []NodeView
 }
 
 // ClusterNode defines the structure of a cluster node
@@ -137,6 +149,7 @@ type ClusterIP struct {
 type NodeView struct {
 	Addr       string
 	Status     bool
+	DomainAddr string
 	ID         uint64
 	IsWritable bool
 }
@@ -173,15 +186,20 @@ type NodeStatInfo struct {
 }
 
 type VolStatInfo struct {
-	Name           string
-	TotalSize      uint64
-	UsedSize       uint64
-	UsedRatio      string
-	CacheTotalSize uint64
-	CacheUsedSize  uint64
-	CacheUsedRatio string
-	EnableToken    bool
-	InodeCount     uint64
+	Name                  string
+	TotalSize             uint64
+	UsedSize              uint64
+	UsedRatio             string
+	CacheTotalSize        uint64
+	CacheUsedSize         uint64
+	CacheUsedRatio        string
+	EnableToken           bool
+	InodeCount            uint64
+	TxCnt                 uint64
+	TxRbInoCnt            uint64
+	TxRbDenCnt            uint64
+	DpReadOnlyWhenVolFull bool
+	TrashInterval         int64
 }
 
 // DataPartition represents the structure of storing the file contents.
@@ -197,6 +215,7 @@ type DataPartitionInfo struct {
 	Hosts                    []string // host addresses
 	Peers                    []Peer
 	Zones                    []string
+	NodeSets                 []uint64
 	MissingNodes             map[string]int64 // key: address of the missing node, value: when the node is missing
 	VolName                  string
 	VolID                    uint64
@@ -207,9 +226,10 @@ type DataPartitionInfo struct {
 	SingleDecommissionStatus uint8
 	SingleDecommissionAddr   string
 	RdOnly                   bool
+	IsDiscard                bool
 }
 
-//FileInCore define file in data partition
+// FileInCore define file in data partition
 type FileInCore struct {
 	Name          string
 	LastModify    int64
@@ -226,6 +246,7 @@ type FileMetadata struct {
 // DataReplica represents the replica of a data partition
 type DataReplica struct {
 	Addr            string
+	DomainAddr      string
 	ReportTime      int64
 	FileCount       uint32
 	Status          int8
@@ -243,12 +264,40 @@ type DataPartitionDiagnosis struct {
 	CorruptDataPartitionIDs     []uint64
 	LackReplicaDataPartitionIDs []uint64
 	BadDataPartitionIDs         []BadPartitionView
+	BadReplicaDataPartitionIDs  []uint64
+	RepFileCountDifferDpIDs     []uint64
+	RepUsedSizeDifferDpIDs      []uint64
+	ExcessReplicaDpIDs          []uint64
 }
 
 // meta partition diagnosis represents the inactive meta nodes, corrupt meta partitions, and meta partitions lack of replicas
 type MetaPartitionDiagnosis struct {
-	InactiveMetaNodes           []string
-	CorruptMetaPartitionIDs     []uint64
-	LackReplicaMetaPartitionIDs []uint64
-	BadMetaPartitionIDs         []BadPartitionView
+	InactiveMetaNodes                          []string
+	CorruptMetaPartitionIDs                    []uint64
+	LackReplicaMetaPartitionIDs                []uint64
+	BadMetaPartitionIDs                        []BadPartitionView
+	BadReplicaMetaPartitionIDs                 []uint64
+	ExcessReplicaMetaPartitionIDs              []uint64
+	InodeCountNotEqualReplicaMetaPartitionIDs  []uint64
+	MaxInodeNotEqualReplicaMetaPartitionIDs    []uint64
+	DentryCountNotEqualReplicaMetaPartitionIDs []uint64
+}
+
+type DecommissionProgress struct {
+	Status    uint32
+	Progress  string
+	FailedDps []uint64
+}
+
+type BadDiskInfo struct {
+	Address string
+	Path    string
+}
+
+type BadDiskInfos struct {
+	BadDisks []BadDiskInfo
+}
+
+type DiscardDataPartitionInfos struct {
+	DiscardDps []DataPartitionInfo
 }

@@ -81,7 +81,8 @@ func (s *DefaultRandomSelector) Select(exclude map[string]struct{}) (dp *DataPar
 	if dp != nil {
 		return dp, nil
 	}
-
+	log.LogErrorf("DefaultRandomSelector: no writable data partition with %v partitions and exclude(%v)",
+		len(partitions), exclude)
 	return nil, fmt.Errorf("no writable data partition")
 }
 
@@ -147,7 +148,7 @@ func (s *DefaultRandomSelector) getRandomDataPartition(partitions []*DataPartiti
 	index := rand.Intn(length)
 	dp = partitions[index]
 	if !isExcluded(dp, exclude) {
-		log.LogDebugf("DefaultRandomSelector: select dp[%v], index %v", dp, index)
+		log.LogDebugf("DefaultRandomSelector: select dp[%v] address[%p], index %v", dp, dp, index)
 		return dp
 	}
 

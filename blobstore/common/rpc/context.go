@@ -165,12 +165,12 @@ func (c *Context) RespondJSON(obj interface{}) {
 
 // RespondStatusData response data with code
 func (c *Context) RespondStatusData(statusCode int, obj interface{}) {
-	body, ct, err := marshalObj(obj)
+	body, err := marshalObj(obj)
 	if err != nil {
 		c.RespondError(err)
 		return
 	}
-	c.RespondWith(statusCode, ct, body)
+	c.RespondWithReader(statusCode, body.ContentLength, body.ContentType, body.Body, nil)
 }
 
 // RespondWith response with code, content-type, bytes
@@ -194,7 +194,7 @@ func (c *Context) RespondWithReader(statusCode int, contentLength int, contentTy
 
 	c.Writer.WriteHeader(statusCode)
 	c.wroteHeader = true
-	io.Copy(c.Writer, body)
+	io.CopyN(c.Writer, body, int64(contentLength))
 }
 
 // Stream sends a streaming response and returns a boolean

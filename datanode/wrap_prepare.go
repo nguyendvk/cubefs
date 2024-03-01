@@ -30,6 +30,8 @@ func (s *DataNode) Prepare(p *repl.Packet) (err error) {
 		p.SetPacketHasPrepare()
 		if err != nil {
 			p.PackErrorBody(repl.ActionPreparePkt, err.Error())
+		} else {
+			p.AfterPre = true
 		}
 	}()
 	if p.IsMasterCommand() {
@@ -91,6 +93,10 @@ func (s *DataNode) checkPartition(p *repl.Packet) (err error) {
 			err = storage.NoSpaceError
 			return
 		}
+	}
+	if p.IsWriteOperation() || p.IsRandomWrite() {
+		dp.disk.allocCheckLimit(proto.FlowWriteType, uint32(p.Size))
+		dp.disk.allocCheckLimit(proto.IopsWriteType, 1)
 	}
 	return
 }

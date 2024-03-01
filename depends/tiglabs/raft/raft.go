@@ -228,6 +228,10 @@ func (s *raft) runApply() {
 			switch cmd := apply.command.(type) {
 			case *proto.ConfChange:
 				resp, err = s.raftConfig.StateMachine.ApplyMemberChange(cmd, apply.index)
+				if cmd.Type == proto.ConfRemoveNode && err == nil {
+					s.raftFsm.mo.RemovePeer(s.raftFsm.id, cmd.Peer)
+				}
+
 			case []byte:
 				resp, err = s.raftConfig.StateMachine.Apply(cmd, apply.index)
 			}
@@ -361,6 +365,7 @@ func (s *raft) run() {
 			msg.Type = proto.LocalMsgHup
 			msg.From = s.config.NodeID
 			msg.ForceVote = true
+			logger.Debug("raft[%v] node %v try to leader", s.raftFsm.id, s.config.NodeID)
 			s.raftFsm.Step(msg)
 			s.maybeChange(true)
 
@@ -501,6 +506,7 @@ func (s *raft) status() *Status {
 }
 
 func (s *raft) truncate(index uint64) {
+	logger.Debug("raft[%v] truncate index %v", s.raftFsm.id, index)
 	if s.restoringSnapshot.Get() {
 		return
 	}

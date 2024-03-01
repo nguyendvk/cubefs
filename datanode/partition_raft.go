@@ -73,7 +73,7 @@ func (dp *DataPartition) raftPort() (heartbeat, replica int, err error) {
 }
 
 // StartRaft start raft instance when data partition start or restore.
-func (dp *DataPartition) StartRaft() (err error) {
+func (dp *DataPartition) StartRaft(isLoad bool) (err error) {
 
 	// cache or preload partition not support raft and repair.
 	if !dp.isNormalType() {
@@ -88,7 +88,13 @@ func (dp *DataPartition) StartRaft() (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			mesg := fmt.Sprintf("StartRaft(%v)  Raft Panic (%v)", dp.partitionID, r)
-			panic(mesg)
+			log.LogError(mesg)
+			if isLoad {
+				err = errors.New(mesg)
+			} else {
+				log.LogFlush()
+				panic(mesg)
+			}
 		}
 	}()
 
@@ -155,6 +161,7 @@ func (dp *DataPartition) CanRemoveRaftMember(peer proto.Peer, force bool) error 
 		}
 	}
 	if !hasExsit {
+		log.LogInfof("action[CanRemoveRaftMember] replicaNum %v peers %v, peer %v not found", dp.replicaNum, len(dp.config.Peers), peer)
 		return nil
 	}
 
@@ -163,9 +170,11 @@ func (dp *DataPartition) CanRemoveRaftMember(peer proto.Peer, force bool) error 
 		if nodeID.NodeID == peer.ID {
 			continue
 		}
+		//check nodeID is valid
 		hasDownReplicasExcludePeer = append(hasDownReplicasExcludePeer, nodeID.NodeID)
 	}
-	log.LogInfof("action[CanRemoveRaftMember] replicaNum %v peers %v", dp.replicaNum, len(dp.config.Peers))
+
+	log.LogInfof("action[CanRemoveRaftMember] dp %v replicaNum %v peers %v", dp.partitionID, dp.replicaNum, len(dp.config.Peers))
 	if dp.replicaNum == 2 && len(dp.config.Peers) == 2 && force {
 		return nil
 	}
@@ -257,7 +266,7 @@ func (dp *DataPartition) StartRaftLoggingSchedule() {
 // It can only happens after all the extent files are repaired by the leader.
 // When the repair is finished, the local dp.partitionSize is same as the leader's dp.partitionSize.
 // The repair task can be done in statusUpdateScheduler->LaunchRepair.
-func (dp *DataPartition) StartRaftAfterRepair() {
+func (dp *DataPartition) StartRaftAfterRepair(isLoad bool) {
 
 	// cache or preload partition not support raft and repair.
 	if !dp.isNormalType() {
@@ -275,7 +284,7 @@ func (dp *DataPartition) StartRaftAfterRepair() {
 		case <-timer.C:
 			err = nil
 			if dp.isLeader { // primary does not need to wait repair
-				if err := dp.StartRaft(); err != nil {
+				if err := dp.StartRaft(isLoad); err != nil {
 					log.LogErrorf("PartitionID(%v) leader start raft err(%v).", dp.partitionID, err)
 					timer.Reset(5 * time.Second)
 					continue
@@ -326,7 +335,7 @@ func (dp *DataPartition) StartRaftAfterRepair() {
 			// start raft
 			dp.DataPartitionCreateType = proto.NormalCreateDataPartition
 			dp.PersistMetadata()
-			if err := dp.StartRaft(); err != nil {
+			if err := dp.StartRaft(isLoad); err != nil {
 				log.LogErrorf("PartitionID(%v) start raft err(%v). Retry after 20s.", dp.partitionID, err)
 				timer.Reset(5 * time.Second)
 				continue
@@ -426,7 +435,14 @@ func (dp *DataPartition) removeRaftNode(req *proto.RemoveDataPartitionRaftMember
 		dp.Disk().space.DeletePartition(dp.partitionID)
 		isUpdated = false
 	}
-	log.LogInfof("Fininsh RemoveRaftNode  PartitionID(%v) nodeID(%v)  do RaftLog (%v) ",
+	// update dp replicas after removing a raft node
+	if isUpdated {
+		dp.replicasLock.Lock()
+		dp.replicas = make([]string, len(dp.config.Hosts))
+		copy(dp.replicas, dp.config.Hosts)
+		dp.replicasLock.Unlock()
+	}
+	log.LogInfof("Finish RemoveRaftNode  PartitionID(%v) nodeID(%v)  do RaftLog (%v) ",
 		req.PartitionId, dp.config.NodeID, string(data))
 
 	return
@@ -454,15 +470,10 @@ func (dp *DataPartition) storeAppliedID(applyIndex uint64) (err error) {
 func (dp *DataPartition) LoadAppliedID() (err error) {
 	filename := path.Join(dp.Path(), ApplyIndexFile)
 	if _, err = os.Stat(filename); err != nil {
-		err = nil
 		return
 	}
 	data, err := ioutil.ReadFile(filename)
 	if err != nil {
-		if err == os.ErrNotExist {
-			err = nil
-			return
-		}
 		err = errors.NewErrorf("[loadApplyIndex] OpenFile: %s", err.Error())
 		return
 	}
@@ -504,6 +515,13 @@ func (s *DataNode) startRaftServer(cfg *config.Config) (err error) {
 	log.LogInfo("Start: startRaftServer")
 
 	s.parseRaftConfig(cfg)
+
+	if s.clusterUuidEnable {
+		if err = config.CheckOrStoreClusterUuid(s.raftDir, s.clusterUuid, false); err != nil {
+			log.LogErrorf("CheckOrStoreClusterUuid failed: %v", err)
+			return fmt.Errorf("CheckOrStoreClusterUuid failed: %v", err)
+		}
+	}
 
 	constCfg := config.ConstConfig{
 		Listen:           s.port,

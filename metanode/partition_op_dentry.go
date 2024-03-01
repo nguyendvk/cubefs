@@ -17,16 +17,98 @@ package metanode
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/cubefs/cubefs/util/log"
+	"sync/atomic"
+	"time"
 
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/util/auditlog"
+	"github.com/cubefs/cubefs/util/errors"
 )
 
-// CreateDentry returns a new dentry.
-func (mp *metaPartition) CreateDentry(req *CreateDentryReq, p *Packet) (err error) {
+func (mp *metaPartition) TxCreateDentry(req *proto.TxCreateDentryRequest, p *Packet, remoteAddr string) (err error) {
+	start := time.Now()
+	if mp.IsEnableAuditLog() {
+		defer func() {
+			auditlog.LogDentryOp(remoteAddr, mp.GetVolName(), p.GetOpMsg(), req.Name, req.GetFullPath(), err, time.Since(start).Milliseconds(), req.Inode, 0)
+		}()
+	}
 	if req.ParentID == req.Inode {
 		err = fmt.Errorf("parentId is equal inodeId")
 		p.PacketErrorWithBody(proto.OpExistErr, []byte(err.Error()))
 		return
+	}
+
+	for _, quotaId := range req.QuotaIds {
+		status := mp.mqMgr.IsOverQuota(false, true, quotaId)
+		if status != 0 {
+			err = errors.New("create dentry is over quota")
+			reply := []byte(err.Error())
+			p.PacketErrorWithBody(status, reply)
+			return
+		}
+	}
+
+	var parIno *Inode
+	item := mp.inodeTree.Get(NewInode(req.ParentID, 0))
+	if item == nil {
+		err = fmt.Errorf("parent inode not exists")
+		p.PacketErrorWithBody(proto.OpNotExistErr, []byte(err.Error()))
+		return
+	}
+
+	parIno = item.(*Inode)
+	quota := atomic.LoadUint32(&dirChildrenNumLimit)
+	if parIno.NLink >= quota {
+		err = fmt.Errorf("parent dir quota limitation reached")
+		p.PacketErrorWithBody(proto.OpDirQuota, []byte(err.Error()))
+		return
+	}
+
+	txInfo := req.TxInfo.GetCopy()
+	txDentry := NewTxDentry(req.ParentID, req.Name, req.Inode, req.Mode, parIno, txInfo)
+	val, err := txDentry.Marshal()
+	if err != nil {
+		return
+	}
+
+	status, err := mp.submit(opFSMTxCreateDentry, val)
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
+		return
+	}
+
+	p.ResultCode = status.(uint8)
+	return
+}
+
+// CreateDentry returns a new dentry.
+func (mp *metaPartition) CreateDentry(req *CreateDentryReq, p *Packet, remoteAddr string) (err error) {
+	start := time.Now()
+	if mp.IsEnableAuditLog() {
+		defer func() {
+			auditlog.LogDentryOp(remoteAddr, mp.GetVolName(), p.GetOpMsg(), req.Name, req.GetFullPath(), err, time.Since(start).Milliseconds(), req.Inode, req.ParentID)
+		}()
+	}
+	if req.ParentID == req.Inode {
+		err = fmt.Errorf("parentId is equal inodeId")
+		p.PacketErrorWithBody(proto.OpExistErr, []byte(err.Error()))
+		return
+	}
+
+	item := mp.inodeTree.CopyGet(NewInode(req.ParentID, 0))
+	if item == nil {
+		err = fmt.Errorf("parent inode not exists")
+		p.PacketErrorWithBody(proto.OpNotExistErr, []byte(err.Error()))
+		return
+	} else {
+		parIno := item.(*Inode)
+		quota := atomic.LoadUint32(&dirChildrenNumLimit)
+		if parIno.NLink >= quota {
+			err = fmt.Errorf("parent dir quota limitation reached")
+			p.PacketErrorWithBody(proto.OpDirQuota, []byte(err.Error()))
+			return
+		}
 	}
 
 	dentry := &Dentry{
@@ -48,8 +130,147 @@ func (mp *metaPartition) CreateDentry(req *CreateDentryReq, p *Packet) (err erro
 	return
 }
 
+func (mp *metaPartition) QuotaCreateDentry(req *proto.QuotaCreateDentryRequest, p *Packet, remoteAddr string) (err error) {
+	start := time.Now()
+	if mp.IsEnableAuditLog() {
+		defer func() {
+			auditlog.LogDentryOp(remoteAddr, mp.GetVolName(), p.GetOpMsg(), req.Name, req.GetFullPath(), err, time.Since(start).Milliseconds(), req.Inode, req.ParentID)
+		}()
+	}
+	if req.ParentID == req.Inode {
+		err = fmt.Errorf("parentId is equal inodeId")
+		p.PacketErrorWithBody(proto.OpExistErr, []byte(err.Error()))
+		return
+	}
+	for _, quotaId := range req.QuotaIds {
+		status := mp.mqMgr.IsOverQuota(false, true, quotaId)
+		if status != 0 {
+			err = errors.New("create dentry is over quota")
+			reply := []byte(err.Error())
+			p.PacketErrorWithBody(status, reply)
+			return
+		}
+	}
+	item := mp.inodeTree.CopyGet(NewInode(req.ParentID, 0))
+	if item == nil {
+		err = fmt.Errorf("parent inode not exists")
+		p.PacketErrorWithBody(proto.OpNotExistErr, []byte(err.Error()))
+		return
+	} else {
+		parIno := item.(*Inode)
+		quota := atomic.LoadUint32(&dirChildrenNumLimit)
+		if parIno.NLink >= quota {
+			err = fmt.Errorf("parent dir quota limitation reached")
+			p.PacketErrorWithBody(proto.OpDirQuota, []byte(err.Error()))
+			return
+		}
+	}
+
+	dentry := &Dentry{
+		ParentId: req.ParentID,
+		Name:     req.Name,
+		Inode:    req.Inode,
+		Type:     req.Mode,
+	}
+	val, err := dentry.Marshal()
+	if err != nil {
+		return
+	}
+	resp, err := mp.submit(opFSMCreateDentry, val)
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
+		return
+	}
+	p.ResultCode = resp.(uint8)
+	return
+}
+
+func (mp *metaPartition) TxDeleteDentry(req *proto.TxDeleteDentryRequest, p *Packet, remoteAddr string) (err error) {
+	start := time.Now()
+	if mp.IsEnableAuditLog() {
+		defer func() {
+			auditlog.LogDentryOp(remoteAddr, mp.GetVolName(), p.GetOpMsg(), req.Name, req.GetFullPath(), err, time.Since(start).Milliseconds(), req.Ino, req.ParentID)
+		}()
+	}
+	txInfo := req.TxInfo.GetCopy()
+	den := &Dentry{
+		ParentId: req.ParentID,
+		Name:     req.Name,
+	}
+
+	defer func() {
+		if p.ResultCode == proto.OpOk {
+			var reply []byte
+			resp := &proto.TxDeleteDentryResponse{
+				Inode: req.Ino,
+			}
+			reply, err = json.Marshal(resp)
+			p.PacketOkWithBody(reply)
+		}
+	}()
+
+	dentry, status := mp.getDentry(den)
+	if status != proto.OpOk {
+		if mp.txDentryInRb(req.ParentID, req.Name, req.TxInfo.TxID) {
+			p.ResultCode = proto.OpOk
+			log.LogWarnf("TxDeleteDentry: dentry is already been deleted before, req %v", req)
+			return
+		}
+
+		err = fmt.Errorf("dentry[%v] not exists", den)
+		log.LogWarn(err)
+		p.PacketErrorWithBody(status, []byte(err.Error()))
+		return
+	}
+
+	if dentry.Inode != req.Ino {
+		err = fmt.Errorf("target name ino is not right, par %d, name %s, want %d, got %d",
+			req.PartitionID, req.Name, req.Ino, dentry.Inode)
+		log.LogWarn(err)
+		p.PacketErrorWithBody(proto.OpExistErr, []byte(err.Error()))
+		return
+	}
+
+	txDentry := &TxDentry{
+		//ParInode: inoResp.Msg,
+		Dentry: dentry,
+		TxInfo: txInfo,
+	}
+
+	val, err := txDentry.Marshal()
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
+		return
+	}
+
+	r, err := mp.submit(opFSMTxDeleteDentry, val)
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
+		return
+	}
+
+	retMsg := r.(*DentryResponse)
+	p.ResultCode = retMsg.Status
+	return
+}
+
 // DeleteDentry deletes a dentry.
-func (mp *metaPartition) DeleteDentry(req *DeleteDentryReq, p *Packet) (err error) {
+func (mp *metaPartition) DeleteDentry(req *DeleteDentryReq, p *Packet, remoteAddr string) (err error) {
+	start := time.Now()
+	if mp.IsEnableAuditLog() {
+		defer func() {
+			auditlog.LogDentryOp(remoteAddr, mp.GetVolName(), p.GetOpMsg(), req.Name, req.GetFullPath(), err, time.Since(start).Milliseconds(), 0, req.ParentID)
+		}()
+	}
+	if req.InodeCreateTime > 0 {
+		if mp.vol.volDeleteLockTime > 0 && req.InodeCreateTime+mp.vol.volDeleteLockTime*60*60 > time.Now().Unix() {
+			err = errors.NewErrorf("the current Inode[%v] is still locked for deletion", req.Name)
+			log.LogDebugf("DeleteDentry: the current Inode is still locked for deletion, inode(%v) createTime(%v) mw.volDeleteLockTime(%v) now(%v)", req.Name, req.InodeCreateTime, mp.vol.volDeleteLockTime, time.Now().Unix())
+			p.PacketErrorWithBody(proto.OpNotPerm, []byte(err.Error()))
+			return
+		}
+	}
+
 	dentry := &Dentry{
 		ParentId: req.ParentID,
 		Name:     req.Name,
@@ -79,17 +300,26 @@ func (mp *metaPartition) DeleteDentry(req *DeleteDentryReq, p *Packet) (err erro
 }
 
 // DeleteDentry deletes a dentry.
-func (mp *metaPartition) DeleteDentryBatch(req *BatchDeleteDentryReq, p *Packet) (err error) {
-
+func (mp *metaPartition) DeleteDentryBatch(req *BatchDeleteDentryReq, p *Packet, remoteAddr string) (err error) {
 	db := make(DentryBatch, 0, len(req.Dens))
-
-	for _, d := range req.Dens {
+	start := time.Now()
+	for i, d := range req.Dens {
 		db = append(db, &Dentry{
 			ParentId: req.ParentID,
 			Name:     d.Name,
 			Inode:    d.Inode,
 			Type:     d.Type,
 		})
+		den := &d
+		fullPath := ""
+		if len(req.FullPaths) > i {
+			fullPath = req.FullPaths[i]
+		}
+		if mp.IsEnableAuditLog() {
+			defer func() {
+				auditlog.LogDentryOp(remoteAddr, mp.GetVolName(), p.GetOpMsg(), den.Name, fullPath, err, time.Since(start).Milliseconds(), den.Inode, req.ParentID)
+			}()
+		}
 	}
 
 	val, err := db.Marshal()
@@ -142,8 +372,84 @@ func (mp *metaPartition) DeleteDentryBatch(req *BatchDeleteDentryReq, p *Packet)
 	return
 }
 
+func (mp *metaPartition) TxUpdateDentry(req *proto.TxUpdateDentryRequest, p *Packet, remoteAddr string) (err error) {
+	start := time.Now()
+	if mp.IsEnableAuditLog() {
+		defer func() {
+			auditlog.LogDentryOp(remoteAddr, mp.GetVolName(), p.GetOpMsg(), req.Name, req.GetFullPath(), err, time.Since(start).Milliseconds(), req.Inode, req.ParentID)
+		}()
+	}
+	if req.ParentID == req.Inode {
+		err = fmt.Errorf("parentId is equal inodeId")
+		p.PacketErrorWithBody(proto.OpExistErr, []byte(err.Error()))
+		return
+	}
+
+	txInfo := req.TxInfo.GetCopy()
+
+	defer func() {
+		if p.ResultCode == proto.OpOk {
+			var reply []byte
+			m := &proto.TxUpdateDentryResponse{
+				Inode: req.OldIno,
+			}
+			reply, _ = json.Marshal(m)
+			p.PacketOkWithBody(reply)
+		}
+	}()
+
+	newDentry := &Dentry{
+		ParentId: req.ParentID,
+		Name:     req.Name,
+		Inode:    req.Inode,
+	}
+	oldDentry, status := mp.getDentry(newDentry)
+	if status != proto.OpOk {
+		if mp.txDentryInRb(req.ParentID, req.Name, req.TxInfo.TxID) {
+			p.ResultCode = proto.OpOk
+			log.LogWarnf("TxDeleteDentry: dentry is already been deleted before, req %v", req)
+			return
+		}
+		err = fmt.Errorf("oldDentry[%v] not exists", oldDentry)
+		p.PacketErrorWithBody(status, []byte(err.Error()))
+		return
+	}
+
+	if oldDentry.Inode != req.OldIno {
+		err = fmt.Errorf("oldDentry is alredy updated, req %v, old [%v]", req, oldDentry)
+		p.PacketErrorWithBody(proto.OpNotExistErr, []byte(err.Error()))
+		return
+	}
+
+	txDentry := &TxUpdateDentry{
+		OldDentry: oldDentry,
+		NewDentry: newDentry,
+		TxInfo:    txInfo,
+	}
+	val, err := txDentry.Marshal()
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
+		return
+	}
+	resp, err := mp.submit(opFSMTxUpdateDentry, val)
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
+		return
+	}
+
+	msg := resp.(*DentryResponse)
+	p.ResultCode = msg.Status
+	return
+}
+
 // UpdateDentry updates a dentry.
-func (mp *metaPartition) UpdateDentry(req *UpdateDentryReq, p *Packet) (err error) {
+func (mp *metaPartition) UpdateDentry(req *UpdateDentryReq, p *Packet, remoteAddr string) (err error) {
+	start := time.Now()
+	if mp.IsEnableAuditLog() {
+		defer func() {
+			auditlog.LogDentryOp(remoteAddr, mp.GetVolName(), p.GetOpMsg(), req.Name, req.GetFullPath(), err, time.Since(start).Milliseconds(), req.Inode, req.ParentID)
+		}()
+	}
 	if req.ParentID == req.Inode {
 		err = fmt.Errorf("parentId is equal inodeId")
 		p.PacketErrorWithBody(proto.OpExistErr, []byte(err.Error()))
@@ -238,4 +544,12 @@ func (mp *metaPartition) Lookup(req *LookupReq, p *Packet) (err error) {
 // GetDentryTree returns the dentry tree stored in the meta partition.
 func (mp *metaPartition) GetDentryTree() *BTree {
 	return mp.dentryTree.GetTree()
+}
+
+// GetDentryTreeLen returns the dentry tree length.
+func (mp *metaPartition) GetDentryTreeLen() int {
+	if mp.dentryTree == nil {
+		return 0
+	}
+	return mp.dentryTree.Len()
 }

@@ -32,7 +32,7 @@ type FileService struct {
 func NewFileService(objectNode string, masters []string, mc *client.MasterGClient) *FileService {
 	return &FileService{
 		manager:    NewVolumeManager(masters, true),
-		userClient: &user.UserClient{mc},
+		userClient: &user.UserClient{MasterGClient: mc},
 		objectNode: objectNode,
 	}
 }
@@ -60,7 +60,6 @@ func (fs *FileService) empty(ctx context.Context, args struct {
 		return false, fmt.Errorf("%v , [%v] , [%v] , [%v]", userInfo.Policy.Own_vols, userInfo.User_id, fs.userVolPerm(ctx, "root", "test"), v)
 	}
 
-	return args.Empty, nil
 }
 
 type ListFileInfo struct {
@@ -245,7 +244,9 @@ func (fs *FileService) fileMeta(ctx context.Context, args struct {
 	if err != nil {
 		return nil, err
 	}
-	return volume.ObjectMeta(args.Path)
+	info, _, err = volume.ObjectMeta(args.Path)
+	return
+	//return volume.ObjectMeta(args.Path)
 }
 
 func (fs *FileService) signURL(ctx context.Context, args struct {
@@ -325,7 +326,7 @@ func (fs *FileService) DownFile(writer http.ResponseWriter, request *http.Reques
 		return err
 	}
 
-	meta, err := volume.ObjectMeta(path)
+	meta, _, err := volume.ObjectMeta(path)
 	if err != nil {
 		return err
 	}

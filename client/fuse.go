@@ -23,11 +23,12 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/cubefs/cubefs/sdk/meta"
 	"io/ioutil"
 	syslog "log"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path"
@@ -39,11 +40,11 @@ import (
 	"time"
 
 	"github.com/cubefs/cubefs/blockcache/bcache"
-
-	"github.com/cubefs/cubefs/util/buf"
+	"github.com/cubefs/cubefs/util/auditlog"
 
 	"github.com/cubefs/cubefs/sdk/master"
 	"github.com/cubefs/cubefs/util"
+	"github.com/cubefs/cubefs/util/buf"
 
 	sysutil "github.com/cubefs/cubefs/util/sys"
 
@@ -58,6 +59,7 @@ import (
 	"github.com/cubefs/cubefs/util/stat"
 	"github.com/cubefs/cubefs/util/ump"
 	"github.com/jacobsa/daemonize"
+	_ "go.uber.org/automaxprocs"
 )
 
 const (
@@ -66,6 +68,8 @@ const (
 	defaultRlimit uint64 = 1024000
 
 	UpdateConfInterval = 2 * time.Minute
+
+	MasterRetrys = 5
 )
 
 const (
@@ -87,7 +91,7 @@ const (
 	DynamicUDSNameFormat = "/tmp/CubeFS-fdstore-%v.sock"
 	DefaultUDSName       = "/tmp/CubeFS-fdstore.sock"
 
-	DefaultLogPath = "/var/log/chubaofs"
+	DefaultLogPath = "/var/log/cubefs"
 )
 
 var (
@@ -287,7 +291,14 @@ func main() {
 		os.Exit(1)
 	}
 	//load  conf from master
-	err = loadConfFromMaster(opt)
+	for retry := 0; retry < MasterRetrys; retry++ {
+		err = loadConfFromMaster(opt)
+		if err != nil {
+			time.Sleep(5 * time.Second * time.Duration(retry+1))
+		} else {
+			break
+		}
+	}
 	if err != nil {
 		err = errors.NewErrorf("parse mount opt from master failed: %v\n", err)
 		fmt.Println(err)
@@ -297,12 +308,11 @@ func main() {
 
 	if opt.MaxCPUs > 0 {
 		runtime.GOMAXPROCS(int(opt.MaxCPUs))
-	} else {
-		runtime.GOMAXPROCS(runtime.NumCPU())
 	}
+	//use uber automaxprocs: get real cpu number to k8s pod"
 
 	level := parseLogLevel(opt.Loglvl)
-	_, err = log.InitLog(opt.Logpath, opt.Volname, level, nil)
+	_, err = log.InitLog(opt.Logpath, opt.Volname, level, nil, log.DefaultLogLeftSpaceLimit)
 	if err != nil {
 		err = errors.NewErrorf("Init log dir fail: %v\n", err)
 		fmt.Println(err)
@@ -310,6 +320,14 @@ func main() {
 		os.Exit(1)
 	}
 	defer log.LogFlush()
+
+	if _, err = os.Stat(opt.MountPoint); err != nil {
+		if err = os.Mkdir(opt.MountPoint, os.ModePerm); err != nil {
+			err = errors.NewErrorf("Init.MountPoint mkdir failed error %v\n", err)
+			fmt.Println(err)
+			os.Exit(1)
+		}
+	}
 
 	_, err = stat.NewStatistic(opt.Logpath, LoggerPrefix, int64(stat.DefaultStatLogSize),
 		stat.DefaultTimeOutUs, true)
@@ -321,9 +339,23 @@ func main() {
 	}
 	stat.ClearStat()
 
+	if opt.EnableAudit {
+		_, err = auditlog.InitAuditWithPrefix(opt.Logpath, LoggerPrefix, int64(auditlog.DefaultAuditLogSize),
+			auditlog.NewAuditPrefix(opt.Master, opt.Volname, opt.SubDir, opt.MountPoint))
+		if err != nil {
+			err = errors.NewErrorf("Init audit log fail: %v\n", err)
+			fmt.Println(err)
+			daemonize.SignalOutcome(err)
+			os.Exit(1)
+		}
+	}
+
 	proto.InitBufferPool(opt.BuffersTotalLimit)
 	if proto.IsCold(opt.VolType) {
 		buf.InitCachePool(opt.EbsBlockSize)
+	}
+	if opt.EnableBcache {
+		buf.InitbCachePool(bcache.MaxBlockSize)
 	}
 	outputFilePath := path.Join(opt.Logpath, LoggerPrefix, LoggerOutput)
 	outputFile, err := os.OpenFile(outputFilePath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0666)
@@ -361,8 +393,15 @@ func main() {
 	}
 
 	registerInterceptedSignal(opt.MountPoint)
-
-	if err = checkPermission(opt); err != nil {
+	for retry := 0; retry < MasterRetrys; retry++ {
+		err = checkPermission(opt)
+		if err != nil {
+			time.Sleep(5 * time.Second * time.Duration(retry+1))
+		} else {
+			break
+		}
+	}
+	if err != nil {
 		err = errors.NewErrorf("check permission failed: %v", err)
 		syslog.Println(err)
 		log.LogFlush()
@@ -403,9 +442,9 @@ func main() {
 		_ = daemonize.SignalOutcome(nil)
 	}
 	defer fsConn.Close()
+	defer super.Close()
 
 	syslog.Printf("enable bcache %v", opt.EnableBcache)
-
 	exporter.Init(ModuleName, cfg)
 	exporter.RegistConsul(super.ClusterName(), ModuleName, cfg)
 
@@ -428,7 +467,7 @@ func main() {
 		}
 	}
 
-	if err = fs.Serve(fsConn, super); err != nil {
+	if err = fs.Serve(fsConn, super, opt); err != nil {
 		log.LogFlush()
 		syslog.Printf("fs Serve returns err(%v)", err)
 		os.Exit(1)
@@ -559,32 +598,58 @@ func mount(opt *proto.MountOptions) (fsConn *fuse.Conn, super *cfs.Super, err er
 	http.HandleFunc(log.GetLogPath, log.GetLog)
 	http.HandleFunc(ControlCommandSuspend, super.SetSuspend)
 	http.HandleFunc(ControlCommandResume, super.SetResume)
+	//auditlog
+	http.HandleFunc(auditlog.EnableAuditLogReqPath, super.EnableAuditLog)
+	http.HandleFunc(auditlog.DisableAuditLogReqPath, auditlog.DisableAuditLog)
+	http.HandleFunc(auditlog.SetAuditLogBufSizeReqPath, auditlog.ResetWriterBuffSize)
+	http.HandleFunc(meta.DisableTrash, super.DisableTrash)
+	http.HandleFunc(meta.QueryTrash, super.QueryTrash)
 
 	statusCh := make(chan error)
-	go waitListenAndServe(statusCh, ":"+opt.Profport, nil)
+	pprofAddr := ":" + opt.Profport
+	if opt.LocallyProf {
+		pprofAddr = "127.0.0.1:" + opt.Profport
+	}
+	mainMux := http.NewServeMux()
+	mux := http.NewServeMux()
+	mux.Handle("/debug/pprof", http.HandlerFunc(pprof.Index))
+	mux.Handle("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
+	mux.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
+	mux.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
+	mux.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
+	mux.Handle("/debug/", http.HandlerFunc(pprof.Index))
+	mainHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if strings.HasPrefix(req.URL.Path, "/debug/") {
+			mux.ServeHTTP(w, req)
+		} else {
+			http.DefaultServeMux.ServeHTTP(w, req)
+		}
+	})
+	mainMux.Handle("/", mainHandler)
+
+	go waitListenAndServe(statusCh, pprofAddr, mainMux)
 	if err = <-statusCh; err != nil {
 		daemonize.SignalOutcome(err)
 		return
 	}
 
 	go func() {
+		var mc = master.NewMasterClientFromString(opt.Master, false)
 		t := time.NewTicker(UpdateConfInterval)
 		defer t.Stop()
-		for {
-			select {
-			case <-t.C:
-				log.LogDebugf("UpdateVolConf: start load conf from master")
-				if proto.IsCold(opt.VolType) {
-					var mc = master.NewMasterClientFromString(opt.Master, false)
-					var volumeInfo *proto.SimpleVolView
-					volumeInfo, err = mc.AdminAPI().GetVolumeSimpleInfo(opt.Volname)
-					if err != nil {
-						return
-					}
-					super.CacheAction = volumeInfo.CacheAction
-					super.CacheThreshold = volumeInfo.CacheThreshold
-					super.EbsBlockSize = volumeInfo.ObjBlockSize
-				}
+		for range t.C {
+			log.LogDebugf("UpdateVolConf: load conf from master")
+			var volumeInfo *proto.SimpleVolView
+			volumeInfo, err = mc.AdminAPI().GetVolumeSimpleInfo(opt.Volname)
+			if err != nil {
+				log.LogErrorf("UpdateVolConf: get vol info from master failed, err %s", err.Error())
+				continue
+			}
+			super.SetTransaction(volumeInfo.EnableTransaction, volumeInfo.TxTimeout, volumeInfo.TxConflictRetryNum, volumeInfo.TxConflictRetryInterval)
+			if proto.IsCold(opt.VolType) {
+				super.CacheAction = volumeInfo.CacheAction
+				super.CacheThreshold = volumeInfo.CacheThreshold
+				super.EbsBlockSize = volumeInfo.ObjBlockSize
 			}
 		}
 	}()
@@ -598,10 +663,11 @@ func mount(opt *proto.MountOptions) (fsConn *fuse.Conn, super *cfs.Super, err er
 		fuse.MaxReadahead(MaxReadAhead),
 		fuse.AsyncRead(),
 		fuse.AutoInvalData(opt.AutoInvalData),
-		fuse.FSName("cubefs-" + opt.Volname),
-		fuse.Subtype("cubes"),
+		fuse.FSName(opt.FileSystemName),
+		fuse.Subtype("cubefs"),
 		fuse.LocalVolume(),
-		fuse.VolumeName("cubefs-" + opt.Volname)}
+		fuse.VolumeName(opt.FileSystemName),
+		fuse.RequestTimeout(opt.RequestTimeout)}
 
 	if opt.Rdonly {
 		options = append(options, fuse.ReadOnly())
@@ -626,10 +692,12 @@ func mount(opt *proto.MountOptions) (fsConn *fuse.Conn, super *cfs.Super, err er
 
 func registerInterceptedSignal(mnt string) {
 	sigC := make(chan os.Signal, 1)
-	signal.Notify(sigC, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigC, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
 	go func() {
 		sig := <-sigC
-		syslog.Printf("Killed due to a received signal (%v)\n", sig)
+		syslog.Printf("Killed due to a received signal (%v)[%d-%v]\n", sig, os.Getpid(), mnt)
+		auditlog.StopAudit()
+		log.LogFlush()
 		os.Exit(1)
 	}()
 }
@@ -645,7 +713,6 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 	if err != nil {
 		return nil, errors.Trace(err, "invalide mount point (%v) ", rawmnt)
 	}
-
 	opt.Volname = GlobalMountOptions[proto.VolName].GetString()
 	opt.Owner = GlobalMountOptions[proto.Owner].GetString()
 	opt.Master = GlobalMountOptions[proto.Master].GetString()
@@ -656,6 +723,7 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 	opt.Logpath = path.Join(logPath, LoggerPrefix)
 	opt.Loglvl = GlobalMountOptions[proto.LogLevel].GetString()
 	opt.Profport = GlobalMountOptions[proto.ProfPort].GetString()
+	opt.LocallyProf = GlobalMountOptions[proto.LocallyProf].GetBool()
 	opt.IcacheTimeout = GlobalMountOptions[proto.IcacheTimeout].GetInt64()
 	opt.LookupValid = GlobalMountOptions[proto.LookupValid].GetInt64()
 	opt.AttrValid = GlobalMountOptions[proto.AttrValid].GetInt64()
@@ -694,12 +762,20 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 	opt.WriteThreads = GlobalMountOptions[proto.WriteThreads].GetInt64()
 	opt.BcacheDir = GlobalMountOptions[proto.BcacheDir].GetString()
 	//opt.EnableBcache = GlobalMountOptions[proto.EnableBcache].GetBool()
+	opt.BcacheFilterFiles = GlobalMountOptions[proto.BcacheFilterFiles].GetString()
+	opt.BcacheBatchCnt = GlobalMountOptions[proto.BcacheBatchCnt].GetInt64()
+	opt.BcacheCheckIntervalS = GlobalMountOptions[proto.BcacheCheckIntervalS].GetInt64()
 	if _, err := os.Stat(bcache.UnixSocketPath); err == nil && opt.BcacheDir != "" {
 		opt.EnableBcache = true
 	}
+
 	opt.BuffersTotalLimit = GlobalMountOptions[proto.BuffersTotalLimit].GetInt64()
 	opt.MetaSendTimeout = GlobalMountOptions[proto.MetaSendTimeout].GetInt64()
 	opt.MaxStreamerLimit = GlobalMountOptions[proto.MaxStreamerLimit].GetInt64()
+	opt.EnableAudit = GlobalMountOptions[proto.EnableAudit].GetBool()
+	opt.RequestTimeout = GlobalMountOptions[proto.RequestTimeout].GetInt64()
+	opt.MinWriteAbleDataPartitionCnt = int(GlobalMountOptions[proto.MinWriteAbleDataPartitionCnt].GetInt64())
+	opt.FileSystemName = GlobalMountOptions[proto.FileSystemName].GetString()
 
 	if opt.MountPoint == "" || opt.Volname == "" || opt.Owner == "" || opt.Master == "" {
 		return nil, errors.New(fmt.Sprintf("invalid config file: lack of mandatory fields, mountPoint(%v), volName(%v), owner(%v), masterAddr(%v)", opt.MountPoint, opt.Volname, opt.Owner, opt.Master))
@@ -708,12 +784,21 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 	if opt.BuffersTotalLimit < 0 {
 		return nil, errors.New(fmt.Sprintf("invalid fields, BuffersTotalLimit(%v) must larger or equal than 0", opt.BuffersTotalLimit))
 	}
+
+	if opt.FileSystemName == "" {
+		opt.FileSystemName = "cubefs-" + opt.Volname
+	}
+
 	return opt, nil
 }
 
 func checkPermission(opt *proto.MountOptions) (err error) {
 	var mc = master.NewMasterClientFromString(opt.Master, false)
-
+	localIP, _ := ump.GetLocalIpAddr()
+	if info, err := mc.UserAPI().AclOperation(opt.Volname, localIP, util.AclCheckIP); err != nil || !info.OK {
+		syslog.Println(err)
+		return proto.ErrNoAclPermission
+	}
 	// Check user access policy is enabled
 	if opt.AccessKey != "" {
 		var userInfo *proto.UserInfo
@@ -785,6 +870,11 @@ func loadConfFromMaster(opt *proto.MountOptions) (err error) {
 	opt.EbsBlockSize = volumeInfo.ObjBlockSize
 	opt.CacheAction = volumeInfo.CacheAction
 	opt.CacheThreshold = volumeInfo.CacheThreshold
+	opt.EnableQuota = volumeInfo.EnableQuota
+	opt.EnableTransaction = volumeInfo.EnableTransaction
+	opt.TxTimeout = volumeInfo.TxTimeout
+	opt.TxConflictRetryNum = volumeInfo.TxConflictRetryNum
+	opt.TxConflictRetryInterval = volumeInfo.TxConflictRetryInterval
 
 	var clusterInfo *proto.ClusterInfo
 	clusterInfo, err = mc.AdminAPI().GetClusterInfo()
@@ -793,5 +883,6 @@ func loadConfFromMaster(opt *proto.MountOptions) (err error) {
 	}
 	opt.EbsEndpoint = clusterInfo.EbsAddr
 	opt.EbsServicePath = clusterInfo.ServicePath
+	//opt.TrashInterval = int64(util.Min(int(opt.TrashInterval), int(volumeInfo.TrashInterval)))
 	return
 }

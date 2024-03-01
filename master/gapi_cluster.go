@@ -201,7 +201,7 @@ func (m *ClusterService) decommissionDisk(ctx context.Context, args struct {
 	}
 	rstMsg := fmt.Sprintf("receive decommissionDisk node[%v] disk[%v], badPartitionIds[%v] has offline successfully",
 		node.Addr, args.DiskPath, badPartitionIds)
-	if err = m.cluster.decommissionDisk(node, false, args.DiskPath, badPartitions); err != nil {
+	if err = m.cluster.decommissionDisk(node, false, args.DiskPath, badPartitions, true); err != nil {
 		return nil, err
 	}
 	Warn(m.cluster.Name, rstMsg)
@@ -608,19 +608,20 @@ func (m *ClusterService) alarmList(ctx context.Context, args struct {
 
 func (m *ClusterService) makeClusterView() *proto.ClusterView {
 	cv := &proto.ClusterView{
-		Name:                m.cluster.Name,
-		LeaderAddr:          m.cluster.leaderInfo.addr,
-		DisableAutoAlloc:    m.cluster.DisableAutoAllocate,
-		MetaNodeThreshold:   m.cluster.cfg.MetaNodeThreshold,
-		Applied:             m.cluster.fsm.applied,
-		MaxDataPartitionID:  m.cluster.idAlloc.dataPartitionID,
-		MaxMetaNodeID:       m.cluster.idAlloc.commonID,
-		MaxMetaPartitionID:  m.cluster.idAlloc.metaPartitionID,
-		MetaNodes:           make([]proto.NodeView, 0),
-		DataNodes:           make([]proto.NodeView, 0),
-		VolStatInfo:         make([]*proto.VolStatInfo, 0),
-		BadPartitionIDs:     make([]proto.BadPartitionView, 0),
-		BadMetaPartitionIDs: make([]proto.BadPartitionView, 0),
+		Name:                 m.cluster.Name,
+		LeaderAddr:           m.cluster.leaderInfo.addr,
+		DisableAutoAlloc:     m.cluster.DisableAutoAllocate,
+		ForbidMpDecommission: m.cluster.ForbidMpDecommission,
+		MetaNodeThreshold:    m.cluster.cfg.MetaNodeThreshold,
+		Applied:              m.cluster.fsm.applied,
+		MaxDataPartitionID:   m.cluster.idAlloc.dataPartitionID,
+		MaxMetaNodeID:        m.cluster.idAlloc.commonID,
+		MaxMetaPartitionID:   m.cluster.idAlloc.metaPartitionID,
+		MetaNodes:            make([]proto.NodeView, 0),
+		DataNodes:            make([]proto.NodeView, 0),
+		VolStatInfo:          make([]*proto.VolStatInfo, 0),
+		BadPartitionIDs:      make([]proto.BadPartitionView, 0),
+		BadMetaPartitionIDs:  make([]proto.BadPartitionView, 0),
 	}
 
 	vols := m.cluster.allVolNames()
@@ -631,7 +632,7 @@ func (m *ClusterService) makeClusterView() *proto.ClusterView {
 	for _, name := range vols {
 		stat, ok := m.cluster.volStatInfo.Load(name)
 		if !ok {
-			cv.VolStatInfo = append(cv.VolStatInfo, newVolStatInfo(name, 0, 0, 0, 0))
+			cv.VolStatInfo = append(cv.VolStatInfo, newVolStatInfo(name, 0, 0, 0, 0, 0))
 			continue
 		}
 		cv.VolStatInfo = append(cv.VolStatInfo, stat.(*volStatInfo))

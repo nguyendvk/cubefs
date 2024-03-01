@@ -18,31 +18,31 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/cubefs/cubefs/util/buf"
 	"net/http"
-	_ "net/http/pprof"
+	"net/http/pprof"
 	"path"
 	gopath "path"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/cubefs/blobstore/api/access"
-	"github.com/cubefs/blobstore/common/trace"
+	"github.com/cubefs/cubefs/blobstore/api/access"
+	"github.com/cubefs/cubefs/blobstore/common/trace"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/sdk/data/stream"
 	masterSDK "github.com/cubefs/cubefs/sdk/master"
 	"github.com/cubefs/cubefs/sdk/meta"
+	"github.com/cubefs/cubefs/util/buf"
 	"github.com/cubefs/cubefs/util/log"
 	"github.com/cubefs/cubefs/util/stat"
-	"github.com/hashicorp/consul/api"
 )
 
 type LimitParameters struct {
 	TraverseDirConcurrency int64
 	PreloadFileConcurrency int64
-	ReadBlockConcurrency   int64
+	ReadBlockConcurrency   int32
 	PreloadFileSizeLimit   int64
 	ClearFileConcurrency   int64
 }
@@ -89,14 +89,30 @@ func NewClient(config PreloadConfig) *PreLoadClient {
 	}
 
 	if config.LogDir != "" {
-		log.InitLog(config.LogDir, "preload", convertLogLevel(config.LogLevel), nil)
+		log.InitLog(config.LogDir, "preload", convertLogLevel(config.LogLevel), nil, log.DefaultLogLeftSpaceLimit)
 		stat.NewStatistic(config.LogDir, "preload", int64(stat.DefaultStatLogSize), stat.DefaultTimeOutUs, true)
 	}
 
 	if config.ProfPort != "" {
 		go func() {
+			mainMux := http.NewServeMux()
+			mux := http.NewServeMux()
 			http.HandleFunc(log.SetLogLevelPath, log.SetLogLevel)
-			e := http.ListenAndServe(fmt.Sprintf(":%v", config.ProfPort), nil)
+			mux.Handle("/debug/pprof", http.HandlerFunc(pprof.Index))
+			mux.Handle("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
+			mux.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
+			mux.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
+			mux.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
+			mux.Handle("/debug/", http.HandlerFunc(pprof.Index))
+			mainHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if strings.HasPrefix(req.URL.Path, "/debug/") {
+					mux.ServeHTTP(w, req)
+				} else {
+					http.DefaultServeMux.ServeHTTP(w, req)
+				}
+			})
+			mainMux.Handle("/", mainHandler)
+			e := http.ListenAndServe(fmt.Sprintf(":%v", config.ProfPort), mainMux)
 			if e != nil {
 				log.LogWarnf("newClient newEBSClient cannot listen pprof (%v)", config.ProfPort)
 			}
@@ -205,7 +221,7 @@ func (c *PreLoadClient) newEBSClient(masters []string, logDir string) (err error
 
 	if ebsc, err = blobstore.NewEbsClient(access.Config{
 		ConnMode: access.NoLimitConnMode,
-		Consul: api.Config{
+		Consul: access.ConsulConfig{
 			Address: ebsEndpoint,
 		},
 		MaxSizePutOnce: int64(c.ebsBlockSize),
@@ -473,7 +489,7 @@ func (c *PreLoadClient) preloadFileWorker(id int64, jobs <-chan fileInfo, wg *sy
 				log.LogWarnf("Read (%v) wrong size:(%v)", objExtent, n)
 				continue
 			}
-			_, err = c.ec.Write(ino, int(objExtent.FileOffset), buf, 0)
+			_, err = c.ec.Write(ino, int(objExtent.FileOffset), buf, 0, nil)
 			//in preload mode,onece extend_hander set to error, streamer is set to error
 			// so write should failed immediately
 			if err != nil {

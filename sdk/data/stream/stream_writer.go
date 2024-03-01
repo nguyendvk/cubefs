@@ -15,14 +15,13 @@
 package stream
 
 import (
+	"context"
 	"fmt"
 	"hash/crc32"
 	"net"
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/wrapper"
@@ -63,6 +62,7 @@ type WriteRequest struct {
 	writeBytes int
 	err        error
 	done       chan struct{}
+	checkFunc  func() error
 }
 
 // FlushRequest defines a flush request.
@@ -79,9 +79,10 @@ type ReleaseRequest struct {
 
 // TruncRequest defines a truncate request.
 type TruncRequest struct {
-	size int
-	err  error
-	done chan struct{}
+	size     int
+	err      error
+	fullPath string
+	done     chan struct{}
 }
 
 // EvictRequest defines an evict request.
@@ -101,7 +102,7 @@ func (s *Streamer) IssueOpenRequest() error {
 	return nil
 }
 
-func (s *Streamer) IssueWriteRequest(offset int, data []byte, flags int) (write int, err error) {
+func (s *Streamer) IssueWriteRequest(offset int, data []byte, flags int, checkFunc func() error) (write int, err error) {
 	if atomic.LoadInt32(&s.status) >= StreamerError {
 		return 0, errors.New(fmt.Sprintf("IssueWriteRequest: stream writer in error status, ino(%v)", s.inode))
 	}
@@ -113,6 +114,8 @@ func (s *Streamer) IssueWriteRequest(offset int, data []byte, flags int) (write 
 	request.size = len(data)
 	request.flags = flags
 	request.done = make(chan struct{}, 1)
+	request.checkFunc = checkFunc
+
 	s.request <- request
 	s.writeLock.Unlock()
 
@@ -144,9 +147,10 @@ func (s *Streamer) IssueReleaseRequest() error {
 	return err
 }
 
-func (s *Streamer) IssueTruncRequest(size int) error {
+func (s *Streamer) IssueTruncRequest(size int, fullPath string) error {
 	request := truncRequestPool.Get().(*TruncRequest)
 	request.size = size
+	request.fullPath = fullPath
 	request.done = make(chan struct{}, 1)
 	s.request <- request
 	<-request.done
@@ -169,12 +173,12 @@ func (s *Streamer) IssueEvictRequest() error {
 func (s *Streamer) server() {
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
-	defer func() {
-		if !s.client.disableMetaCache {
-			close(s.request)
-			s.request = nil
-		}
-	}()
+	//defer func() {
+	//	if !s.client.disableMetaCache && s.needBCache {
+	//		close(s.request)
+	//		s.request = nil
+	//	}
+	//}()
 
 	for {
 		select {
@@ -192,7 +196,7 @@ func (s *Streamer) server() {
 
 				s.client.streamerLock.Lock()
 				if s.idle >= streamWriterIdleTimeoutPeriod && len(s.request) == 0 {
-					if s.client.disableMetaCache {
+					if s.client.disableMetaCache || !s.needBCache {
 						delete(s.client.streamers, s.inode)
 						if s.client.evictIcache != nil {
 							s.client.evictIcache(s.inode)
@@ -200,10 +204,10 @@ func (s *Streamer) server() {
 					}
 
 					s.isOpen = false
-					s.client.streamerLock.Unlock()
-
 					// fail the remaining requests in such case
 					s.clearRequests()
+					s.client.streamerLock.Unlock()
+
 					log.LogDebugf("done server: no requests for a long time, ino(%v)", s.inode)
 					return
 				}
@@ -255,10 +259,10 @@ func (s *Streamer) handleRequest(request interface{}) {
 		s.open()
 		request.done <- struct{}{}
 	case *WriteRequest:
-		request.writeBytes, request.err = s.write(request.data, request.fileOffset, request.size, request.flags)
+		request.writeBytes, request.err = s.write(request.data, request.fileOffset, request.size, request.flags, request.checkFunc)
 		request.done <- struct{}{}
 	case *TruncRequest:
-		request.err = s.truncate(request.size)
+		request.err = s.truncate(request.size, request.fullPath)
 		request.done <- struct{}{}
 	case *FlushRequest:
 		request.err = s.flush()
@@ -273,7 +277,7 @@ func (s *Streamer) handleRequest(request interface{}) {
 	}
 }
 
-func (s *Streamer) write(data []byte, offset, size, flags int) (total int, err error) {
+func (s *Streamer) write(data []byte, offset, size, flags int, checkFunc func() error) (total int, err error) {
 	var direct bool
 
 	if flags&proto.FlagsSyncWrite != 0 {
@@ -290,46 +294,46 @@ func (s *Streamer) write(data []byte, offset, size, flags int) (total int, err e
 	ctx := context.Background()
 	s.client.writeLimiter.Wait(ctx)
 
-	if flags&proto.FlagsCache == 0 {
-		s.client.LimitManager.WriteAlloc(ctx, size)
-	}
-
-	// Khoi tao cac ExtentRequest de dieu chinh file.
 	requests := s.extents.PrepareWriteRequests(offset, size, data)
 	log.LogDebugf("Streamer write: ino(%v) prepared requests(%v)", s.inode, requests)
 
+	isChecked := false
 	// Must flush before doing overwrite
 	for _, req := range requests {
 		if req.ExtentKey == nil {
 			continue
 		}
-		// Neu ton tai extent cu (req.ExtentKey != nil) luc PrepareWriteRequests
-		// -> ko phai la write lan dau
-		// -> flush để đảm bảo file đã hoàn chỉnh ở lần write trước
 		err = s.flush()
 		if err != nil {
 			return
 		}
-		// PrepareWriteRequests lai
 		requests = s.extents.PrepareWriteRequests(offset, size, data)
 		log.LogDebugf("Streamer write: ino(%v) prepared requests after flush(%v)", s.inode, requests)
 		break
 	}
 
-	// duyệt từng NewExtentRequest:  neu la extent cu -> doOverwrite; neu la extent moi -> doWrite
 	for _, req := range requests {
 		var writeSize int
 		if req.ExtentKey != nil {
 			writeSize, err = s.doOverwrite(req, direct)
-			cacheKey := util.GenerateRepVolKey(s.client.volumeName, s.inode, req.ExtentKey.ExtentId, req.ExtentKey.FileOffset)
-			if _, ok := s.inflightEvictL1cache.Load(cacheKey); !ok && s.client.bcacheEnable {
-				go func(cacheKey string) {
-					s.inflightEvictL1cache.Store(cacheKey, true)
-					s.client.evictBcache(cacheKey)
-					s.inflightEvictL1cache.Delete(cacheKey)
-				}(cacheKey)
+			if s.client.bcacheEnable {
+				cacheKey := util.GenerateRepVolKey(s.client.volumeName, s.inode, req.ExtentKey.PartitionId, req.ExtentKey.ExtentId, uint64(req.FileOffset))
+				if _, ok := s.inflightEvictL1cache.Load(cacheKey); !ok {
+					go func(cacheKey string) {
+						s.inflightEvictL1cache.Store(cacheKey, true)
+						s.client.evictBcache(cacheKey)
+						s.inflightEvictL1cache.Delete(cacheKey)
+					}(cacheKey)
+				}
 			}
+
 		} else {
+			if !isChecked && checkFunc != nil {
+				isChecked = true
+				if err = checkFunc(); err != nil {
+					return
+				}
+			}
 			writeSize, err = s.doWrite(req.Data, req.FileOffset, req.Size, direct)
 		}
 		if err != nil {
@@ -346,7 +350,6 @@ func (s *Streamer) write(data []byte, offset, size, flags int) (total int, err e
 	return
 }
 
-// TODO:
 func (s *Streamer) doOverwrite(req *ExtentRequest, direct bool) (total int, err error) {
 	var dp *wrapper.DataPartition
 
@@ -429,10 +432,6 @@ func (s *Streamer) doOverwrite(req *ExtentRequest, direct bool) (total int, err 
 	return
 }
 
-// thực hiện write NewExtentRequest
-//   - tao ExtentHandler moi: NewExtentHandler(s, offset, storeMode, 0)
-//   - ExtentHandler.write để push request
-//   - Nếu thành công, thêm ExtentHandler vào dirtylist, đánh dấu ExtentHandler đang cần được flush
 func (s *Streamer) doWrite(data []byte, offset, size int, direct bool) (total int, err error) {
 	var (
 		ek        *proto.ExtentKey
@@ -444,7 +443,6 @@ func (s *Streamer) doWrite(data []byte, offset, size int, direct bool) (total in
 	if offset > 0 || offset+size > s.tinySizeLimit() {
 		storeMode = proto.NormalExtentType
 	} else {
-		// if offset == 0 && size <= s.tinySizeLimit()
 		storeMode = proto.TinyExtentType
 	}
 
@@ -500,13 +498,10 @@ func (s *Streamer) doWrite(data []byte, offset, size int, direct bool) (total in
 
 			s.closeOpenHandler()
 		}
-	} else { // if volType = cold
-		// Tạo ExtentHandler mới
+	} else {
 		s.handler = NewExtentHandler(s, offset, storeMode, 0)
 		s.dirty = false
-		// ExtentHandler tạo và push các WritePacket để gửi các block
 		ek, err = s.handler.write(data, offset, size, direct)
-		// Nếu thành công, thêm ExtentHandler vào dirtylist, đánh dấu ExtentHandler đang cần được flush
 		if err == nil && ek != nil {
 			if !s.dirty {
 				s.dirtylist.Put(s.handler)
@@ -532,9 +527,6 @@ func (s *Streamer) doWrite(data []byte, offset, size int, direct bool) (total in
 	return
 }
 
-// Day tat ca data cua file len cluster.
-// - Goi tat ca dirtyExtentHandler.flush()
-// - Remove dirtyExtentHandler neu flush thanh cong
 func (s *Streamer) flush() (err error) {
 	for {
 		element := s.dirtylist.Get()
@@ -657,7 +649,7 @@ func (s *Streamer) evict() error {
 		s.client.streamerLock.Unlock()
 		return errors.New(fmt.Sprintf("evict: streamer(%v) refcnt(%v)", s, s.refcnt))
 	}
-	if s.client.disableMetaCache {
+	if s.client.disableMetaCache || !s.needBCache {
 		delete(s.client.streamers, s.inode)
 	}
 	s.client.streamerLock.Unlock()
@@ -677,14 +669,14 @@ func (s *Streamer) abort() {
 	}
 }
 
-func (s *Streamer) truncate(size int) error {
+func (s *Streamer) truncate(size int, fullPath string) error {
 	s.closeOpenHandler()
 	err := s.flush()
 	if err != nil {
 		return err
 	}
 
-	err = s.client.truncate(s.inode, uint64(size))
+	err = s.client.truncate(s.inode, uint64(size), fullPath)
 	if err != nil {
 		return err
 	}

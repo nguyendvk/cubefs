@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2018 The Chubao Authors.
+# Copyright 2018 The CubeFS Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 MntPoint=/cfs/mnt
 mkdir -p /cfs/bin /cfs/log /cfs/mnt
-src_path=/go/src/github.com/chubaofs/cfs
+src_path=/go/src/github.com/cubefs/cfs
 cli=/cfs/bin/cfs-cli
 conf_path=/cfs/conf
 
@@ -104,6 +104,19 @@ create_volume() {
     echo -e "\033[32mdone\033[0m"
 }
 
+create_cold_volume() {
+    echo -n "Creating cold volume   ... "
+    # check volume exist
+    ${cli} volume info ${VolName} &> /dev/null
+    if [[ $? -eq 0 ]]; then
+        echo -e "\033[32mdone\033[0m"
+        return
+    fi
+    md5=`echo -n ${Owner} | md5sum | cut -d ' ' -f1`
+    curl -v "http://192.168.0.11:17010/admin/createVol?name=${VolName}&volType=1&cacheCap=8&cacheAction=2&capacity=10&owner=${Owner}&mpCount=3"
+    curl -v "http://192.168.0.11:17010/client/vol?name=${VolName}&authKey=${md5}" | python -m json.tool
+}
+
 show_cluster_info() {
     tmp_file=/tmp/collect_cluster_info
     ${cli} cluster info &>> ${tmp_file}
@@ -141,6 +154,7 @@ create_cluster_user
 ensure_node_writable "metanode"
 ensure_node_writable "datanode"
 create_volume
+#create_cold_volume
 show_cluster_info
 start_client
 

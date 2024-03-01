@@ -40,18 +40,8 @@ import (
 //  put empty shard to blobnode if file has been aligned.
 
 // Put put one object
-//
-//	required: size, file size
-//	optional: hasher map to calculate hash.Hash
-//
-/*
-Access Object Put handler:
-- make hasher
-- allocFromAllocatorWithHystrix(): gửi request đến proxy để xin các blobs
-- foreach blob:
-	-- EC encode data
-	-- writeToBlobnodesWithHystrix
-*/
+//     required: size, file size
+//     optional: hasher map to calculate hash.Hash
 func (h *Handler) Put(ctx context.Context, rc io.Reader, size int64,
 	hasherMap access.HasherMap) (*access.Location, error) {
 	span := trace.SpanFromContextSafe(ctx)
@@ -275,7 +265,7 @@ func (h *Handler) writeToBlobnodes(ctx context.Context,
 			}
 			// punished disk, ignore and return
 			if hostInfo.Punished {
-				span.Infof("ignore punished disk(%d %s) uvid(%d) ecidx(%02d) in idc(%s)",
+				span.Warnf("ignore punished disk(%d %s) uvid(%d) ecidx(%02d) in idc(%s)",
 					diskID, hostInfo.Host, unit.Vuid, index, hostInfo.IDC)
 				return
 			}
@@ -315,13 +305,13 @@ func (h *Handler) writeToBlobnodes(ctx context.Context,
 				case errcode.CodeDiskBroken, errcode.CodeVUIDReadonly:
 					h.punishVolume(ctx, clusterID, vid, host, "BrokenOrRO")
 					h.punishDisk(ctx, clusterID, diskID, host, "BrokenOrRO")
-					span.Infof("punish disk:%d volume:%d cos:blobnode/%d", diskID, vid, code)
+					span.Warnf("punish disk:%d volume:%d cos:blobnode/%d", diskID, vid, code)
 					return true, err
 
 				// chunk no space, we should punish this volume
 				case errcode.CodeChunkNoSpace:
 					h.punishVolume(ctx, clusterID, vid, host, "NoSpace")
-					span.Infof("punish volume:%d cos:blobnode/%d", vid, code)
+					span.Warnf("punish volume:%d cos:blobnode/%d", vid, code)
 					return true, err
 
 				// vuid not found means the reflection between vuid and diskID has change, we should refresh the volume
@@ -345,14 +335,14 @@ func (h *Handler) writeToBlobnodes(ctx context.Context,
 
 					h.punishVolume(ctx, clusterID, vid, host, "NotFound")
 					h.punishDisk(ctx, clusterID, diskID, host, "NotFound")
-					span.Infof("punish disk:%d volume:%d cos:blobnode/%d", diskID, vid, code)
+					span.Warnf("punish disk:%d volume:%d cos:blobnode/%d", diskID, vid, code)
 					return true, err
 				}
 
 				// in timeout case and writtenNum is not satisfied with putQuorum, then should retry
 				if errorTimeout(err) && atomic.LoadUint32(&writtenNum) < putQuorum {
 					h.punishDiskWith(ctx, clusterID, diskID, host, "Timeout")
-					span.Info("connect timeout, need to punish threshold disk", diskID, host)
+					span.Warn("connect timeout, need to punish threshold disk", diskID, host)
 					return false, err
 				}
 
@@ -364,7 +354,7 @@ func (h *Handler) writeToBlobnodes(ctx context.Context,
 				goto RETRY
 			}
 			if writeErr != nil {
-				span.Warnf("write %s on blobnode(%d %d %s) ecidx(%02d): %s",
+				span.Warnf("write %s on blobnode(vuid:%d disk:%d host:%s) ecidx(%02d): %s",
 					blob.String(), args.Vuid, args.DiskID, hostInfo.Host, index, errors.Detail(writeErr))
 				return
 			}

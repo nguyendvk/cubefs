@@ -17,12 +17,15 @@ package master
 import (
 	"context"
 	"fmt"
+	"github.com/cubefs/cubefs/raftstore/raftstore_db"
 	syslog "log"
 	"net/http"
 	"net/http/httputil"
 	"regexp"
 	"strconv"
 	"sync"
+
+	"github.com/cubefs/cubefs/util/stat"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/raftstore"
@@ -40,6 +43,7 @@ const (
 	IP                   = "ip"
 	Port                 = "port"
 	LogLevel             = "logLevel"
+	LogDir               = "logDir"
 	WalDir               = "walDir"
 	StoreDir             = "storeDir"
 	EbsAddrKey           = "ebsAddr"
@@ -54,6 +58,7 @@ const (
 	cfgRaftRecvBufSize   = "raftRecvBufSize"
 	cfgElectionTick      = "electionTick"
 	SecretKey            = "masterServiceKey"
+	Stat                 = "stat"
 )
 
 var (
@@ -63,8 +68,6 @@ var (
 
 	useConnPool = true //for test
 	gConfig     *clusterConfig
-
-	maxDpCntOneNode = uint32(3000)
 )
 
 var overSoldFactor = defaultOverSoldFactor
@@ -90,20 +93,19 @@ func setOverSoldFactor(factor float32) {
 		overSoldFactor = factor
 	}
 }
-func dpCntOneNodeLimit() uint32 {
-	if maxDpCntOneNode <= 0 {
-		return 3000
-	}
 
-	return maxDpCntOneNode
-}
+var (
+	volNameErr = errors.New("name can only start and end with number or letters, and len can't less than 3")
+)
 
 // Server represents the server in a cluster
 type Server struct {
 	id              uint64
 	clusterName     string
 	ip              string
+	bindIp          bool
 	port            string
+	logDir          string
 	walDir          string
 	storeDir        string
 	bStoreAddr      string
@@ -116,7 +118,7 @@ type Server struct {
 	config          *clusterConfig
 	cluster         *Cluster
 	user            *User
-	rocksDBStore    *raftstore.RocksDBStore
+	rocksDBStore    *raftstore_db.RocksDBStore
 	raftStore       raftstore.RaftStore
 	fsm             *MetadataFsm
 	partition       raftstore.Partition
@@ -142,7 +144,7 @@ func (m *Server) Start(cfg *config.Config) (err error) {
 		return
 	}
 
-	if m.rocksDBStore, err = raftstore.NewRocksDBStore(m.storeDir, LRUCacheSize, WriteBufferSize); err != nil {
+	if m.rocksDBStore, err = raftstore_db.NewRocksDBStore(m.storeDir, LRUCacheSize, WriteBufferSize); err != nil {
 		return
 	}
 
@@ -161,8 +163,13 @@ func (m *Server) Start(cfg *config.Config) (err error) {
 	m.cluster.scheduleTask()
 	m.startHTTPService(ModuleName, cfg)
 	exporter.RegistConsul(m.clusterName, ModuleName, cfg)
+	WarnMetrics = newWarningMetrics(m.cluster)
 	metricsService := newMonitorMetrics(m.cluster)
 	metricsService.start()
+
+	_, err = stat.NewStatistic(m.logDir, Stat, int64(stat.DefaultStatLogSize),
+		stat.DefaultTimeOutUs, true)
+
 	m.wg.Add(1)
 	return nil
 }
@@ -175,6 +182,7 @@ func (m *Server) Shutdown() {
 			log.LogErrorf("action[Shutdown] failed, err: %v", err)
 		}
 	}
+	stat.CloseStat()
 	m.wg.Done()
 }
 
@@ -187,7 +195,9 @@ func (m *Server) checkConfig(cfg *config.Config) (err error) {
 
 	m.clusterName = cfg.GetString(ClusterName)
 	m.ip = cfg.GetString(IP)
+	m.bindIp = cfg.GetBool(proto.BindIpKey)
 	m.port = cfg.GetString(proto.ListenPort)
+	m.logDir = cfg.GetString(LogDir)
 	m.walDir = cfg.GetString(WalDir)
 	m.storeDir = cfg.GetString(StoreDir)
 	m.bStoreAddr = cfg.GetString(BStoreAddrKey)
@@ -199,14 +209,17 @@ func (m *Server) checkConfig(cfg *config.Config) (err error) {
 		m.servicePath = cfg.GetString(EbsServicePathKey)
 	}
 	peerAddrs := cfg.GetString(cfgPeers)
-	if m.ip == "" || m.port == "" || m.walDir == "" || m.storeDir == "" || m.clusterName == "" || peerAddrs == "" {
-		return fmt.Errorf("%v,err:%v,%v,%v,%v,%v,%v,%v", proto.ErrInvalidCfg, "one of (ip,listen,walDir,storeDir,clusterName) is null",
-			m.ip, m.port, m.walDir, m.storeDir, m.clusterName, peerAddrs)
+	if m.port == "" || m.walDir == "" || m.storeDir == "" || m.clusterName == "" || peerAddrs == "" {
+		return fmt.Errorf("%v,err:%v,%v,%v,%v,%v,%v", proto.ErrInvalidCfg, "one of (listen,walDir,storeDir,clusterName) is null",
+			m.port, m.walDir, m.storeDir, m.clusterName, peerAddrs)
 	}
 
 	if m.id, err = strconv.ParseUint(cfg.GetString(ID), 10, 64); err != nil {
 		return fmt.Errorf("%v,err:%v", proto.ErrInvalidCfg, err.Error())
 	}
+
+	m.config.DisableAutoCreate = cfg.GetBoolWithDefault(disableAutoCreate, false)
+	syslog.Printf("get disableAutoCreate cfg %v", m.config.DisableAutoCreate)
 
 	m.config.faultDomain = cfg.GetBoolWithDefault(faultDomain, false)
 	m.config.heartbeatPort = cfg.GetInt64(heartbeatPortKey)
@@ -268,6 +281,20 @@ func (m *Server) checkConfig(cfg *config.Config) (err error) {
 		}
 	}
 
+	dpNoLeaderReportInterval := cfg.GetString(cfgDpNoLeaderReportIntervalSec)
+	if dpNoLeaderReportInterval != "" {
+		if m.config.DpNoLeaderReportIntervalSec, err = strconv.ParseInt(dpNoLeaderReportInterval, 10, 0); err != nil {
+			return fmt.Errorf("%v,err:%v", proto.ErrInvalidCfg, err.Error())
+		}
+	}
+
+	mpNoLeaderReportInterval := cfg.GetString(cfgMpNoLeaderReportIntervalSec)
+	if mpNoLeaderReportInterval != "" {
+		if m.config.MpNoLeaderReportIntervalSec, err = strconv.ParseInt(mpNoLeaderReportInterval, 10, 0); err != nil {
+			return fmt.Errorf("%v,err:%v", proto.ErrInvalidCfg, err.Error())
+		}
+	}
+
 	dataPartitionTimeOutSec := cfg.GetString(dataPartitionTimeOutSec)
 	if dataPartitionTimeOutSec != "" {
 		if m.config.DataPartitionTimeOutSec, err = strconv.ParseInt(dataPartitionTimeOutSec, 10, 0); err != nil {
@@ -289,6 +316,7 @@ func (m *Server) checkConfig(cfg *config.Config) (err error) {
 			return fmt.Errorf("%v,err:%v", proto.ErrInvalidCfg, err.Error())
 		}
 	}
+
 	m.tickInterval = int(cfg.GetFloat(cfgTickInterval))
 	m.raftRecvBufSize = int(cfg.GetInt(cfgRaftRecvBufSize))
 	m.electionTick = int(cfg.GetFloat(cfgElectionTick))
@@ -298,6 +326,24 @@ func (m *Server) checkConfig(cfg *config.Config) (err error) {
 	if m.electionTick <= 3 {
 		m.electionTick = 5
 	}
+
+	maxQuotaNumPerVol := cfg.GetString(cfgMaxQuotaNumPerVol)
+	if maxQuotaNumPerVol != "" {
+		if m.config.MaxQuotaNumPerVol, err = strconv.Atoi(maxQuotaNumPerVol); err != nil {
+			return fmt.Errorf("%v,err:%v", proto.ErrInvalidCfg, err.Error())
+		}
+	}
+
+	m.config.MonitorPushAddr = cfg.GetString(cfgMonitorPushAddr)
+
+	m.config.volForceDeletion = cfg.GetBoolWithDefault(cfgVolForceDeletion, true)
+
+	threshold := cfg.GetInt64WithDefault(cfgVolDeletionDentryThreshold, 0)
+	if threshold < 0 {
+		return fmt.Errorf("volDeletionDentryThreshold can't be less than 0 ! ")
+	}
+	m.config.volDeletionDentryThreshold = uint64(threshold)
+
 	return
 }
 
@@ -305,6 +351,7 @@ func (m *Server) createRaftServer(cfg *config.Config) (err error) {
 	raftCfg := &raftstore.Config{
 		NodeID:            m.id,
 		RaftPath:          m.walDir,
+		IPAddr:            cfg.GetString(IP),
 		NumOfLogsToRetain: m.retainLogs,
 		HeartbeatPort:     int(m.config.heartbeatPort),
 		ReplicaPort:       int(m.config.replicaPort),
@@ -342,6 +389,11 @@ func (m *Server) initFsm() {
 func (m *Server) initCluster() {
 	m.cluster = newCluster(m.clusterName, m.leaderInfo, m.fsm, m.partition, m.config)
 	m.cluster.retainLogs = m.retainLogs
+
+	//incase any limiter on follower
+	log.LogInfo("action[loadApiLimiterInfo] begin")
+	m.cluster.loadApiLimiterInfo()
+	log.LogInfo("action[loadApiLimiterInfo] end")
 }
 
 func (m *Server) initUser() {

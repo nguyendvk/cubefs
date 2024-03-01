@@ -30,17 +30,19 @@ import (
 )
 
 func newCreateDataPartitionRequest(volName string, ID uint64, replicaNum int, members []proto.Peer,
-	dataPartitionSize, leaderSize int, hosts []string, createType int, partitionType int) (req *proto.CreateDataPartitionRequest) {
+	dataPartitionSize, leaderSize int, hosts []string, createType int, partitionType int,
+	decommissionedDisks []string) (req *proto.CreateDataPartitionRequest) {
 	req = &proto.CreateDataPartitionRequest{
-		PartitionTyp:  partitionType,
-		PartitionId:   ID,
-		PartitionSize: dataPartitionSize,
-		ReplicaNum:    replicaNum,
-		VolumeId:      volName,
-		Members:       members,
-		Hosts:         hosts,
-		CreateType:    createType,
-		LeaderSize:    leaderSize,
+		PartitionTyp:        partitionType,
+		PartitionId:         ID,
+		PartitionSize:       dataPartitionSize,
+		ReplicaNum:          replicaNum,
+		VolumeId:            volName,
+		Members:             members,
+		Hosts:               hosts,
+		CreateType:          createType,
+		LeaderSize:          leaderSize,
+		DecommissionedDisks: decommissionedDisks,
 	}
 	return
 }
@@ -182,6 +184,10 @@ func keyNotFound(name string) (err error) {
 
 func unmatchedKey(name string) (err error) {
 	return errors.NewErrorf("parameter %v not match", name)
+}
+
+func txInvalidMask() (err error) {
+	return errors.New("transaction mask key value pair should be: enableTxMaskKey=[create|mkdir|remove|rename|mknod|symlink|link]\n enableTxMaskKey=off \n enableTxMaskKey=all")
 }
 
 func notFoundMsg(name string) (err error) {

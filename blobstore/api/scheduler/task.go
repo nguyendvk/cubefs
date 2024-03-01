@@ -140,10 +140,10 @@ type PerMinStats struct {
 }
 
 type DiskRepairTasksStat struct {
-	Enable           bool         `json:"enable"`
-	RepairingDiskID  proto.DiskID `json:"repairing_disk_id"`
-	TotalTasksCnt    int          `json:"total_tasks_cnt"`
-	RepairedTasksCnt int          `json:"repaired_tasks_cnt"`
+	Enable           bool           `json:"enable"`
+	RepairingDisks   []proto.DiskID `json:"repairing_disks"`
+	TotalTasksCnt    int            `json:"total_tasks_cnt"`
+	RepairedTasksCnt int            `json:"repaired_tasks_cnt"`
 	MigrateTasksStat
 }
 
@@ -155,10 +155,10 @@ type MigrateTasksStat struct {
 }
 
 type DiskDropTasksStat struct {
-	Enable          bool         `json:"enable"`
-	DroppingDiskID  proto.DiskID `json:"dropping_disk_id"`
-	TotalTasksCnt   int          `json:"total_tasks_cnt"`
-	DroppedTasksCnt int          `json:"dropped_tasks_cnt"`
+	Enable          bool           `json:"enable"`
+	DroppingDisks   []proto.DiskID `json:"dropping_disks"`
+	TotalTasksCnt   int            `json:"total_tasks_cnt"`
+	DroppedTasksCnt int            `json:"dropped_tasks_cnt"`
 	MigrateTasksStat
 }
 
@@ -215,7 +215,29 @@ func (c *client) Stats(ctx context.Context, host string) (ret TasksStat, err err
 
 func (c *client) LeaderStats(ctx context.Context) (ret TasksStat, err error) {
 	err = c.request(func(host string) error {
-		return c.GetWith(ctx, host+PathLeaderStats, &ret)
+		return c.GetWith(ctx, host+PathStatsLeader, &ret)
+	})
+	return
+}
+
+type DiskMigratingStatsArgs struct {
+	TaskType proto.TaskType `json:"task_type"`
+	DiskID   proto.DiskID   `json:"disk_id"`
+}
+
+type DiskMigratingStats struct {
+	TotalTasksCnt    int `json:"total_tasks_cnt"`
+	MigratedTasksCnt int `json:"migrated_tasks_cnt"`
+}
+
+func (c *client) DiskMigratingStats(ctx context.Context, args *DiskMigratingStatsArgs) (ret *DiskMigratingStats, err error) {
+	if args == nil || !args.TaskType.Valid() {
+		err = errcode.ErrIllegalArguments
+		return
+	}
+	err = c.request(func(host string) error {
+		path := host + PathStatsDiskMigrating + fmt.Sprintf("?task_type=%s&disk_id=%d", args.TaskType, args.DiskID)
+		return c.GetWith(ctx, path, &ret)
 	})
 	return
 }

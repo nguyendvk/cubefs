@@ -15,15 +15,18 @@
 package stream
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sync"
-
-	"golang.org/x/net/context"
+	"sync/atomic"
+	"time"
 
 	"github.com/cubefs/cubefs/blockcache/bcache"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util"
+	"github.com/cubefs/cubefs/util/buf"
+	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -42,10 +45,11 @@ type Streamer struct {
 	traversed int // how many times the streamer is traversed
 
 	extents *ExtentCache
-	once    sync.Once
+
+	once sync.Once
 
 	handler    *ExtentHandler   // current open handler
-	dirtylist  *DirtyExtentList // dirty handlers. La cac extent được đánh dấu để flush, push data len cluster
+	dirtylist  *DirtyExtentList // dirty handlers
 	dirty      bool             // whether current open handler is in the dirty list
 	isOpen     bool
 	needBCache bool
@@ -54,8 +58,13 @@ type Streamer struct {
 	done    chan struct{}    // stream writer is being closed
 
 	writeLock            sync.Mutex
-	inflightL1cache      sync.Map
 	inflightEvictL1cache sync.Map
+	pendingCache         chan bcacheKey
+}
+
+type bcacheKey struct {
+	cacheKey  string
+	extentKey *proto.ExtentKey
 }
 
 // NewStreamer returns a new streamer.
@@ -69,7 +78,9 @@ func NewStreamer(client *ExtentClient, inode uint64) *Streamer {
 	s.done = make(chan struct{})
 	s.dirtylist = NewDirtyExtentList()
 	s.isOpen = true
+	s.pendingCache = make(chan bcacheKey, 1)
 	go s.server()
+	go s.asyncBlockCache()
 	return s
 }
 
@@ -101,6 +112,11 @@ func (s *Streamer) GetExtentReader(ek *proto.ExtentKey) (*ExtentReader, error) {
 	partition, err := s.client.dataWrapper.GetDataPartition(ek.PartitionId)
 	if err != nil {
 		return nil, err
+	}
+
+	if partition.IsDiscard {
+		log.LogWarnf("GetExtentReader: datapartition %v is discard", partition.PartitionID)
+		return nil, DpDiscardError
 	}
 
 	retryRead := true
@@ -172,69 +188,58 @@ func (s *Streamer) read(data []byte, offset int, size int) (total int, err error
 			total += req.Size
 			log.LogDebugf("Stream read hole: ino(%v) req(%v) total(%v)", s.inode, req, total)
 		} else {
+			log.LogDebugf("Stream read: ino(%v) req(%v) s.needBCache(%v) s.client.bcacheEnable(%v)", s.inode, req, s.needBCache, s.client.bcacheEnable)
+			if s.needBCache {
+				bcacheMetric := exporter.NewCounter("fileReadL1Cache")
+				bcacheMetric.AddWithLabels(1, map[string]string{exporter.Vol: s.client.volumeName})
+			}
+
 			//skip hole,ek is not nil,read block cache firstly
-			cacheKey := util.GenerateRepVolKey(s.client.volumeName, s.inode, req.ExtentKey.ExtentId, req.ExtentKey.FileOffset)
 			log.LogDebugf("Stream read: ino(%v) req(%v) s.client.bcacheEnable(%v) s.needBCache(%v)", s.inode, req, s.client.bcacheEnable, s.needBCache)
-			if s.client.bcacheEnable && s.needBCache && filesize <= bcache.MaxBlockSize {
-				//todo offset is ok for tinyextent?
+			cacheKey := util.GenerateRepVolKey(s.client.volumeName, s.inode, req.ExtentKey.PartitionId, req.ExtentKey.ExtentId, req.ExtentKey.FileOffset)
+			if s.client.bcacheEnable && s.needBCache && filesize <= bcache.MaxFileSize {
 				offset := req.FileOffset - int(req.ExtentKey.FileOffset)
 				if s.client.loadBcache != nil {
 					readBytes, err = s.client.loadBcache(cacheKey, req.Data, uint64(offset), uint32(req.Size))
 					if err == nil && readBytes == req.Size {
 						total += req.Size
+						bcacheMetric := exporter.NewCounter("fileReadL1CacheHit")
+						bcacheMetric.AddWithLabels(1, map[string]string{exporter.Vol: s.client.volumeName})
 						log.LogDebugf("TRACE Stream read. hit blockCache: ino(%v) cacheKey(%v) readBytes(%v) err(%v)", s.inode, cacheKey, readBytes, err)
 						continue
 					}
 				}
 				log.LogDebugf("TRACE Stream read. miss blockCache cacheKey(%v) loadBcache(%v)", cacheKey, s.client.loadBcache)
 			}
+
+			if s.needBCache {
+				bcacheMetric := exporter.NewCounter("fileReadL1CacheMiss")
+				bcacheMetric.AddWithLabels(1, map[string]string{exporter.Vol: s.client.volumeName})
+			}
+
 			//read extent
 			reader, err = s.GetExtentReader(req.ExtentKey)
 			if err != nil {
 				break
 			}
 
-			// todo :  optimization
-			var needCache = false
-			if _, ok := s.inflightL1cache.Load(cacheKey); !ok && s.client.bcacheEnable && s.needBCache {
-				s.inflightL1cache.Store(cacheKey, true)
-				needCache = true
-			}
-
-			var buf []byte
-			if needCache && filesize <= bcache.MaxBlockSize {
-				//read full extent
-				buf = make([]byte, req.ExtentKey.Size)
-				fullReq := NewExtentRequest(int(req.ExtentKey.FileOffset), int(req.ExtentKey.Size), buf, req.ExtentKey)
-				readBytes, err = reader.Read(fullReq)
-				if err != nil || readBytes != len(buf) {
-					s.inflightL1cache.Delete(cacheKey)
-					log.LogErrorf("ERROR Stream read. read full extent error. fullReq(%v) readBytes(%v) err(%v)", fullReq, readBytes, err)
-					return
-				}
-
-				extentOffset := req.FileOffset - int(req.ExtentKey.FileOffset)
-				readBytes = copy(req.Data, buf[extentOffset:extentOffset+req.Size])
-
-				go func(cacheKey string, buf []byte) {
-					if s.client.cacheBcache != nil {
-						log.LogDebugf("TRACE read. write blockCache cacheKey(%v) len_buf(%v),", cacheKey, len(buf))
-						s.client.cacheBcache(cacheKey, buf)
-					} else {
-						log.LogErrorf("TRACE Stream read. write blockCache is nil,loadBcache(%v)", s.client.loadBcache)
+			if s.client.bcacheEnable && s.needBCache && filesize <= bcache.MaxFileSize {
+				//limit big block cache
+				if s.exceedBlockSize(req.ExtentKey.Size) && atomic.LoadInt32(&s.client.inflightL1BigBlock) > 10 {
+					//do nothing
+				} else {
+					select {
+					case s.pendingCache <- bcacheKey{cacheKey: cacheKey, extentKey: req.ExtentKey}:
+						if s.exceedBlockSize(req.ExtentKey.Size) {
+							atomic.AddInt32(&s.client.inflightL1BigBlock, 1)
+						}
+					default:
 					}
-					s.inflightL1cache.Delete(cacheKey)
-				}(cacheKey, buf)
-
-				log.LogDebugf("TRACE Stream read. read full extent Exit. fullReq(%v) readBytes(%v) err(%v)", fullReq, readBytes, err)
-			} else {
-				readBytes, err = reader.Read(req)
-				if err != nil || readBytes != req.Size {
-					log.LogErrorf("ERROR Stream read. read error. req(%v) readBytes(%v) err(%v)", req, readBytes, err)
-					return
 				}
+
 			}
 
+			readBytes, err = reader.Read(req)
 			log.LogDebugf("TRACE Stream read: ino(%v) req(%v) readBytes(%v) err(%v)", s.inode, req, readBytes, err)
 
 			total += readBytes
@@ -249,4 +254,64 @@ func (s *Streamer) read(data []byte, offset int, size int) (total int, err error
 	}
 	//log.LogErrorf("==========> Streamer Read Exit, inode(%v), time[%v us].", s.inode, time.Since(t1).Microseconds())
 	return
+}
+
+func (s *Streamer) asyncBlockCache() {
+	if !s.needBCache || !s.isOpen {
+		return
+	}
+	t := time.NewTicker(3 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case pending := <-s.pendingCache:
+			ek := pending.extentKey
+			cacheKey := pending.cacheKey
+			log.LogDebugf("asyncBlockCache: cacheKey=(%v) ek=(%v)", cacheKey, ek)
+
+			//read full extent
+			var data []byte
+			if ek.Size == bcache.MaxBlockSize {
+				data = buf.BCachePool.Get()
+			} else {
+				data = make([]byte, ek.Size)
+			}
+			reader, err := s.GetExtentReader(ek)
+			fullReq := NewExtentRequest(int(ek.FileOffset), int(ek.Size), data, ek)
+			readBytes, err := reader.Read(fullReq)
+			if err != nil || readBytes != len(data) {
+				log.LogWarnf("asyncBlockCache: Stream read full extent error. fullReq(%v) readBytes(%v) err(%v)", fullReq, readBytes, err)
+				if ek.Size == bcache.MaxBlockSize {
+					buf.BCachePool.Put(data)
+				}
+				if s.exceedBlockSize(ek.Size) {
+					atomic.AddInt32(&s.client.inflightL1BigBlock, -1)
+				}
+				return
+			}
+			if s.client.cacheBcache != nil {
+				log.LogDebugf("TRACE read. write blockCache cacheKey(%v) len_buf(%v),", cacheKey, len(data))
+				s.client.cacheBcache(cacheKey, data)
+			}
+			if ek.Size == bcache.MaxBlockSize {
+				buf.BCachePool.Put(data)
+			}
+			if s.exceedBlockSize(ek.Size) {
+				atomic.AddInt32(&s.client.inflightL1BigBlock, -1)
+			}
+		case <-t.C:
+			if s.refcnt <= 0 {
+				s.isOpen = false
+				return
+			}
+		}
+
+	}
+}
+
+func (s *Streamer) exceedBlockSize(size uint32) bool {
+	if size > bcache.BigExtentSize {
+		return true
+	}
+	return false
 }

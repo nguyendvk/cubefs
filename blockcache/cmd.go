@@ -17,12 +17,9 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/cubefs/cubefs/util/stat"
-	"golang.org/x/net/context"
 	syslog "log"
-	"net"
 	"net/http"
-	_ "net/http/pprof"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path"
@@ -38,6 +35,7 @@ import (
 	"github.com/cubefs/cubefs/util/config"
 	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/log"
+	"github.com/cubefs/cubefs/util/stat"
 	sysutil "github.com/cubefs/cubefs/util/sys"
 	"github.com/cubefs/cubefs/util/ump"
 	"github.com/jacobsa/daemonize"
@@ -76,9 +74,11 @@ func interceptSignal(s common.Server) {
 	signal.Notify(sigC, syscall.SIGINT, syscall.SIGTERM)
 	syslog.Println("action[interceptSignal] register system signal.")
 	go func() {
-		sig := <-sigC
-		syslog.Printf("action[interceptSignal] received signal: %s.", sig.String())
-		s.Shutdown()
+		for {
+			sig := <-sigC
+			syslog.Printf("action[interceptSignal] received signal: %s. pid %d", sig.String(), os.Getpid())
+			s.Shutdown()
+		}
 	}()
 }
 
@@ -106,7 +106,6 @@ func modifyOpenFiles() (err error) {
 func main() {
 
 	if os.Args[1] == "stop" {
-		stopService()
 		os.Exit(0)
 	}
 
@@ -180,7 +179,7 @@ func main() {
 		level = log.ErrorLevel
 	}
 
-	_, err = log.InitLog(logDir, module, level, nil)
+	_, err = log.InitLog(logDir, module, level, nil, log.DefaultLogLeftSpaceLimit)
 	if err != nil {
 		err = errors.NewErrorf("Fatal: failed to init log - %v", err)
 		fmt.Println(err)
@@ -244,8 +243,24 @@ func main() {
 
 	if profPort != "" {
 		go func() {
+			mainMux := http.NewServeMux()
+			mux := http.NewServeMux()
 			http.HandleFunc(log.SetLogLevelPath, log.SetLogLevel)
-			e := http.ListenAndServe(fmt.Sprintf(":%v", profPort), nil)
+			mux.Handle("/debug/pprof", http.HandlerFunc(pprof.Index))
+			mux.Handle("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
+			mux.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
+			mux.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
+			mux.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
+			mux.Handle("/debug/", http.HandlerFunc(pprof.Index))
+			mainHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if strings.HasPrefix(req.URL.Path, "/debug/") {
+					mux.ServeHTTP(w, req)
+				} else {
+					http.DefaultServeMux.ServeHTTP(w, req)
+				}
+			})
+			mainMux.Handle("/", mainHandler)
+			e := http.ListenAndServe(fmt.Sprintf(":%v", profPort), mainMux)
 			if e != nil {
 				log.LogFlush()
 				err = errors.NewErrorf("cannot listen pprof %v err %v", profPort, err)
@@ -299,31 +314,4 @@ func startDaemon() error {
 	}
 
 	return nil
-}
-
-func stopService() {
-	httpc := http.Client{
-		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return net.DialTimeout("unix", UnixSocketPath, DefaultTimeOut)
-			},
-			MaxConnsPerHost:     20,
-			IdleConnTimeout:     DefaultTimeOut,
-			MaxIdleConnsPerHost: 20,
-		},
-		Timeout: DefaultTimeOut,
-	}
-	req, err := http.NewRequest(http.MethodHead, UnixSocketStopUrl, nil)
-	if err != nil {
-		fmt.Println("Stop failed:", err.Error())
-		return
-	}
-	res, err := httpc.Do(req)
-	if err != nil {
-		if res == nil {
-			fmt.Println("Stop failed: Service not started.")
-		} else {
-			fmt.Println("Stop failed:", err.Error())
-		}
-	}
 }

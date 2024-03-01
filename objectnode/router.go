@@ -50,6 +50,14 @@ func (o *ObjectNode) registerApiRouters(router *mux.Router) {
 
 	var registerBucketHttpGetRouters = func(r *mux.Router) {
 
+		// Get Object Lock configuration
+		// API reference: https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectLockConfiguration.html
+		// Notes: unsupported operation
+		r.NewRoute().Name(ActionToUniqueRouteName(proto.OSSGetObjectLockConfigurationAction)).
+			Methods(http.MethodGet).
+			Queries("object-lock", "").
+			HandlerFunc(o.unsupportedOperationHandler)
+
 		// List parts
 		// API reference: https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListParts.html
 		r.NewRoute().Name(ActionToUniqueRouteName(proto.OSSListPartsAction)).
@@ -142,7 +150,7 @@ func (o *ObjectNode) registerApiRouters(router *mux.Router) {
 		r.NewRoute().Name(ActionToUniqueRouteName(proto.OSSGetBucketLocationAction)).
 			Methods(http.MethodGet).
 			Queries("location", "").
-			HandlerFunc(o.getBucketLocation)
+			HandlerFunc(o.getBucketLocationHandler)
 
 		// Get bucket policy
 		// API reference: https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketPolicy.html
@@ -287,16 +295,22 @@ func (o *ObjectNode) registerApiRouters(router *mux.Router) {
 	}
 
 	var registerBucketHttpPutRouters = func(r *mux.Router) {
+		// Put Object Lock configuration
+		// API reference: https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectLockConfiguration.html
+		// Notes: unsupported operation
+		r.NewRoute().Name(ActionToUniqueRouteName(proto.OSSPutObjectLockConfigurationAction)).
+			Methods(http.MethodPut).
+			Queries("object-lock", "").
+			HandlerFunc(o.unsupportedOperationHandler)
 
 		// Upload part copy
 		// API reference: https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPartCopy.html
-		// Notes: unsupported operation
 		r.NewRoute().Name(ActionToUniqueRouteName(proto.OSSUploadPartCopyAction)).
 			Methods(http.MethodPut).
 			Path("/{object:.+}").
 			HeadersRegexp(HeaderNameXAmzCopySource, ".*?(\\/|%2F).*?").
 			Queries("partNumber", "{partNumber:[0-9]+}", "uploadId", "{uploadId:.*}").
-			HandlerFunc(o.unsupportedOperationHandler)
+			HandlerFunc(o.uploadPartCopyHandler)
 
 		// Upload part
 		// API reference: https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPart.html .
@@ -562,7 +576,6 @@ func (o *ObjectNode) registerApiRouters(router *mux.Router) {
 		// https://docs.aws.amazon.com/AmazonS3/latest/API/RESTOPTIONSobject.html
 		r.NewRoute().Name(ActionToUniqueRouteName(proto.OSSOptionsObjectAction)).
 			Methods(http.MethodOptions).
-			Path("/{object:.+}").
 			HandlerFunc(o.optionsObjectHandler)
 	}
 

@@ -15,10 +15,12 @@
 package metanode
 
 import (
-	"github.com/cubefs/cubefs/util"
-	"github.com/xtaci/smux"
+	"fmt"
 	"io"
 	"net"
+
+	"github.com/cubefs/cubefs/util"
+	"github.com/xtaci/smux"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util/log"
@@ -28,7 +30,13 @@ import (
 func (m *MetaNode) startServer() (err error) {
 	// initialize and start the server.
 	m.httpStopC = make(chan uint8)
-	ln, err := net.Listen("tcp", ":"+m.listen)
+
+	addr := fmt.Sprintf(":%s", m.listen)
+	if m.bindIp {
+		addr = fmt.Sprintf("%s:%s", m.localAddr, m.listen)
+	}
+
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return
 	}
@@ -64,7 +72,11 @@ func (m *MetaNode) stopServer() {
 
 // Read data from the specified tcp connection until the connection is closed by the remote or the tcp service is down.
 func (m *MetaNode) serveConn(conn net.Conn, stopC chan uint8) {
-	defer conn.Close()
+	defer func() {
+		conn.Close()
+		m.RemoveConnection()
+	}()
+	m.AddConnection()
 	c := conn.(*net.TCPConn)
 	c.SetKeepAlive(true)
 	c.SetNoDelay(true)
@@ -98,7 +110,12 @@ func (m *MetaNode) handlePacket(conn net.Conn, p *Packet,
 func (m *MetaNode) startSmuxServer() (err error) {
 	// initialize and start the server.
 	m.smuxStopC = make(chan uint8)
-	addr := util.ShiftAddrPort(":"+m.listen, smuxPortShift)
+
+	ipPort := fmt.Sprintf(":%s", m.listen)
+	if m.bindIp {
+		ipPort = fmt.Sprintf("%s:%s", m.localAddr, m.listen)
+	}
+	addr := util.ShiftAddrPort(ipPort, smuxPortShift)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return
@@ -139,7 +156,11 @@ func (m *MetaNode) stopSmuxServer() {
 }
 
 func (m *MetaNode) serveSmuxConn(conn net.Conn, stopC chan uint8) {
-	defer conn.Close()
+	defer func() {
+		conn.Close()
+		m.RemoveConnection()
+	}()
+	m.AddConnection()
 	c := conn.(*net.TCPConn)
 	c.SetKeepAlive(true)
 	c.SetNoDelay(true)

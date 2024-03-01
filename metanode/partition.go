@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"os"
 	"path"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,22 +30,25 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cubefs/blobstore/api/access"
+	"github.com/cubefs/cubefs/blobstore/api/access"
 	"github.com/cubefs/cubefs/cmd/common"
+	raftproto "github.com/cubefs/cubefs/depends/tiglabs/raft/proto"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/raftstore"
-
-	raftproto "github.com/cubefs/cubefs/depends/tiglabs/raft/proto"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/log"
-	"github.com/hashicorp/consul/api"
 )
+
+// NOTE: if the operation is invoked by local machine
+// the remote addr is "127.0.0.1"
+const localAddrForAudit = "127.0.0.1"
 
 var (
 	ErrIllegalHeartbeatAddress = errors.New("illegal heartbeat address")
 	ErrIllegalReplicateAddress = errors.New("illegal replicate address")
+	ErrSnapshotCrcMismatch     = errors.New("snapshot crc not match")
 )
 
 // Errors
@@ -75,6 +79,7 @@ type MetaPartitionConfig struct {
 	PartitionType int                 `json:"partition_type"`
 	Peers         []proto.Peer        `json:"peers"` // Peers information of the raftStore
 	Cursor        uint64              `json:"-"`     // Cursor ID of the inode that have been assigned
+	UniqId        uint64              `json:"-"`
 	NodeId        uint64              `json:"-"`
 	RootDir       string              `json:"-"`
 	BeforeStart   func()              `json:"-"`
@@ -114,24 +119,31 @@ func (c *MetaPartitionConfig) sortPeers() {
 
 // OpInode defines the interface for the inode operations.
 type OpInode interface {
-	CreateInode(req *CreateInoReq, p *Packet) (err error)
-	UnlinkInode(req *UnlinkInoReq, p *Packet) (err error)
-	UnlinkInodeBatch(req *BatchUnlinkInoReq, p *Packet) (err error)
+	CreateInode(req *CreateInoReq, p *Packet, remoteAddr string) (err error)
+	UnlinkInode(req *UnlinkInoReq, p *Packet, remoteAddr string) (err error)
+	UnlinkInodeBatch(req *BatchUnlinkInoReq, p *Packet, remoteAddr string) (err error)
 	InodeGet(req *InodeGetReq, p *Packet) (err error)
 	InodeGetBatch(req *InodeGetReqBatch, p *Packet) (err error)
-	CreateInodeLink(req *LinkInodeReq, p *Packet) (err error)
-	EvictInode(req *EvictInodeReq, p *Packet) (err error)
-	EvictInodeBatch(req *BatchEvictInodeReq, p *Packet) (err error)
+	CreateInodeLink(req *LinkInodeReq, p *Packet, remoteAddr string) (err error)
+	EvictInode(req *EvictInodeReq, p *Packet, remoteAddr string) (err error)
+	EvictInodeBatch(req *BatchEvictInodeReq, p *Packet, remoteAddr string) (err error)
 	SetAttr(reqData []byte, p *Packet) (err error)
 	GetInodeTree() *BTree
-	DeleteInode(req *proto.DeleteInodeRequest, p *Packet) (err error)
-	DeleteInodeBatch(req *proto.DeleteInodeBatchRequest, p *Packet) (err error)
+	GetInodeTreeLen() int
+	DeleteInode(req *proto.DeleteInodeRequest, p *Packet, remoteAddr string) (err error)
+	DeleteInodeBatch(req *proto.DeleteInodeBatchRequest, p *Packet, remoteAddr string) (err error)
 	ClearInodeCache(req *proto.ClearInodeCacheRequest, p *Packet) (err error)
+	TxCreateInode(req *proto.TxCreateInodeRequest, p *Packet, remoteAddr string) (err error)
+	TxUnlinkInode(req *proto.TxUnlinkInodeRequest, p *Packet, remoteAddr string) (err error)
+	TxCreateInodeLink(req *proto.TxLinkInodeRequest, p *Packet, remoteAddr string) (err error)
+	QuotaCreateInode(req *proto.QuotaCreateInodeRequest, p *Packet, remoteAddr string) (err error)
 }
 
 type OpExtend interface {
 	SetXAttr(req *proto.SetXAttrRequest, p *Packet) (err error)
+	BatchSetXAttr(req *proto.BatchSetXAttrRequest, p *Packet) (err error)
 	GetXAttr(req *proto.GetXAttrRequest, p *Packet) (err error)
+	GetAllXAttr(req *proto.GetAllXAttrRequest, p *Packet) (err error)
 	BatchGetXAttr(req *proto.BatchGetXAttrRequest, p *Packet) (err error)
 	RemoveXAttr(req *proto.RemoveXAttrRequest, p *Packet) (err error)
 	ListXAttr(req *proto.ListXAttrRequest, p *Packet) (err error)
@@ -140,15 +152,31 @@ type OpExtend interface {
 
 // OpDentry defines the interface for the dentry operations.
 type OpDentry interface {
-	CreateDentry(req *CreateDentryReq, p *Packet) (err error)
-	DeleteDentry(req *DeleteDentryReq, p *Packet) (err error)
-	DeleteDentryBatch(req *BatchDeleteDentryReq, p *Packet) (err error)
-	UpdateDentry(req *UpdateDentryReq, p *Packet) (err error)
+	CreateDentry(req *CreateDentryReq, p *Packet, remoteAddr string) (err error)
+	DeleteDentry(req *DeleteDentryReq, p *Packet, remoteAddr string) (err error)
+	DeleteDentryBatch(req *BatchDeleteDentryReq, p *Packet, remoteAddr string) (err error)
+	UpdateDentry(req *UpdateDentryReq, p *Packet, remoteAddr string) (err error)
 	ReadDir(req *ReadDirReq, p *Packet) (err error)
 	ReadDirLimit(req *ReadDirLimitReq, p *Packet) (err error)
 	ReadDirOnly(req *ReadDirOnlyReq, p *Packet) (err error)
 	Lookup(req *LookupReq, p *Packet) (err error)
 	GetDentryTree() *BTree
+	GetDentryTreeLen() int
+	TxCreateDentry(req *proto.TxCreateDentryRequest, p *Packet, remoteAddr string) (err error)
+	TxDeleteDentry(req *proto.TxDeleteDentryRequest, p *Packet, remoteAddr string) (err error)
+	TxUpdateDentry(req *proto.TxUpdateDentryRequest, p *Packet, remoteAddr string) (err error)
+	QuotaCreateDentry(req *proto.QuotaCreateDentryRequest, p *Packet, remoteAddr string) (err error)
+}
+
+type OpTransaction interface {
+	TxCreate(req *proto.TxCreateRequest, p *Packet) (err error)
+	TxCommitRM(req *proto.TxApplyRMRequest, p *Packet) error
+	TxRollbackRM(req *proto.TxApplyRMRequest, p *Packet) error
+	TxCommit(req *proto.TxApplyRequest, p *Packet, remoteAddr string) (err error)
+	TxRollback(req *proto.TxApplyRequest, p *Packet, remoteAddr string) (err error)
+	TxGetInfo(req *proto.TxGetInfoRequest, p *Packet) (err error)
+	TxGetCnt() (uint64, uint64, uint64)
+	TxGetTree() (*BTree, *BTree, *BTree)
 }
 
 // OpExtent defines the interface for the extent operations.
@@ -158,7 +186,7 @@ type OpExtent interface {
 	BatchObjExtentAppend(req *proto.AppendObjExtentKeysRequest, p *Packet) (err error)
 	ExtentsList(req *proto.GetExtentsRequest, p *Packet) (err error)
 	ObjExtentsList(req *proto.GetExtentsRequest, p *Packet) (err error)
-	ExtentsTruncate(req *ExtentsTruncateReq, p *Packet) (err error)
+	ExtentsTruncate(req *ExtentsTruncateReq, p *Packet, remoteAddr string) (err error)
 	BatchExtentAppend(req *proto.AppendExtentKeysRequest, p *Packet) (err error)
 	// ExtentsDelete(req *proto.DelExtentKeyRequest, p *Packet) (err error)
 }
@@ -169,6 +197,9 @@ type OpMultipart interface {
 	AppendMultipart(req *proto.AddMultipartPartRequest, p *Packet) (err error)
 	RemoveMultipart(req *proto.RemoveMultipartRequest, p *Packet) (err error)
 	ListMultipart(req *proto.ListMultipartRequest, p *Packet) (err error)
+	GetUidInfo() (info []*proto.UidReportSpaceInfo)
+	SetUidLimit(info []*proto.UidSpaceInfo)
+	SetTxInfo(info []*proto.TxInfo)
 }
 
 // OpMeta defines the interface for the metadata operations.
@@ -179,12 +210,17 @@ type OpMeta interface {
 	OpPartition
 	OpExtend
 	OpMultipart
+	OpTransaction
+	OpQuota
 }
 
 // OpPartition defines the interface for the partition operations.
 type OpPartition interface {
 	IsLeader() (leaderAddr string, isLeader bool)
+	IsFollowerRead() bool
+	SetFollowerRead(bool)
 	GetCursor() uint64
+	GetUniqId() uint64
 	GetBaseConfig() MetaPartitionConfig
 	ResponseLoadMetaPartition(p *Packet) (err error)
 	PersistMetadata() (err error)
@@ -196,33 +232,235 @@ type OpPartition interface {
 	TryToLeader(groupID uint64) error
 	CanRemoveRaftMember(peer proto.Peer) error
 	IsEquareCreateMetaPartitionRequst(request *proto.CreateMetaPartitionRequest) (err error)
+	GetUniqID(p *Packet, num uint32) (err error)
 }
 
 // MetaPartition defines the interface for the meta partition operations.
 type MetaPartition interface {
-	Start() error
+	Start(isCreate bool) error
 	Stop()
 	DataSize() uint64
+	GetFreeListLen() int
 	OpMeta
 	LoadSnapshot(path string) error
 	ForceSetMetaPartitionToLoadding()
 	ForceSetMetaPartitionToFininshLoad()
+	IsEnableAuditLog() bool
+	SetEnableAuditLog(status bool)
+	UpdateVolumeView(dataView *proto.DataPartitionsView, volumeView *proto.SimpleVolView)
+}
+
+type UidManager struct {
+	accumDelta        *sync.Map
+	accumBase         *sync.Map
+	accumRebuildDelta *sync.Map // snapshot redoLog
+	accumRebuildBase  *sync.Map // snapshot mirror
+	uidAcl            *sync.Map
+	lastUpdateTime    time.Time
+	enable            bool
+	rbuilding         bool
+	volName           string
+	acLock            sync.RWMutex
+	mpID              uint64
+}
+
+func NewUidMgr(volName string, mpID uint64) (mgr *UidManager) {
+	mgr = &UidManager{
+		volName:           volName,
+		mpID:              mpID,
+		accumDelta:        new(sync.Map),
+		accumBase:         new(sync.Map),
+		accumRebuildDelta: new(sync.Map),
+		accumRebuildBase:  new(sync.Map),
+		uidAcl:            new(sync.Map),
+	}
+	var uid uint32
+	mgr.uidAcl.Store(uid, false)
+	log.LogDebugf("NewUidMgr init")
+	return
+}
+
+func (uMgr *UidManager) addUidSpace(uid uint32, inode uint64, eks []proto.ExtentKey) (status uint8) {
+	uMgr.acLock.Lock()
+	defer uMgr.acLock.Unlock()
+
+	status = proto.OpOk
+	if uMgr.getUidAcl(uid) {
+		log.LogWarnf("addUidSpace.vol %v mp[%v] uid %v be set full", uMgr.mpID, uMgr.volName, uid)
+		return proto.OpNoSpaceErr
+	}
+	if eks == nil {
+		return
+	}
+	var size int64
+	for _, ek := range eks {
+		size += int64(ek.Size)
+	}
+	if val, ok := uMgr.accumDelta.Load(uid); ok {
+		size += val.(int64)
+	}
+	uMgr.accumDelta.Store(uid, size)
+
+	if uMgr.rbuilding {
+		if val, ok := uMgr.accumRebuildDelta.Load(uid); ok {
+			size += val.(int64)
+		}
+		uMgr.accumRebuildDelta.Store(uid, size)
+	}
+	return
+}
+
+func (uMgr *UidManager) doMinusUidSpace(uid uint32, inode uint64, size uint64) {
+	uMgr.acLock.Lock()
+	defer uMgr.acLock.Unlock()
+
+	doWork := func(delta *sync.Map) {
+		var rsvSize int64
+		if val, ok := delta.Load(uid); ok {
+			delta.Store(uid, val.(int64)-int64(size))
+		} else {
+			rsvSize -= int64(size)
+			delta.Store(uid, rsvSize)
+		}
+	}
+	doWork(uMgr.accumDelta)
+	if uMgr.rbuilding {
+		doWork(uMgr.accumRebuildDelta)
+	}
+}
+
+func (uMgr *UidManager) minusUidSpace(uid uint32, inode uint64, eks []proto.ExtentKey) {
+	var size uint64
+	for _, ek := range eks {
+		size += uint64(ek.Size)
+	}
+	uMgr.doMinusUidSpace(uid, inode, size)
+}
+
+func (uMgr *UidManager) getUidAcl(uid uint32) (enable bool) {
+	if val, ok := uMgr.uidAcl.Load(uid); ok {
+		enable = val.(bool)
+	}
+	return
+}
+
+func (uMgr *UidManager) setUidAcl(info []*proto.UidSpaceInfo) {
+	uMgr.acLock.Lock()
+	defer uMgr.acLock.Unlock()
+
+	uMgr.uidAcl = new(sync.Map)
+	for _, uidInfo := range info {
+		if uidInfo.VolName != uMgr.volName {
+			continue
+		}
+		// log.LogDebugf("setUidAcl.vol %v uid %v be set enable %v", uMgr.volName, uidInfo.Uid, uidInfo.Limited)
+		uMgr.uidAcl.Store(uidInfo.Uid, uidInfo.Limited)
+	}
+}
+
+func (uMgr *UidManager) getAllUidSpace() (rsp []*proto.UidReportSpaceInfo) {
+	uMgr.acLock.RLock()
+	defer uMgr.acLock.RUnlock()
+
+	var ok bool
+
+	uMgr.accumDelta.Range(func(key, value interface{}) bool {
+		var size int64
+		size += value.(int64)
+		if baseInfo, ok := uMgr.accumBase.Load(key.(uint32)); ok {
+			size += baseInfo.(int64)
+			if size < 0 {
+				log.LogErrorf("getAllUidSpace. mp[%v] uid %v size small than 0 %v, old %v, new %v", uMgr.mpID, key.(uint32), size, value.(int64), baseInfo.(int64))
+				return false
+			}
+		}
+		uMgr.accumBase.Store(key.(uint32), size)
+		return true
+	})
+
+	uMgr.accumDelta = new(sync.Map)
+
+	uMgr.accumBase.Range(func(key, value interface{}) bool {
+		var size int64
+		if size, ok = value.(int64); !ok {
+			log.LogErrorf("getAllUidSpace. mp[%v] accumBase key %v size type %v", uMgr.mpID, reflect.TypeOf(key), reflect.TypeOf(value))
+			return false
+		}
+		rsp = append(rsp, &proto.UidReportSpaceInfo{
+			Uid:  key.(uint32),
+			Size: uint64(size),
+		})
+		// log.LogDebugf("getAllUidSpace. mp[%v] accumBase uid %v size %v", uMgr.mpID, key.(uint32), size)
+		return true
+	})
+
+	return
+}
+
+func (uMgr *UidManager) accumRebuildStart() bool {
+	uMgr.acLock.Lock()
+	defer uMgr.acLock.Unlock()
+	log.LogDebugf("accumRebuildStart vol [%v] mp[%v] rbuilding [%v]", uMgr.volName, uMgr.mpID, uMgr.rbuilding)
+	if uMgr.rbuilding {
+		return false
+	}
+	uMgr.rbuilding = true
+	return true
+}
+
+func (uMgr *UidManager) accumRebuildFin(rebuild bool) {
+	uMgr.acLock.Lock()
+	defer uMgr.acLock.Unlock()
+	log.LogDebugf("accumRebuildFin rebuild vol %v, mp:[%v],%v:%v, rebuild:[%v]", uMgr.volName, uMgr.mpID,
+		uMgr.accumRebuildBase, uMgr.accumRebuildDelta, rebuild)
+	uMgr.rbuilding = false
+	if !rebuild {
+		uMgr.accumRebuildBase = new(sync.Map)
+		uMgr.accumRebuildDelta = new(sync.Map)
+		return
+	}
+	uMgr.accumBase = uMgr.accumRebuildBase
+	uMgr.accumDelta = uMgr.accumRebuildDelta
+	uMgr.accumRebuildBase = new(sync.Map)
+	uMgr.accumRebuildDelta = new(sync.Map)
+
+}
+
+func (uMgr *UidManager) accumInoUidSize(ino *Inode, accum *sync.Map) {
+	size := ino.GetSpaceSize()
+	if val, ok := accum.Load(ino.Uid); ok {
+		size += uint64(val.(int64))
+	}
+	accum.Store(ino.Uid, int64(size))
+}
+
+type OpQuota interface {
+	setQuotaHbInfo(infos []*proto.QuotaHeartBeatInfo)
+	getQuotaReportInfos() (infos []*proto.QuotaReportInfo)
+	batchSetInodeQuota(req *proto.BatchSetMetaserverQuotaReuqest,
+		resp *proto.BatchSetMetaserverQuotaResponse) (err error)
+	batchDeleteInodeQuota(req *proto.BatchDeleteMetaserverQuotaReuqest,
+		resp *proto.BatchDeleteMetaserverQuotaResponse) (err error)
+	getInodeQuota(inode uint64, p *Packet) (err error)
 }
 
 // metaPartition manages the range of the inode IDs.
 // When a new inode is requested, it allocates a new inode id for this inode if possible.
 // States:
-//  +-----+             +-------+
-//  | New | → Restore → | Ready |
-//  +-----+             +-------+
+//
+//	+-----+             +-------+
+//	| New | → Restore → | Ready |
+//	+-----+             +-------+
 type metaPartition struct {
 	config                 *MetaPartitionConfig
-	size                   uint64 // For partition all file size
-	applyID                uint64 // Inode/Dentry max applyID, this index will be update after restoring from the dumped data.
-	dentryTree             *BTree
-	inodeTree              *BTree // btree for inodes
-	extendTree             *BTree // btree for inode extend (XAttr) management
-	multipartTree          *BTree // collection for multipart management
+	size                   uint64                // For partition all file size
+	applyID                uint64                // Inode/Dentry max applyID, this index will be update after restoring from the dumped data.
+	storedApplyId          uint64                // update after store snapshot to disk
+	dentryTree             *BTree                // btree for dentries
+	inodeTree              *BTree                // btree for inodes
+	extendTree             *BTree                // btree for inode extend (XAttr) management
+	multipartTree          *BTree                // collection for multipart management
+	txProcessor            *TransactionProcessor // transction processor
 	raftPartition          raftstore.Partition
 	stopC                  chan bool
 	storeChan              chan *storeMsg
@@ -237,7 +475,36 @@ type metaPartition struct {
 	summaryLock            sync.Mutex
 	ebsClient              *blobstore.BlobStoreClient
 	volType                int
+	isFollowerRead         bool
+	uidManager             *UidManager
 	xattrLock              sync.Mutex
+	fileRange              []int64
+	mqMgr                  *MetaQuotaManager
+	nonIdempotent          sync.Mutex
+	uniqChecker            *uniqChecker
+	enableAuditLog         bool
+}
+
+func (mp *metaPartition) IsEnableAuditLog() bool {
+	return mp.enableAuditLog
+}
+
+func (mp *metaPartition) SetEnableAuditLog(status bool) {
+	mp.enableAuditLog = status
+}
+
+func (mp *metaPartition) acucumRebuildStart() bool {
+	return mp.uidManager.accumRebuildStart()
+}
+func (mp *metaPartition) acucumRebuildFin(rebuild bool) {
+	mp.uidManager.accumRebuildFin(rebuild)
+}
+func (mp *metaPartition) acucumUidSizeByStore(ino *Inode) {
+	mp.uidManager.accumInoUidSize(ino, mp.uidManager.accumRebuildBase)
+}
+
+func (mp *metaPartition) acucumUidSizeByLoad(ino *Inode) {
+	mp.uidManager.accumInoUidSize(ino, mp.uidManager.accumBase)
 }
 
 func (mp *metaPartition) updateSize() {
@@ -276,8 +543,12 @@ func (mp *metaPartition) DataSize() uint64 {
 	return mp.size
 }
 
+func (mp *metaPartition) GetFreeListLen() int {
+	return mp.freeList.Len()
+}
+
 // Start starts a meta partition.
-func (mp *metaPartition) Start() (err error) {
+func (mp *metaPartition) Start(isCreate bool) (err error) {
 	if atomic.CompareAndSwapUint32(&mp.state, common.StateStandby, common.StateStart) {
 		defer func() {
 			var newState uint32
@@ -291,7 +562,7 @@ func (mp *metaPartition) Start() (err error) {
 		if mp.config.BeforeStart != nil {
 			mp.config.BeforeStart()
 		}
-		if err = mp.onStart(); err != nil {
+		if err = mp.onStart(isCreate); err != nil {
 			err = errors.NewErrorf("[Start]->%s", err.Error())
 			return
 		}
@@ -318,50 +589,46 @@ func (mp *metaPartition) Stop() {
 	}
 }
 
-func (mp *metaPartition) onStart() (err error) {
+func (mp *metaPartition) onStart(isCreate bool) (err error) {
 	defer func() {
 		if err == nil {
 			return
 		}
 		mp.onStop()
 	}()
-	if err = mp.load(); err != nil {
+	if err = mp.load(isCreate); err != nil {
 		err = errors.NewErrorf("[onStart] load partition id=%d: %s",
 			mp.config.PartitionId, err.Error())
 		return
 	}
-	mp.startSchedule(mp.applyID)
+	mp.startScheduleTask()
 	if err = mp.startFreeList(); err != nil {
 		err = errors.NewErrorf("[onStart] start free list id=%d: %s",
 			mp.config.PartitionId, err.Error())
 		return
 	}
-	if err = mp.startRaft(); err != nil {
-		err = errors.NewErrorf("[onStart] start raft id=%d: %s",
-			mp.config.PartitionId, err.Error())
-		return
-	}
 
 	// set EBS Client
-	clusterInfo, cerr := masterClient.AdminAPI().GetClusterInfo()
-	if cerr != nil {
-		err = cerr
+	if clusterInfo, err = masterClient.AdminAPI().GetClusterInfo(); err != nil {
 		log.LogErrorf("action[onStart] GetClusterInfo err[%v]", err)
 		return
 	}
-	volumeInfo, verr := masterClient.AdminAPI().GetVolumeSimpleInfo(mp.config.VolName)
-	if verr != nil {
-		err = verr
+
+	var volumeInfo *proto.SimpleVolView
+	if volumeInfo, err = masterClient.AdminAPI().GetVolumeSimpleInfo(mp.config.VolName); err != nil {
 		log.LogErrorf("action[onStart] GetVolumeSimpleInfo err[%v]", err)
 		return
 	}
+
+	mp.vol.volDeleteLockTime = volumeInfo.DeleteLockTime
+
 	mp.volType = volumeInfo.VolType
 	var ebsClient *blobstore.BlobStoreClient
-	if clusterInfo.EbsAddr != "" {
+	if clusterInfo.EbsAddr != "" && proto.IsCold(mp.volType) {
 		ebsClient, err = blobstore.NewEbsClient(
 			access.Config{
 				ConnMode: access.NoLimitConnMode,
-				Consul: api.Config{
+				Consul: access.ConsulConfig{
 					Address: clusterInfo.EbsAddr,
 				},
 				MaxSizePutOnce: int64(volumeInfo.ObjBlockSize),
@@ -380,8 +647,11 @@ func (mp *metaPartition) onStart() (err error) {
 		mp.ebsClient = ebsClient
 	}
 
-	if proto.IsHot(mp.volType) {
-		log.LogInfof("hot vol not need updateSize & cacheTTL")
+	go mp.startCheckerEvict()
+
+	if err = mp.startRaft(); err != nil {
+		err = errors.NewErrorf("[onStart] start raft id=%d: %s",
+			mp.config.PartitionId, err.Error())
 		return
 	}
 
@@ -394,6 +664,11 @@ func (mp *metaPartition) onStart() (err error) {
 		return
 	}
 	return
+}
+
+func (mp *metaPartition) startScheduleTask() {
+	mp.startSchedule(mp.applyID)
+	mp.startFileStats()
 }
 
 func (mp *metaPartition) onStop() {
@@ -475,20 +750,49 @@ func (mp *metaPartition) getRaftPort() (heartbeat, replica int, err error) {
 // NewMetaPartition creates a new meta partition with the specified configuration.
 func NewMetaPartition(conf *MetaPartitionConfig, manager *metadataManager) MetaPartition {
 	mp := &metaPartition{
-		config:        conf,
-		dentryTree:    NewBtree(),
-		inodeTree:     NewBtree(),
-		extendTree:    NewBtree(),
-		multipartTree: NewBtree(),
-		stopC:         make(chan bool),
-		storeChan:     make(chan *storeMsg, 100),
-		freeList:      newFreeList(),
-		extDelCh:      make(chan []proto.ExtentKey, defaultDelExtentsCnt),
-		extReset:      make(chan struct{}),
-		vol:           NewVol(),
-		manager:       manager,
+		config:         conf,
+		dentryTree:     NewBtree(),
+		inodeTree:      NewBtree(),
+		extendTree:     NewBtree(),
+		multipartTree:  NewBtree(),
+		stopC:          make(chan bool),
+		storeChan:      make(chan *storeMsg, 100),
+		freeList:       newFreeList(),
+		extDelCh:       make(chan []proto.ExtentKey, defaultDelExtentsCnt),
+		extReset:       make(chan struct{}),
+		vol:            NewVol(),
+		manager:        manager,
+		uniqChecker:    newUniqChecker(),
+		enableAuditLog: true,
 	}
+	mp.txProcessor = NewTransactionProcessor(mp)
 	return mp
+}
+
+// IsLeader returns the raft leader address and if the current meta partition is the leader.
+func (mp *metaPartition) SetFollowerRead(fRead bool) {
+	if mp.raftPartition == nil {
+		return
+	}
+	mp.isFollowerRead = fRead
+	return
+}
+
+// IsLeader returns the raft leader address and if the current meta partition is the leader.
+func (mp *metaPartition) IsFollowerRead() (ok bool) {
+	if mp.raftPartition == nil {
+		return false
+	}
+
+	if !mp.isFollowerRead {
+		return false
+	}
+
+	if mp.raftPartition.IsRestoring() {
+		return false
+	}
+
+	return true
 }
 
 // IsLeader returns the raft leader address and if the current meta partition is the leader.
@@ -526,6 +830,11 @@ func (mp *metaPartition) GetCursor() uint64 {
 	return atomic.LoadUint64(&mp.config.Cursor)
 }
 
+// GetUniqId returns the uniqid stored in the config.
+func (mp *metaPartition) GetUniqId() uint64 {
+	return atomic.LoadUint64(&mp.config.UniqId)
+}
+
 // PersistMetadata is the wrapper of persistMetadata.
 func (mp *metaPartition) PersistMetadata() (err error) {
 	mp.config.sortPeers()
@@ -533,45 +842,146 @@ func (mp *metaPartition) PersistMetadata() (err error) {
 	return
 }
 
-func (mp *metaPartition) LoadSnapshot(snapshotPath string) (err error) {
-	if err = mp.loadInode(snapshotPath); err != nil {
-		return
+func (mp *metaPartition) parseCrcFromFile() ([]uint32, error) {
+	data, err := ioutil.ReadFile(path.Join(path.Join(mp.config.RootDir, snapshotDir), SnapshotSign))
+	if err != nil {
+		return nil, err
 	}
-	if err = mp.loadDentry(snapshotPath); err != nil {
-		return
+	raw := string(data)
+	crcStrs := strings.Split(raw, " ")
+
+	crcs := make([]uint32, 0, len(crcStrs))
+	for _, crcStr := range crcStrs {
+		crc, err := strconv.ParseUint(crcStr, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		crcs = append(crcs, uint32(crc))
 	}
-	if err = mp.loadExtend(snapshotPath); err != nil {
-		return
-	}
-	if err = mp.loadMultipart(snapshotPath); err != nil {
-		return
-	}
-	err = mp.loadApplyID(snapshotPath)
-	return
+
+	return crcs, nil
 }
 
-func (mp *metaPartition) load() (err error) {
+const (
+	CRC_COUNT_BASIC      int = 4
+	CRC_COUNT_TX_STUFF   int = 7
+	CRC_COUNT_UINQ_STUFF int = 8
+)
+
+func (mp *metaPartition) LoadSnapshot(snapshotPath string) (err error) {
+	crcs, err := mp.parseCrcFromFile()
+	if err != nil {
+		return err
+	}
+
+	var loadFuncs = []func(rootDir string, crc uint32) error{
+		mp.loadInode,
+		mp.loadDentry,
+		nil, //loading quota info from extend requires mp.loadInode() has been completed, so skip mp.loadExtend() here
+		mp.loadMultipart,
+	}
+
+	crc_count := len(crcs)
+	if crc_count != CRC_COUNT_BASIC && crc_count != CRC_COUNT_TX_STUFF && crc_count != CRC_COUNT_UINQ_STUFF {
+		log.LogErrorf("action[LoadSnapshot] crc array length %d not match", len(crcs))
+		return ErrSnapshotCrcMismatch
+	}
+
+	//handle compatibility in upgrade scenarios
+	needLoadTxStuff := false
+	needLoadUniqStuff := false
+	if crc_count >= CRC_COUNT_TX_STUFF {
+		needLoadTxStuff = true
+		loadFuncs = append(loadFuncs, mp.loadTxInfo)
+		loadFuncs = append(loadFuncs, mp.loadTxRbInode)
+		loadFuncs = append(loadFuncs, mp.loadTxRbDentry)
+	}
+	if crc_count == CRC_COUNT_UINQ_STUFF {
+		needLoadUniqStuff = true
+		loadFuncs = append(loadFuncs, mp.loadUniqChecker)
+	}
+
+	errs := make([]error, len(loadFuncs))
+	var wg sync.WaitGroup
+	wg.Add(len(loadFuncs))
+	for idx, f := range loadFuncs {
+		loadFunc := f
+		if f == nil {
+			wg.Done()
+			continue
+		}
+
+		i := idx
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.LogWarnf("action[LoadSnapshot] recovered when load partition partition: %v, failed: %v",
+						mp.config.PartitionId, r)
+
+					errs[i] = errors.NewErrorf("%v", r)
+				}
+
+				wg.Done()
+			}()
+
+			errs[i] = loadFunc(snapshotPath, crcs[i])
+		}()
+	}
+
+	wg.Wait()
+
+	for _, err = range errs {
+		if err != nil {
+			return
+		}
+	}
+
+	if err = mp.loadExtend(snapshotPath, crcs[2]); err != nil {
+		return
+	}
+
+	if needLoadTxStuff {
+		if err = mp.loadTxID(snapshotPath); err != nil {
+			return
+		}
+	}
+
+	if needLoadUniqStuff {
+		if err = mp.loadUniqID(snapshotPath); err != nil {
+			return
+		}
+	}
+
+	return mp.loadApplyID(snapshotPath)
+}
+
+func (mp *metaPartition) load(isCreate bool) (err error) {
 	if err = mp.loadMetadata(); err != nil {
 		return
 	}
+
+	// 1. create new metaPartition, no need to load snapshot
+	// 2. store the snapshot files for new mp, because
+	// mp.load() will check all the snapshot files when mn startup
+	if isCreate {
+		if err = mp.storeSnapshotFiles(); err != nil {
+			err = errors.NewErrorf("[onStart] storeSnapshotFiles for partition id=%d: %s",
+				mp.config.PartitionId, err.Error())
+		}
+		return
+	}
+
 	snapshotPath := path.Join(mp.config.RootDir, snapshotDir)
-	if err = mp.loadInode(snapshotPath); err != nil {
-		return
+	if _, err = os.Stat(snapshotPath); err != nil {
+		log.LogErrorf("load snapshot failed, err: %s", err.Error())
+		return nil
+
 	}
-	if err = mp.loadDentry(snapshotPath); err != nil {
-		return
-	}
-	if err = mp.loadExtend(snapshotPath); err != nil {
-		return
-	}
-	if err = mp.loadMultipart(snapshotPath); err != nil {
-		return
-	}
-	err = mp.loadApplyID(snapshotPath)
-	return
+	return mp.LoadSnapshot(snapshotPath)
 }
 
 func (mp *metaPartition) store(sm *storeMsg) (err error) {
+	log.LogWarnf("metaPartition %d store apply %v", mp.config.PartitionId, sm.applyIndex)
 	tmpDir := path.Join(mp.config.RootDir, snapshotDirTmp)
 	if _, err = os.Stat(tmpDir); err == nil {
 		// TODO Unhandled errors
@@ -594,6 +1004,10 @@ func (mp *metaPartition) store(sm *storeMsg) (err error) {
 		mp.storeDentry,
 		mp.storeExtend,
 		mp.storeMultipart,
+		mp.storeTxInfo,
+		mp.storeTxRbInode,
+		mp.storeTxRbDentry,
+		mp.storeUniqChecker,
 	}
 	for _, storeFunc := range storeFuncs {
 		var crc uint32
@@ -605,9 +1019,17 @@ func (mp *metaPartition) store(sm *storeMsg) (err error) {
 		}
 		crcBuffer.WriteString(fmt.Sprintf("%d", crc))
 	}
+	log.LogWarnf("metaPartition %d store apply %v", mp.config.PartitionId, sm.applyIndex)
 	if err = mp.storeApplyID(tmpDir, sm); err != nil {
 		return
 	}
+	if err = mp.storeTxID(tmpDir, sm); err != nil {
+		return
+	}
+	if err = mp.storeUniqID(tmpDir, sm); err != nil {
+		return
+	}
+
 	// write crc to file
 	if err = ioutil.WriteFile(path.Join(tmpDir, SnapshotSign), crcBuffer.Bytes(), 0775); err != nil {
 		return
@@ -635,6 +1057,11 @@ func (mp *metaPartition) store(sm *storeMsg) (err error) {
 		return
 	}
 	err = os.RemoveAll(backupDir)
+	if err != nil {
+		return
+	}
+
+	mp.storedApplyId = sm.applyIndex
 	return
 }
 
@@ -655,6 +1082,7 @@ func (mp *metaPartition) nextInodeID() (inodeId uint64, err error) {
 		cur := atomic.LoadUint64(&mp.config.Cursor)
 		end := mp.config.End
 		if cur >= end {
+			log.LogWarnf("nextInodeID: can't create inode again, cur %d, end %d", cur, end)
 			return 0, ErrInodeIDOutOfRange
 		}
 		newId := cur + 1
@@ -726,9 +1154,9 @@ func (mp *metaPartition) ResponseLoadMetaPartition(p *Packet) (err error) {
 		DoCompare:   true,
 	}
 	resp.MaxInode = mp.GetCursor()
-	resp.InodeCount = uint64(mp.getInodeTree().Len())
-	resp.DentryCount = uint64(mp.getDentryTree().Len())
-	resp.ApplyID = mp.applyID
+	resp.InodeCount = uint64(mp.GetInodeTreeLen())
+	resp.DentryCount = uint64(mp.GetDentryTreeLen())
+	resp.ApplyID = mp.getApplyID()
 	if err != nil {
 		err = errors.Trace(err,
 			"[ResponseLoadMetaPartition] check snapshot")
@@ -755,10 +1183,12 @@ func (mp *metaPartition) Reset() (err error) {
 	mp.inodeTree.Reset()
 	mp.dentryTree.Reset()
 	mp.config.Cursor = 0
+	mp.config.UniqId = 0
 	mp.applyID = 0
+	mp.txProcessor.Reset()
 
 	// remove files
-	filenames := []string{applyIDFile, dentryFile, inodeFile, extendFile, multipartFile}
+	filenames := []string{applyIDFile, dentryFile, inodeFile, extendFile, multipartFile, txInfoFile, txRbInodeFile, txRbDentryFile, TxIDFile}
 	for _, filename := range filenames {
 		filepath := path.Join(mp.config.RootDir, filename)
 		if err = os.Remove(filepath); err != nil {
@@ -769,7 +1199,6 @@ func (mp *metaPartition) Reset() (err error) {
 	return
 }
 
-//
 func (mp *metaPartition) canRemoveSelf() (canRemove bool, err error) {
 	var partition *proto.MetaPartitionInfo
 	if partition, err = masterClient.ClientAPI().GetMetaPartition(mp.config.PartitionId); err != nil {
@@ -847,7 +1276,7 @@ func (mp *metaPartition) doCacheTTL(cacheTTL int) (err error) {
 }
 
 func (mp *metaPartition) InodeTTLScan(cacheTTL int) {
-	curTime := Now.GetCurrentTime().Unix()
+	curTime := Now.GetCurrentTimeUnix()
 	// begin
 	count := 0
 	needSleep := false
@@ -873,7 +1302,7 @@ func (mp *metaPartition) InodeTTLScan(cacheTTL int) {
 				Inode: inode.Inode,
 			}
 			ino := NewInode(req.Inode, 0)
-			curTime = Now.GetCurrentTime().Unix()
+			curTime = Now.GetCurrentTimeUnix()
 			if inode.ModifyTime < curTime {
 				ino.ModifyTime = curTime
 			}
@@ -895,4 +1324,59 @@ func (mp *metaPartition) InodeTTLScan(cacheTTL int) {
 		}
 		return true
 	})
+}
+
+func (mp *metaPartition) initTxInfo(txInfo *proto.TransactionInfo) error {
+	txInfo.TxID = mp.txProcessor.txManager.nextTxID()
+
+	txInfo.CreateTime = time.Now().Unix()
+	txInfo.State = proto.TxStatePreCommit
+
+	if mp.txProcessor.txManager.opLimiter.Allow() {
+		return nil
+	}
+
+	return fmt.Errorf("tx create is limited")
+}
+
+func (mp *metaPartition) storeSnapshotFiles() (err error) {
+	msg := &storeMsg{
+		applyIndex:     mp.applyID,
+		txId:           mp.txProcessor.txManager.txIdAlloc.getTransactionID(),
+		inodeTree:      NewBtree(),
+		dentryTree:     NewBtree(),
+		extendTree:     NewBtree(),
+		multipartTree:  NewBtree(),
+		txTree:         NewBtree(),
+		txRbInodeTree:  NewBtree(),
+		txRbDentryTree: NewBtree(),
+		uniqId:         mp.GetUniqId(),
+		uniqChecker:    newUniqChecker(),
+	}
+
+	return mp.store(msg)
+}
+
+func (mp *metaPartition) startCheckerEvict() {
+	var timer = time.NewTimer(opCheckerInterval)
+	for {
+		select {
+		case <-timer.C:
+			if _, ok := mp.IsLeader(); ok {
+				left, evict, err := mp.uniqCheckerEvict()
+				if evict != 0 {
+					log.LogInfof("[uniqChecker] after doEvict partition-%d, left:%d, evict:%d, err:%v", mp.config.PartitionId, left, evict, err)
+				} else {
+					log.LogDebugf("[uniqChecker] after doEvict partition-%d, left:%d, evict:%d, err:%v", mp.config.PartitionId, left, evict, err)
+				}
+			}
+			timer.Reset(opCheckerInterval)
+		case <-mp.stopC:
+			return
+		}
+	}
+}
+
+func (mp *metaPartition) GetVolName() (volName string) {
+	return mp.config.VolName
 }

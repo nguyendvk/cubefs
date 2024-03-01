@@ -267,13 +267,13 @@ func handlePutAt(c *rpc.Context) {
 		return
 	}
 
-	if partRandBroken && args.Blobid%3 == 0 { // random broken
+	if partRandBroken && args.BlobID%3 == 0 { // random broken
 		c.RespondStatus(http.StatusForbidden)
 		return
 	}
 
 	token := uptoken.DecodeToken(args.Token)
-	if !token.IsValid(args.ClusterID, args.Vid, args.Blobid, uint32(args.Size), tokenPutat[:]) {
+	if !token.IsValid(args.ClusterID, args.Vid, args.BlobID, uint32(args.Size), tokenPutat[:]) {
 		c.RespondStatus(http.StatusForbidden)
 		return
 	}
@@ -288,7 +288,7 @@ func handlePutAt(c *rpc.Context) {
 		hashSumMap[alg] = hasher.Sum(nil)
 	}
 
-	dataCache.put(args.Blobid, blobBuf)
+	dataCache.put(args.BlobID, blobBuf)
 	c.RespondJSON(access.PutAtResp{HashSumMap: hashSumMap})
 }
 
@@ -296,6 +296,11 @@ func handleGet(c *rpc.Context) {
 	args := new(access.GetArgs)
 	if err := c.ParseArgs(args); err != nil {
 		c.RespondError(err)
+		return
+	}
+
+	if args.Location.Size == 100 {
+		c.RespondStatus(http.StatusBadRequest)
 		return
 	}
 
@@ -539,6 +544,10 @@ func TestAccessClientPutGet(t *testing.T) {
 		io.ReadFull(body, buff)
 		require.Equal(t, crcExpected, crc32.ChecksumIEEE(buff))
 	}
+
+	// test code 400
+	_, err := client.Get(randCtx(), &access.GetArgs{Location: access.Location{Size: 100}, ReadSize: uint64(100)})
+	require.Error(t, err)
 }
 
 func TestAccessClientPutAtBase(t *testing.T) {

@@ -24,6 +24,7 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 
+	"github.com/cubefs/cubefs/blobstore/api/blobnode"
 	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/api/proxy"
 	"github.com/cubefs/cubefs/blobstore/common/codemode"
@@ -38,6 +39,8 @@ import (
 )
 
 var (
+	A = gomock.Any()
+
 	errCodeMode = errors.New("codeMode not exist")
 	errBidCount = errors.New("count too large")
 	ctx         = context.Background()
@@ -93,6 +96,46 @@ func newMockService(t *testing.T) *Service {
 			}
 			return nil, nil, nil
 		})
+	volumeMgr.EXPECT().Discard(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
+		func(ctx context.Context, args *proxy.DiscardVolsArgs) (err error) {
+			if args.CodeMode != codemode.EC6P6 && args.CodeMode != codemode.EC15P12 {
+				return errCodeMode
+			}
+			return nil
+		})
+
+	cacher := mock.NewMockCacher(ctr)
+	cacher.EXPECT().GetVolume(A, A).AnyTimes().DoAndReturn(
+		func(_ context.Context, args *proxy.CacheVolumeArgs) (*proxy.VersionVolume, error) {
+			volume := new(proxy.VersionVolume)
+			if args.Vid%2 == 0 {
+				volume.Vid = args.Vid
+				return volume, nil
+			}
+			if args.Flush {
+				return nil, errcode.ErrVolumeNotExist
+			}
+			return nil, errors.New("internal error")
+		})
+	cacher.EXPECT().GetDisk(A, A).AnyTimes().DoAndReturn(
+		func(_ context.Context, args *proxy.CacheDiskArgs) (*blobnode.DiskInfo, error) {
+			disk := new(blobnode.DiskInfo)
+			if args.DiskID%2 == 0 {
+				disk.DiskID = args.DiskID
+				return disk, nil
+			}
+			if args.Flush {
+				return nil, errcode.ErrCMDiskNotFound
+			}
+			return nil, errors.New("internal error")
+		})
+	cacher.EXPECT().Erase(A, A).AnyTimes().DoAndReturn(
+		func(_ context.Context, key string) error {
+			if key == "ALL" {
+				return errors.New("internal error")
+			}
+			return nil
+		})
 
 	return &Service{
 		Config: Config{
@@ -103,6 +146,7 @@ func newMockService(t *testing.T) *Service {
 		shardRepairMgr: shardRepairMgr,
 		blobDeleteMgr:  blobDeleteMgr,
 		volumeMgr:      volumeMgr,
+		cacher:         cacher,
 	}
 }
 
@@ -160,7 +204,7 @@ func TestService_MQ(t *testing.T) {
 				ClusterID: 2,
 				Blobs:     []proxy.BlobDelete{{Bid: 0, Vid: 0}},
 			},
-			code: 706,
+			code: 803,
 		},
 		{
 			args: proxy.DeleteArgs{
@@ -197,7 +241,7 @@ func TestService_MQ(t *testing.T) {
 				BadIdxes:  nil,
 				Reason:    "",
 			},
-			code: 706,
+			code: 803,
 		},
 		{
 			args: proxy.ShardRepairArgs{
@@ -261,6 +305,16 @@ func TestService_Allocator(t *testing.T) {
 		require.Error(t, err)
 		require.Equal(t, errcode.ErrIllegalArguments.Error(), err.Error())
 	}
+	discardUrl := url + "/volume/discard"
+	{
+		args := proxy.DiscardVolsArgs{
+			CodeMode: codemode.CodeMode(2),
+			Discards: []proto.Vid{},
+		}
+		err := cli.PostWith(ctx, discardUrl, nil, args)
+		require.NoError(t, err)
+	}
+
 	{
 		err := cli.GetWith(ctx, url+"/volume/list?code_mode=0", nil)
 		require.Error(t, err)
@@ -278,6 +332,78 @@ func TestService_Allocator(t *testing.T) {
 	{
 		err := cli.GetWith(ctx, url+"/volume/list?code_mode=2", nil)
 		require.NoError(t, err)
+	}
+}
+
+func TestService_CacherVolume(t *testing.T) {
+	url := runMockService(newMockService(t)) + "/cache/volume/"
+	cli := newClient()
+	var volume clustermgr.VolumeInfo
+	{
+		err := cli.GetWith(ctx, url+"1024", &volume)
+		require.NoError(t, err)
+		require.Equal(t, proto.Vid(1024), volume.Vid)
+	}
+	{
+		err := cli.GetWith(ctx, url+"111", &volume)
+		require.Error(t, err)
+	}
+	{
+		err := cli.GetWith(ctx, url+"111?flush=0", &volume)
+		require.Error(t, err)
+		require.Equal(t, 500, rpc.DetectStatusCode(err))
+	}
+	{
+		err := cli.GetWith(ctx, url+"111?flush=1", &volume)
+		require.Error(t, err)
+		require.Equal(t, errcode.CodeVolumeNotExist, rpc.DetectStatusCode(err))
+	}
+	{
+		err := cli.GetWith(ctx, url+"111?flush=true", &volume)
+		require.Error(t, err)
+		require.Equal(t, errcode.CodeVolumeNotExist, rpc.DetectStatusCode(err))
+	}
+}
+
+func TestService_CacherDisk(t *testing.T) {
+	url := runMockService(newMockService(t)) + "/cache/disk/"
+	cli := newClient()
+	var disk blobnode.DiskInfo
+	{
+		err := cli.GetWith(ctx, url+"1024", &disk)
+		require.NoError(t, err)
+		require.Equal(t, proto.DiskID(1024), disk.DiskID)
+	}
+	{
+		err := cli.GetWith(ctx, url+"111", nil)
+		require.Error(t, err)
+	}
+	{
+		err := cli.GetWith(ctx, url+"111?flush=0", nil)
+		require.Error(t, err)
+		require.Equal(t, 500, rpc.DetectStatusCode(err))
+	}
+	{
+		err := cli.GetWith(ctx, url+"111?flush=true", nil)
+		require.Error(t, err)
+		require.Equal(t, errcode.CodeCMDiskNotFound, rpc.DetectStatusCode(err))
+	}
+}
+
+func TestService_CacherErase(t *testing.T) {
+	url := runMockService(newMockService(t)) + "/cache/erase/"
+	cli := newClient()
+	{
+		resp, err := cli.Delete(ctx, url+"volume-10")
+		require.NoError(t, err)
+		require.Equal(t, 200, resp.StatusCode)
+		resp.Body.Close()
+	}
+	{
+		resp, err := cli.Delete(ctx, url+"ALL")
+		require.NoError(t, err)
+		require.Equal(t, 500, resp.StatusCode)
+		resp.Body.Close()
 	}
 }
 

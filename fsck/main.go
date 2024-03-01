@@ -17,11 +17,25 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime/pprof"
 
 	"github.com/cubefs/cubefs/fsck/cmd"
+	"github.com/cubefs/cubefs/util/log"
 )
 
 func main() {
+	var err error
+	_, err = log.InitLog("/tmp/cfs", "fsck", log.InfoLevel, nil, log.DefaultLogLeftSpaceLimit)
+	if err != nil {
+		fmt.Printf("Failed to init log: %v\n", err)
+		os.Exit(1)
+	}
+	defer log.LogFlush()
+
+	f, err := os.Create("/tmp/cfs/fsck/cpu_profile")
+	pprof.StartCPUProfile(f)
+	defer pprof.StopCPUProfile()
+
 	c := cmd.NewRootCmd()
 	if err := c.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed: %v\n", err)

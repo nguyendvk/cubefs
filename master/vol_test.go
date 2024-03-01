@@ -124,7 +124,7 @@ func TestCreateColdVol(t *testing.T) {
 	assert.True(t, vol.CacheCapacity == 0)
 	assert.True(t, vol.CacheAction == proto.NoCache)
 	assert.True(t, vol.CacheThreshold == defaultCacheThreshold)
-	assert.True(t, vol.dpReplicaNum == 1)
+	assert.True(t, vol.dpReplicaNum == 0)
 	assert.True(t, vol.FollowerRead)
 	assert.True(t, vol.CacheTTL == defaultCacheTtl)
 	assert.True(t, vol.CacheHighWater == defaultCacheHighWater)
@@ -215,7 +215,7 @@ func createVol(kv map[string]interface{}, t *testing.T) {
 	checkWithDefault(kv, volTypeKey, proto.VolumeTypeHot)
 	checkWithDefault(kv, volOwnerKey, testOwner)
 	checkWithDefault(kv, zoneNameKey, testZone2)
-	checkWithDefault(kv, volCapacityKey, 100)
+	checkWithDefault(kv, volCapacityKey, 300)
 
 	switch kv[volTypeKey].(int) {
 	case proto.VolumeTypeHot:
@@ -278,7 +278,7 @@ func checkMetaPartitionsWritableTest(vol *Vol, t *testing.T) {
 	maxPartitionID := vol.maxPartitionID()
 	maxMp := vol.MetaPartitions[maxPartitionID]
 	//after check meta partitions ,the status must be writable
-	maxMp.checkStatus(server.cluster.Name, false, int(vol.mpReplicaNum), maxPartitionID)
+	maxMp.checkStatus(server.cluster.Name, false, int(vol.mpReplicaNum), maxPartitionID, 4194304)
 	if maxMp.Status != proto.ReadWrite {
 		t.Errorf("expect partition status[%v],real status[%v]\n", proto.ReadWrite, maxMp.Status)
 		return

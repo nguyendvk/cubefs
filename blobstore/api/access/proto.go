@@ -506,7 +506,7 @@ type PutResp struct {
 type PutAtArgs struct {
 	ClusterID proto.ClusterID `json:"clusterid"`
 	Vid       proto.Vid       `json:"volumeid"`
-	Blobid    proto.BlobID    `json:"blobid"`
+	BlobID    proto.BlobID    `json:"blobid"`
 	Size      int64           `json:"size"`
 	Hashes    HashAlgorithm   `json:"hashes,omitempty"`
 	Token     string          `json:"token"`
@@ -520,7 +520,7 @@ func (args *PutAtArgs) IsValid() bool {
 	}
 	return args.ClusterID > proto.ClusterID(0) &&
 		args.Vid > proto.Vid(0) &&
-		args.Blobid > proto.BlobID(0) &&
+		args.BlobID > proto.BlobID(0) &&
 		args.Size > 0
 }
 
@@ -569,7 +569,9 @@ func (args *GetArgs) IsValid() bool {
 	if args == nil {
 		return false
 	}
-	return args.Offset+args.ReadSize <= args.Location.Size
+	return args.Offset <= args.Location.Size &&
+		args.ReadSize <= args.Location.Size &&
+		args.Offset+args.ReadSize <= args.Location.Size
 }
 
 // DeleteArgs for service /delete
@@ -594,7 +596,7 @@ type DeleteResp struct {
 type DeleteBlobArgs struct {
 	ClusterID proto.ClusterID `json:"clusterid"`
 	Vid       proto.Vid       `json:"volumeid"`
-	Blobid    proto.BlobID    `json:"blobid"`
+	BlobID    proto.BlobID    `json:"blobid"`
 	Size      int64           `json:"size"`
 	Token     string          `json:"token"`
 }
@@ -606,7 +608,7 @@ func (args *DeleteBlobArgs) IsValid() bool {
 	}
 	return args.ClusterID > proto.ClusterID(0) &&
 		args.Vid > proto.Vid(0) &&
-		args.Blobid > proto.BlobID(0) &&
+		args.BlobID > proto.BlobID(0) &&
 		args.Size > 0
 }
 

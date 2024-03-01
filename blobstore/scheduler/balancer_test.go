@@ -20,11 +20,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/xid"
+
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 
 	api "github.com/cubefs/cubefs/blobstore/api/scheduler"
 	"github.com/cubefs/cubefs/blobstore/common/codemode"
+	errcode "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/scheduler/base"
 	"github.com/cubefs/cubefs/blobstore/scheduler/client"
@@ -87,7 +90,7 @@ func TestBalanceCollectionTask(t *testing.T) {
 	}
 	{
 		mgr := newBalancer(t)
-		mgr.cfg.BalanceDiskCntLimit = 2
+		mgr.cfg.DiskConcurrency = 2
 		mgr.IMigrator.(*MockMigrater).EXPECT().GetMigratingDiskNum().AnyTimes().Return(1)
 
 		disk1 := &client.DiskInfoSimple{
@@ -123,7 +126,7 @@ func TestBalanceCollectionTask(t *testing.T) {
 		clusterTopMgr := &ClusterTopologyMgr{
 			taskStatsMgr: base.NewClusterTopologyStatisticsMgr(1, []float64{}),
 		}
-		clusterTopMgr.buildClusterTopo([]*client.DiskInfoSimple{disk1, disk2, disk3}, 1)
+		clusterTopMgr.buildClusterTopology([]*client.DiskInfoSimple{disk1, disk2, disk3}, 1)
 		mgr.IMigrator.(*MockMigrater).EXPECT().IsMigratingDisk(any).AnyTimes().DoAndReturn(func(diskID proto.DiskID) bool {
 			return diskID == 1
 		})
@@ -222,4 +225,46 @@ func TestBalanceStatQueueTaskCnt(t *testing.T) {
 	require.Equal(t, 0, inited)
 	require.Equal(t, 0, prepared)
 	require.Equal(t, 0, completed)
+}
+
+func TestBalanceCheckAndClearJunkTasks(t *testing.T) {
+	{
+		mgr := newBalancer(t)
+		mgr.IMigrator.(*MockMigrater).EXPECT().DeletedTasks().Return([]DeletedTask{})
+		mgr.checkAndClearJunkTasks()
+	}
+	{
+		mgr := newBalancer(t)
+		mgr.IMigrator.(*MockMigrater).EXPECT().DeletedTasks().Return([]DeletedTask{
+			{DiskID: proto.DiskID(1), TaskID: xid.New().String(), DeletedTime: time.Now()},
+		})
+		mgr.checkAndClearJunkTasks()
+	}
+	{
+		mgr := newBalancer(t)
+		mgr.IMigrator.(*MockMigrater).EXPECT().DeletedTasks().Return([]DeletedTask{
+			{DiskID: proto.DiskID(1), TaskID: xid.New().String(), DeletedTime: time.Now().Add(-junkMigrationTaskProtectionWindow)},
+		})
+		mgr.clusterMgrCli.(*MockClusterMgrAPI).EXPECT().GetMigrateTask(any, any, any).Return(nil, errMock)
+		mgr.checkAndClearJunkTasks()
+	}
+	{
+		mgr := newBalancer(t)
+		mgr.IMigrator.(*MockMigrater).EXPECT().DeletedTasks().Return([]DeletedTask{
+			{DiskID: proto.DiskID(1), TaskID: xid.New().String(), DeletedTime: time.Now().Add(-junkMigrationTaskProtectionWindow)},
+		})
+		mgr.clusterMgrCli.(*MockClusterMgrAPI).EXPECT().GetMigrateTask(any, any, any).Return(nil, errcode.ErrNotFound)
+		mgr.IMigrator.(*MockMigrater).EXPECT().ClearDeletedTaskByID(any, any).Return()
+		mgr.checkAndClearJunkTasks()
+	}
+	{
+		mgr := newBalancer(t)
+		mgr.IMigrator.(*MockMigrater).EXPECT().DeletedTasks().Return([]DeletedTask{
+			{DiskID: proto.DiskID(1), TaskID: xid.New().String(), DeletedTime: time.Now().Add(-junkMigrationTaskProtectionWindow)},
+		})
+		mgr.clusterMgrCli.(*MockClusterMgrAPI).EXPECT().GetMigrateTask(any, any, any).Return(&proto.MigrateTask{}, nil)
+		mgr.clusterMgrCli.(*MockClusterMgrAPI).EXPECT().DeleteMigrateTask(any, any).Return(nil)
+		mgr.IMigrator.(*MockMigrater).EXPECT().ClearDeletedTaskByID(any, any).Return()
+		mgr.checkAndClearJunkTasks()
+	}
 }

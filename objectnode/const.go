@@ -21,6 +21,7 @@ const (
 )
 
 const (
+	S3Namespace                  = "http://s3.amazonaws.com/doc/2006-03-01/"
 	HeaderNameServer             = "Server"
 	HeaderNameHost               = "Host"
 	HeaderNameLastModified       = "Last-Modified"
@@ -40,21 +41,24 @@ const (
 	HeaderNameLocation           = "Location"
 	HeaderNameCacheControl       = "Cache-Control"
 	HeaderNameExpires            = "Expires"
+	HeaderNameConnection         = "Connection"
 
 	// Headers for CORS validation
-	Origin                                = "Origin"
-	HeaderNameAccessControlRequestMethod  = "Access-Control-Request-Method"
-	HeaderNameAccessControlRequestHeaders = "Access-Control-Request-Headers"
-	HeaderNameAccessControlAllowOrigin    = "Access-Control-Allow-Origin"
-	HeaderNameAccessControlMaxAge         = "Access-Control-Max-Age"
-	HeaderNameAccessControlAllowMethods   = "Access-Control-Allow-Methods"
-	HeaderNameAccessControlAllowHeaders   = "Access-Control-Allow-Headers"
-	HeaderNamrAccessControlExposeHeaders  = "Access-Control-Expose-Headers"
+	Origin                                  = "Origin"
+	HeaderNameAccessControlRequestMethod    = "Access-Control-Request-Method"
+	HeaderNameAccessControlRequestHeaders   = "Access-Control-Request-Headers"
+	HeaderNameAccessControlAllowOrigin      = "Access-Control-Allow-Origin"
+	HeaderNameAccessControlAllowCredentials = "Access-Control-Allow-Credentials"
+	HeaderNameAccessControlMaxAge           = "Access-Control-Max-Age"
+	HeaderNameAccessControlAllowMethods     = "Access-Control-Allow-Methods"
+	HeaderNameAccessControlAllowHeaders     = "Access-Control-Allow-Headers"
+	HeaderNameAccessControlExposeHeaders    = "Access-Control-Expose-Headers"
 
 	HeaderNameXAmzStartDate           = "x-amz-date"
 	HeaderNameXAmzRequestId           = "x-amz-request-id"
 	HeaderNameXAmzContentHash         = "x-amz-content-sha256"
 	HeaderNameXAmzCopySource          = "x-amz-copy-source"
+	HeaderNameXAmzCopyRange           = "x-amz-copy-source-range"
 	HeaderNameXAmzCopyMatch           = "x-amz-copy-source-if-match"
 	HeaderNameXAmzCopyNoneMatch       = "x-amz-copy-source-if-none-match"
 	HeaderNameXAmzCopyModified        = "x-amz-copy-source-if-modified-since"
@@ -115,10 +119,11 @@ const (
 	MaxKeys    = 1000
 	MaxParts   = 1000
 	MaxUploads = 1000
+	BodyLimit  = 1 << 20
 )
 
 const (
-	StorageClassStandard = "Standard"
+	StorageClassStandard = "STANDARD"
 )
 
 // XAttr keys for ObjectNode compatible feature

@@ -140,16 +140,16 @@ type DataPartition struct {
 
 func CreateDataPartition(dpCfg *dataPartitionCfg, disk *Disk, request *proto.CreateDataPartitionRequest) (dp *DataPartition, err error) {
 
-	if dp, err = newDataPartition(dpCfg, disk); err != nil {
+	if dp, err = newDataPartition(dpCfg, disk, true); err != nil {
 		return
 	}
 	dp.ForceLoadHeader()
 	if request.CreateType == proto.NormalCreateDataPartition {
-		err = dp.StartRaft()
+		err = dp.StartRaft(false)
 	} else {
 		// init leaderSize to partitionSize
 		disk.updateDisk(uint64(request.LeaderSize))
-		go dp.StartRaftAfterRepair()
+		go dp.StartRaftAfterRepair(false)
 	}
 	if err != nil {
 		return nil, err
@@ -229,27 +229,30 @@ func LoadDataPartition(partitionDir string, disk *Disk) (dp *DataPartition, err 
 		NodeID:        disk.space.GetNodeID(),
 		ClusterID:     disk.space.GetClusterID(),
 	}
-	if dp, err = newDataPartition(dpCfg, disk); err != nil {
+	if dp, err = newDataPartition(dpCfg, disk, false); err != nil {
 		return
 	}
+	dp.computeUsage()
 	dp.ForceSetDataPartitionToLoadding()
 	disk.space.AttachPartition(dp)
 	if err = dp.LoadAppliedID(); err != nil {
 		log.LogErrorf("action[loadApplyIndex] %v", err)
+		return
 	}
 	log.LogInfof("Action(LoadDataPartition) PartitionID(%v) meta(%v)", dp.partitionID, meta)
 	dp.DataPartitionCreateType = meta.DataPartitionCreateType
 	dp.lastTruncateID = meta.LastTruncateID
 	if meta.DataPartitionCreateType == proto.NormalCreateDataPartition {
-		err = dp.StartRaft()
+		err = dp.StartRaft(true)
 	} else {
 		// init leaderSize to partitionSize
 		dp.leaderSize = dp.partitionSize
-		go dp.StartRaftAfterRepair()
+		go dp.StartRaftAfterRepair(true)
 	}
 	if err != nil {
 		log.LogErrorf("PartitionID(%v) start raft err(%v)..", dp.partitionID, err)
 		disk.space.DetachDataPartition(dp.partitionID)
+		return
 	}
 
 	go dp.StartRaftLoggingSchedule()
@@ -258,7 +261,7 @@ func LoadDataPartition(partitionDir string, disk *Disk) (dp *DataPartition, err 
 	return
 }
 
-func newDataPartition(dpCfg *dataPartitionCfg, disk *Disk) (dp *DataPartition, err error) {
+func newDataPartition(dpCfg *dataPartitionCfg, disk *Disk, isCreate bool) (dp *DataPartition, err error) {
 	partitionID := dpCfg.PartitionID
 	var dataPath string
 
@@ -291,9 +294,10 @@ func newDataPartition(dpCfg *dataPartitionCfg, disk *Disk) (dp *DataPartition, e
 		config:          dpCfg,
 		raftStatus:      RaftStatusStopped,
 	}
-	log.LogInfof("action[newDataPartition] dp %v replica num %v", partitionID, dpCfg.ReplicaNum)
+	log.LogInfof("action[newDataPartition] dp %v replica num %v isCreate %v", partitionID, dpCfg.ReplicaNum, isCreate)
 	partition.replicasInit()
-	partition.extentStore, err = storage.NewExtentStore(partition.path, dpCfg.PartitionID, dpCfg.PartitionSize, partition.partitionType)
+	partition.extentStore, err = storage.NewExtentStore(partition.path, dpCfg.PartitionID, dpCfg.PartitionSize,
+		partition.partitionType, isCreate)
 	if err != nil {
 		return
 	}
@@ -438,8 +442,8 @@ func (dp *DataPartition) Stop() {
 			close(dp.stopC)
 		}
 		// Close the store and raftstore.
-		dp.extentStore.Close()
 		dp.stopRaft()
+		dp.extentStore.Close()
 		_ = dp.storeAppliedID(atomic.LoadUint64(&dp.appliedID))
 	})
 	return
@@ -717,10 +721,20 @@ func (dp *DataPartition) compareReplicas(v1, v2 []string) (equals bool) {
 func (dp *DataPartition) fetchReplicasFromMaster() (isLeader bool, replicas []string, err error) {
 
 	var partition *proto.DataPartitionInfo
-	if partition, err = MasterClient.AdminAPI().GetDataPartition(dp.volumeID, dp.partitionID); err != nil {
-		isLeader = false
-		return
+	var retry = 0
+	for {
+		if partition, err = MasterClient.AdminAPI().GetDataPartition(dp.volumeID, dp.partitionID); err != nil {
+			retry++
+			if retry > 5 {
+				isLeader = false
+				return
+			}
+		} else {
+			break
+		}
+		time.Sleep(10 * time.Second)
 	}
+
 	for _, host := range partition.Hosts {
 		replicas = append(replicas, host)
 	}
@@ -757,15 +771,19 @@ func (dp *DataPartition) Load() (response *proto.LoadDataPartitionResponse) {
 // 2. if the extent does not even exist, create the extent first, and then repair.
 func (dp *DataPartition) DoExtentStoreRepair(repairTask *DataPartitionRepairTask) {
 	store := dp.extentStore
+	log.LogDebugf("DoExtentStoreRepair dp %v len extents %v type %v",
+		dp.partitionID, len(repairTask.ExtentsToBeCreated), repairTask.TaskType)
 	for _, extentInfo := range repairTask.ExtentsToBeCreated {
 		if storage.IsTinyExtent(extentInfo.FileID) {
 			continue
 		}
 		if store.HasExtent(uint64(extentInfo.FileID)) {
+			log.LogWarnf("DoExtentStoreRepair dp %v, extent(%v) is exist", dp.partitionID, extentInfo.FileID)
 			continue
 		}
 		if !AutoRepairStatus {
-			log.LogWarnf("AutoRepairStatus is False,so cannot Create extent(%v)", extentInfo.String())
+			log.LogWarnf("DoExtentStoreRepair dp %v, AutoRepairStatus is False,so cannot Create extent(%v)",
+				dp.partitionID, extentInfo.FileID)
 			continue
 		}
 
@@ -773,6 +791,8 @@ func (dp *DataPartition) DoExtentStoreRepair(repairTask *DataPartitionRepairTask
 
 		err := store.Create(uint64(extentInfo.FileID))
 		if err != nil {
+			log.LogWarnf("DoExtentStoreRepair dp %v extent %v failed, err:%v",
+				dp.partitionID, extentInfo.FileID, err.Error())
 			continue
 		}
 	}
@@ -908,12 +928,20 @@ func (dp *DataPartition) ChangeRaftMember(changeType raftProto.ConfChangeType, p
 	return
 }
 
-//
 func (dp *DataPartition) canRemoveSelf() (canRemove bool, err error) {
 	var partition *proto.DataPartitionInfo
-	if partition, err = MasterClient.AdminAPI().GetDataPartition(dp.volumeID, dp.partitionID); err != nil {
-		log.LogErrorf("action[canRemoveSelf] err[%v]", err)
-		return
+	retry := 0
+	for {
+		if partition, err = MasterClient.AdminAPI().GetDataPartition(dp.volumeID, dp.partitionID); err != nil {
+			log.LogErrorf("action[canRemoveSelf] err[%v]", err)
+			retry++
+			if retry > 60 {
+				return
+			}
+		} else {
+			break
+		}
+		time.Sleep(10 * time.Second)
 	}
 	canRemove = false
 	var existInPeers bool
@@ -938,6 +966,7 @@ func (dp *DataPartition) getRepairConn(target string) (net.Conn, error) {
 }
 
 func (dp *DataPartition) putRepairConn(conn net.Conn, forceClose bool) {
+	log.LogDebugf("action[putRepairConn], forceClose: %v", forceClose)
 	dp.dataNode.putRepairConnFunc(conn, forceClose)
 	return
 }

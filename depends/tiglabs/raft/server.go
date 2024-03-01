@@ -218,6 +218,15 @@ func (rs *RaftServer) ChangeMember(id uint64, changeType proto.ConfChangeType, p
 	return
 }
 
+func (rs *RaftServer) IsRestoring(id uint64) bool {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	if raft, ok := rs.rafts[id]; ok {
+		return raft.restoringSnapshot.Get() && raft.applied() == 0
+	}
+	return true
+}
+
 func (rs *RaftServer) Status(id uint64) (status *Status) {
 	rs.mu.RLock()
 	raft, ok := rs.rafts[id]
@@ -251,7 +260,6 @@ func (rs *RaftServer) IsLeader(id uint64) bool {
 	rs.mu.RLock()
 	raft, ok := rs.rafts[id]
 	rs.mu.RUnlock()
-
 	if ok {
 		return raft.isLeader()
 	}

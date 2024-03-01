@@ -25,7 +25,7 @@ POLICY = '{' \
          '"Effect": "Allow",' \
          '"Principal": {"AWS": ["arn:aws:iam::123456789012:root"]}, ' \
          '"Action": ["s3:PutObject"], ' \
-         '"Resource": ["arn:aws:s3:::acl3/*" ] ' \
+         '"Resource": ["arn:aws:s3:::' + env.BUCKET + '/*" ] ' \
          '}]}'
 
 
@@ -38,11 +38,13 @@ class PolicyTest(S3TestCase):
 
     def test_policy_set(self):
         # Get bucket policy configuration
-        self.assert_get_bucket_policy_result(
-            result=self.s3.get_bucket_policy(Bucket=env.BUCKET), policy=None)
+        try:
+            result=self.s3.get_bucket_policy(Bucket=env.BUCKET)
+        except Exception as e:
+            self.assert_client_error(error=e, expect_status_code=404)
         # Put bucket policy configuration
         self.assert_result_status_code(
-            result=self.s3.put_bucket_policy(Bucket=env.BUCKET, Policy=POLICY))
+            result=self.s3.put_bucket_policy(Bucket=env.BUCKET, Policy=POLICY), status_code=204)
         # Get bucket policy configuration
         self.assert_get_bucket_policy_result(
             result=self.s3.get_bucket_policy(Bucket=env.BUCKET), policy=json.loads(POLICY))
@@ -50,5 +52,7 @@ class PolicyTest(S3TestCase):
         self.assert_result_status_code(
             result=self.s3.delete_bucket_policy(Bucket=env.BUCKET), status_code=204)
         # Get bucket policy configuration
-        self.assert_get_bucket_policy_result(
-            result=self.s3.get_bucket_policy(Bucket=env.BUCKET), policy=None)
+        try:
+            result=self.s3.get_bucket_policy(Bucket=env.BUCKET)
+        except Exception as e:
+            self.assert_client_error(error=e, expect_status_code=404)

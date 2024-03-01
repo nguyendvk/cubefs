@@ -55,23 +55,10 @@ func newMockService(t *testing.T) *Service {
 	manualMgr := NewMockMigrater(ctr)
 	balanceMgr := NewMockMigrater(ctr)
 	inspectorMgr := NewMockVolumeInspector(ctr)
-	volumeCache := NewMockVolumeCache(ctr)
+	clusterTopology := NewMockClusterTopology(ctr)
 
-	// return balance task
-	emptyTask := proto.MigrateTask{}
-	manualMgr.EXPECT().AcquireTask(any, any).Return(emptyTask, errMock)
-	diskRepairMgr.EXPECT().AcquireTask(any, any).Return(emptyTask, errMock)
-	diskDropMgr.EXPECT().AcquireTask(any, any).Return(emptyTask, errMock)
-	balanceMgr.EXPECT().AcquireTask(any, any).Return(proto.MigrateTask{TaskType: proto.TaskTypeBalance}, nil)
-	// return disk drop task
-	manualMgr.EXPECT().AcquireTask(any, any).Return(emptyTask, errMock)
-	diskRepairMgr.EXPECT().AcquireTask(any, any).Return(emptyTask, errMock)
-	diskDropMgr.EXPECT().AcquireTask(any, any).Return(proto.MigrateTask{TaskType: proto.TaskTypeDiskDrop}, nil)
 	// return disk repair task
-	manualMgr.EXPECT().AcquireTask(any, any).Return(emptyTask, errMock)
 	diskRepairMgr.EXPECT().AcquireTask(any, any).Return(proto.MigrateTask{TaskType: proto.TaskTypeDiskRepair}, nil)
-	// return manual migrate task
-	manualMgr.EXPECT().AcquireTask(any, any).Return(proto.MigrateTask{TaskType: proto.TaskTypeManualMigrate}, nil)
 
 	// reclaim repair task
 	diskRepairMgr.EXPECT().ReclaimTask(any, any, any, any, any, any).Return(nil)
@@ -132,8 +119,8 @@ func newMockService(t *testing.T) *Service {
 	inspectorMgr.EXPECT().CompleteInspect(any, any).Return()
 
 	// volume update
-	volumeCache.EXPECT().Update(any).Return(&client.VolumeInfoSimple{}, nil)
-	volumeCache.EXPECT().Update(any).Return(nil, errMock)
+	clusterTopology.EXPECT().UpdateVolume(any).Return(&client.VolumeInfoSimple{}, nil)
+	clusterTopology.EXPECT().UpdateVolume(any).Return(nil, errMock)
 
 	// stats
 	blobDeleteMgr.EXPECT().GetErrorStats().Return([]string{}, uint64(0))
@@ -143,10 +130,10 @@ func newMockService(t *testing.T) *Service {
 	shardRepairMgr.EXPECT().GetTaskStats().Return([counter.SLOT]int{}, [counter.SLOT]int{})
 	shardRepairMgr.EXPECT().Enabled().Return(true)
 	diskRepairMgr.EXPECT().Stats().Return(api.MigrateTasksStat{})
-	diskRepairMgr.EXPECT().Progress(any).Return(proto.DiskID(1), 0, 0)
+	diskRepairMgr.EXPECT().Progress(any).Return([]proto.DiskID{proto.DiskID(1)}, 0, 0)
 	diskRepairMgr.EXPECT().Enabled().Return(true)
 	diskDropMgr.EXPECT().Stats().Return(api.MigrateTasksStat{})
-	diskDropMgr.EXPECT().Progress(any).Return(proto.DiskID(1), 0, 0)
+	diskDropMgr.EXPECT().Progress(any).Return([]proto.DiskID{proto.DiskID(1)}, 0, 0)
 	diskDropMgr.EXPECT().Enabled().Return(true)
 	balanceMgr.EXPECT().Stats().Return(api.MigrateTasksStat{})
 	balanceMgr.EXPECT().Enabled().Return(true)
@@ -164,6 +151,12 @@ func newMockService(t *testing.T) *Service {
 	diskRepairMgr.EXPECT().QueryTask(any, any).Return(nil, errMock)
 	manualMgr.EXPECT().QueryTask(any, any).Return(nil, errMock)
 
+	// disk stats
+	diskRepairMgr.EXPECT().DiskProgress(any, any).Return(nil, errMock)
+	diskDropMgr.EXPECT().DiskProgress(any, any).Return(nil, errMock)
+	diskRepairMgr.EXPECT().DiskProgress(any, any).Return(&api.DiskMigratingStats{TotalTasksCnt: int(testDisk1.UsedChunkCnt), MigratedTasksCnt: 1}, nil)
+	diskDropMgr.EXPECT().DiskProgress(any, any).Return(&api.DiskMigratingStats{TotalTasksCnt: int(testDisk1.UsedChunkCnt), MigratedTasksCnt: 1}, nil)
+
 	service := &Service{
 		ClusterID:     1,
 		leader:        true,
@@ -174,9 +167,9 @@ func newMockService(t *testing.T) *Service {
 		diskRepairMgr: diskRepairMgr,
 		inspectMgr:    inspectorMgr,
 
-		shardRepairMgr: shardRepairMgr,
-		blobDeleteMgr:  blobDeleteMgr,
-		volCache:       volumeCache,
+		shardRepairMgr:  shardRepairMgr,
+		blobDeleteMgr:   blobDeleteMgr,
+		clusterTopology: clusterTopology,
 
 		clusterMgrCli: clusterMgrCli,
 	}
@@ -199,23 +192,24 @@ func TestServiceAPI(t *testing.T) {
 		proto.TaskTypeBalance, proto.TaskTypeDiskDrop,
 		proto.TaskTypeDiskRepair, proto.TaskTypeManualMigrate,
 	}
-	// opetate task
-	for _, taskType := range taskTypes {
-		task, err := cli.AcquireTask(ctx, &api.AcquireArgs{IDC: idc})
-		require.NoError(t, err)
-		require.Equal(t, taskType, task.TaskType)
+	// acquire task
+	task, err := cli.AcquireTask(ctx, &api.AcquireArgs{IDC: idc})
+	require.NoError(t, err)
+	require.Equal(t, proto.TaskTypeDiskRepair, task.TaskType)
 
+	for _, taskType := range taskTypes {
 		require.NoError(t, cli.ReclaimTask(ctx, &api.OperateTaskArgs{IDC: idc, TaskType: taskType, TaskID: client.GenMigrateTaskID(taskType, diskID, volumeID)}))
 		require.NoError(t, cli.CancelTask(ctx, &api.OperateTaskArgs{IDC: idc, TaskType: taskType, TaskID: client.GenMigrateTaskID(taskType, diskID, volumeID)}))
 		require.NoError(t, cli.CompleteTask(ctx, &api.OperateTaskArgs{IDC: idc, TaskType: taskType, TaskID: client.GenMigrateTaskID(taskType, diskID, volumeID)}))
 		require.NoError(t, cli.ReportTask(ctx, &api.TaskReportArgs{TaskType: taskType, TaskID: client.GenMigrateTaskID(taskType, diskID, volumeID)}))
 	}
+
 	require.Error(t, cli.ReclaimTask(ctx, &api.OperateTaskArgs{IDC: idc, TaskType: "task"}))
 	require.Error(t, cli.CancelTask(ctx, &api.OperateTaskArgs{IDC: idc, TaskType: "task"}))
 	require.Error(t, cli.CompleteTask(ctx, &api.OperateTaskArgs{IDC: idc, TaskType: "task"}))
 
 	// renewal task
-	_, err := cli.RenewalTask(ctx, &api.TaskRenewalArgs{
+	_, err = cli.RenewalTask(ctx, &api.TaskRenewalArgs{
 		IDC: "z0",
 		IDs: map[proto.TaskType][]string{
 			proto.TaskTypeBalance: {
@@ -280,5 +274,15 @@ func TestServiceAPI(t *testing.T) {
 		require.NoError(t, err)
 		_, err = cli.DetailMigrateTask(ctx, &api.MigrateTaskDetailArgs{Type: taskType, ID: client.GenMigrateTaskID(taskType, diskID, volumeID)})
 		require.Error(t, err)
+	}
+	// disk migrating stats
+	diskMigrateTypes := []proto.TaskType{proto.TaskTypeDiskRepair, proto.TaskTypeDiskDrop}
+	for _, taskType := range diskMigrateTypes {
+		_, err = cli.DiskMigratingStats(ctx, &api.DiskMigratingStatsArgs{DiskID: testDisk1.DiskID, TaskType: taskType})
+		require.Error(t, err)
+		stats, err := cli.DiskMigratingStats(ctx, &api.DiskMigratingStatsArgs{DiskID: testDisk1.DiskID, TaskType: taskType})
+		require.NoError(t, err)
+		require.Equal(t, int(testDisk1.UsedChunkCnt), stats.TotalTasksCnt)
+		require.Equal(t, 1, stats.MigratedTasksCnt)
 	}
 }

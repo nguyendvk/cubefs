@@ -16,8 +16,6 @@ package util
 
 import (
 	"fmt"
-	"github.com/cubefs/cubefs/util/errors"
-	"github.com/xtaci/smux"
 	"io"
 	"net"
 	"strconv"
@@ -27,6 +25,9 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/cubefs/cubefs/util/errors"
+	"github.com/xtaci/smux"
 )
 
 const (
@@ -133,6 +134,7 @@ type SmuxConnPoolStat struct {
 	TotalStreamsReported int                      `json:"totalStreamsInflight"`
 	Pools                map[string]*SmuxPoolStat `json:"pools"`
 	TotalSessions        int                      `json:"totalSessions"`
+	Bucket               int                      `json:"bucket"`
 }
 
 // token bucket limit
@@ -231,12 +233,10 @@ func (cp *SmuxConnectPool) PutConnect(stream *smux.Stream, forceClose bool) {
 		return
 	}
 	if forceClose {
-		stream.Close()
 		pool.MarkClosed(stream)
 		return
 	}
 	pool.PutStreamObjectToPool(&streamObject{stream: stream, idle: time.Now().UnixNano()})
-	return
 }
 
 func (cp *SmuxConnectPool) autoRelease() {
@@ -297,6 +297,8 @@ func (cp *SmuxConnectPool) GetStat() *SmuxConnPoolStat {
 		stat.TotalStreams += poolStat.InflightStreams
 		stat.TotalStreamsReported += poolStat.InflightStreamsReported
 	}
+
+	stat.Bucket = int(atomic.LoadInt64(&cp.streamBucket.bucket))
 	return stat
 }
 
@@ -389,7 +391,7 @@ func (p *SmuxPool) callCreate() (createCall *createSessCall) {
 		} else {
 			return
 		}
-	default:
+		//default:
 	}
 tryCreateNewSess:
 	prev := createCall
@@ -605,7 +607,6 @@ func (p *SmuxPool) handleCreateCall(call *createSessCall) {
 		return
 	}
 	p.insertSession(call.sess)
-	return
 }
 
 func (p *SmuxPool) openStream(sess *smux.Session) (stream *smux.Stream, err error) {
@@ -630,7 +631,6 @@ func (p *SmuxPool) PutStreamObjectToPool(obj *streamObject) {
 	case p.objects <- obj:
 		return
 	default:
-		obj.stream.Close()
 		p.MarkClosed(obj.stream)
 	}
 }

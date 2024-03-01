@@ -17,7 +17,12 @@ package metanode
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/cubefs/cubefs/util/config"
+	"github.com/cubefs/cubefs/util/errors"
+	"io"
 	"net/http"
+	"os"
+	"path"
 	"strconv"
 
 	"bytes"
@@ -50,6 +55,7 @@ func (api *APIResponse) Marshal() ([]byte, error) {
 func (m *MetaNode) registerAPIHandler() (err error) {
 	http.HandleFunc("/getPartitions", m.getPartitionsHandler)
 	http.HandleFunc("/getPartitionById", m.getPartitionByIDHandler)
+	http.HandleFunc("/getLeaderPartitions", m.getLeaderPartitionsHandler)
 	http.HandleFunc("/getInode", m.getInodeHandler)
 	http.HandleFunc("/getExtentsByInode", m.getExtentsByInodeHandler)
 	http.HandleFunc("/getEbsExtentsByInode", m.getEbsExtentsByInodeHandler)
@@ -59,9 +65,15 @@ func (m *MetaNode) registerAPIHandler() (err error) {
 	http.HandleFunc("/getDentry", m.getDentryHandler)
 	http.HandleFunc("/getDirectory", m.getDirectoryHandler)
 	http.HandleFunc("/getAllDentry", m.getAllDentriesHandler)
+	http.HandleFunc("/getAllTxInfo", m.getAllTxHandler)
 	http.HandleFunc("/getParams", m.getParamsHandler)
 	http.HandleFunc("/getSmuxStat", m.getSmuxStatHandler)
 	http.HandleFunc("/getRaftStatus", m.getRaftStatusHandler)
+	http.HandleFunc("/genClusterVersionFile", m.genClusterVersionFileHandler)
+	http.HandleFunc("/getInodeSnapshot", m.getInodeSnapshotHandler)
+	http.HandleFunc("/getDentrySnapshot", m.getDentrySnapshotHandler)
+	// get tx information
+	http.HandleFunc("/getTx", m.getTxHandler)
 	return
 }
 
@@ -121,12 +133,35 @@ func (m *MetaNode) getPartitionByIDHandler(w http.ResponseWriter, r *http.Reques
 	leader, _ := mp.IsLeader()
 	msg["leaderAddr"] = leader
 	conf := mp.GetBaseConfig()
+	msg["partition_id"] = conf.PartitionId
+	msg["partition_type"] = conf.PartitionType
+	msg["vol_name"] = conf.VolName
+	msg["start"] = conf.Start
+	msg["end"] = conf.End
 	msg["peers"] = conf.Peers
 	msg["nodeId"] = conf.NodeId
 	msg["cursor"] = conf.Cursor
 	resp.Data = msg
 	resp.Code = http.StatusOK
 	resp.Msg = http.StatusText(http.StatusOK)
+}
+
+func (m *MetaNode) getLeaderPartitionsHandler(w http.ResponseWriter, r *http.Request) {
+	resp := NewAPIResponse(http.StatusOK, http.StatusText(http.StatusOK))
+	mps := m.metadataManager.GetLeaderPartitions()
+	resp.Data = mps
+	data, err := resp.Marshal()
+	if err != nil {
+		log.LogErrorf("json marshal error:%v", err)
+		resp.Code = http.StatusInternalServerError
+		resp.Msg = err.Error()
+		return
+	}
+	if _, err := w.Write(data); err != nil {
+		log.LogErrorf("[getPartitionsHandler] response %s", err)
+		resp.Code = http.StatusInternalServerError
+		resp.Msg = err.Error()
+	}
 }
 
 func (m *MetaNode) getAllInodesHandler(w http.ResponseWriter, r *http.Request) {
@@ -191,6 +226,7 @@ func (m *MetaNode) getInodeHandler(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		data, _ := resp.Marshal()
 		if _, err := w.Write(data); err != nil {
+
 			log.LogErrorf("[getInodeHandler] response %s", err)
 		}
 	}()
@@ -389,7 +425,55 @@ func (m *MetaNode) getDentryHandler(w http.ResponseWriter, r *http.Request) {
 		resp.Data = json.RawMessage(p.Data)
 	}
 	return
+}
 
+func (m *MetaNode) getTxHandler(w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	resp := NewAPIResponse(http.StatusBadRequest, "")
+	defer func() {
+		data, _ := resp.Marshal()
+		if _, err := w.Write(data); err != nil {
+			log.LogErrorf("[getTxHandler] response %s", err)
+		}
+	}()
+	var (
+		pid  uint64
+		txId string
+		err  error
+	)
+	if pid, err = strconv.ParseUint(r.FormValue("pid"), 10, 64); err == nil {
+		if txId = r.FormValue("txId"); txId == "" {
+			err = fmt.Errorf("no txId")
+		}
+	}
+	if err != nil {
+		resp.Msg = err.Error()
+		return
+	}
+
+	mp, err := m.metadataManager.GetPartition(pid)
+	if err != nil {
+		resp.Code = http.StatusNotFound
+		resp.Msg = err.Error()
+		return
+	}
+	req := &proto.TxGetInfoRequest{
+		Pid:  pid,
+		TxID: txId,
+	}
+	p := &Packet{}
+	if err = mp.TxGetInfo(req, p); err != nil {
+		resp.Code = http.StatusSeeOther
+		resp.Msg = err.Error()
+		return
+	}
+
+	resp.Code = http.StatusSeeOther
+	resp.Msg = p.GetResultMsg()
+	if len(p.Data) > 0 {
+		resp.Data = json.RawMessage(p.Data)
+	}
+	return
 }
 
 func (m *MetaNode) getAllDentriesHandler(w http.ResponseWriter, r *http.Request) {
@@ -453,6 +537,89 @@ func (m *MetaNode) getAllDentriesHandler(w http.ResponseWriter, r *http.Request)
 	return
 }
 
+func (m *MetaNode) getAllTxHandler(w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	resp := NewAPIResponse(http.StatusOK, "")
+	shouldSkip := false
+	defer func() {
+		if !shouldSkip {
+			data, _ := resp.Marshal()
+			if _, err := w.Write(data); err != nil {
+				log.LogErrorf("[getAllTxHandler] response %s", err)
+			}
+		}
+	}()
+	pid, err := strconv.ParseUint(r.FormValue("pid"), 10, 64)
+	if err != nil {
+		resp.Code = http.StatusBadRequest
+		resp.Msg = err.Error()
+		return
+	}
+	mp, err := m.metadataManager.GetPartition(pid)
+	if err != nil {
+		resp.Code = http.StatusNotFound
+		resp.Msg = err.Error()
+		return
+	}
+	buff := bytes.NewBufferString(`{"code": 200, "msg": "OK", "data":[`)
+	if _, err := w.Write(buff.Bytes()); err != nil {
+		return
+	}
+	buff.Reset()
+	var (
+		val       []byte
+		delimiter = []byte{',', '\n'}
+		isFirst   = true
+	)
+
+	f := func(i BtreeItem) bool {
+		if !isFirst {
+			if _, err = w.Write(delimiter); err != nil {
+				return false
+			}
+		} else {
+			isFirst = false
+		}
+
+		if ino, ok := i.(*TxRollbackInode); ok {
+			_, err = w.Write([]byte(ino.ToString()))
+			if err != nil {
+				return false
+			}
+			return true
+		}
+		if den, ok := i.(*TxRollbackDentry); ok {
+			_, err = w.Write([]byte(den.ToString()))
+			if err != nil {
+				return false
+			}
+			return true
+		}
+
+		val, err = json.Marshal(i)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(err.Error()))
+			return false
+		}
+		if _, err = w.Write(val); err != nil {
+			return false
+		}
+		return true
+	}
+
+	txTree, rbInoTree, rbDenTree := mp.TxGetTree()
+	txTree.Ascend(f)
+	rbInoTree.Ascend(f)
+	rbDenTree.Ascend(f)
+
+	shouldSkip = true
+	buff.WriteString(`]}`)
+	if _, err = w.Write(buff.Bytes()); err != nil {
+		log.LogErrorf("[getAllTxHandler] response %s", err)
+	}
+	return
+}
 func (m *MetaNode) getDirectoryHandler(w http.ResponseWriter, r *http.Request) {
 	resp := NewAPIResponse(http.StatusBadRequest, "")
 	defer func() {
@@ -494,4 +661,82 @@ func (m *MetaNode) getDirectoryHandler(w http.ResponseWriter, r *http.Request) {
 		resp.Data = json.RawMessage(p.Data)
 	}
 	return
+}
+
+func (m *MetaNode) genClusterVersionFileHandler(w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	resp := NewAPIResponse(http.StatusOK, "Generate cluster version file success")
+	defer func() {
+		data, _ := resp.Marshal()
+		if _, err := w.Write(data); err != nil {
+			log.LogErrorf("[genClusterVersionFileHandler] response %s", err)
+		}
+	}()
+	paths := make([]string, 0)
+	paths = append(paths, m.metadataDir, m.raftDir)
+	for _, p := range paths {
+		if _, err := os.Stat(path.Join(p, config.ClusterVersionFile)); err == nil || os.IsExist(err) {
+			resp.Code = http.StatusCreated
+			resp.Msg = "Cluster version file already exists in " + p
+			return
+		}
+	}
+	for _, p := range paths {
+		if err := config.CheckOrStoreClusterUuid(p, m.clusterUuid, true); err != nil {
+			resp.Code = http.StatusInternalServerError
+			resp.Msg = "Failed to create cluster version file in " + p
+			return
+		}
+	}
+	return
+}
+
+func (m *MetaNode) getInodeSnapshotHandler(w http.ResponseWriter, r *http.Request) {
+	m.getSnapshotHandler(w, r, inodeFile)
+}
+
+func (m *MetaNode) getDentrySnapshotHandler(w http.ResponseWriter, r *http.Request) {
+	m.getSnapshotHandler(w, r, dentryFile)
+}
+
+func (m *MetaNode) getSnapshotHandler(w http.ResponseWriter, r *http.Request, file string) {
+	var err error
+	defer func() {
+		if err != nil {
+			msg := fmt.Sprintf("[getInodeSnapshotHandler] err(%v)", err)
+			log.LogErrorf("%s", msg)
+			if _, e := w.Write([]byte(msg)); e != nil {
+				log.LogErrorf("[getInodeSnapshotHandler] failed to write response: err(%v) msg(%v)", e, msg)
+			}
+		}
+	}()
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+	id, err := strconv.ParseUint(r.FormValue("pid"), 10, 64)
+	if err != nil {
+		return
+	}
+	mp, err := m.metadataManager.GetPartition(id)
+	if err != nil {
+		return
+	}
+
+	filename := path.Join(mp.GetBaseConfig().RootDir, snapshotDir, file)
+	if _, err = os.Stat(filename); err != nil {
+		err = errors.NewErrorf("[getInodeSnapshotHandler] Stat: %s", err.Error())
+		return
+	}
+	fp, err := os.OpenFile(filename, os.O_RDONLY, 0644)
+	if err != nil {
+		err = errors.NewErrorf("[getInodeSnapshotHandler] OpenFile: %s", err.Error())
+		return
+	}
+	defer fp.Close()
+
+	_, err = io.Copy(w, fp)
+	if err != nil {
+		err = errors.NewErrorf("[getInodeSnapshotHandler] copy: %s", err.Error())
+		return
+	}
 }

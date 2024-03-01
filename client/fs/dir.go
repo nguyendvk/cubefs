@@ -15,9 +15,13 @@
 package fs
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"os"
+	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -25,14 +29,12 @@ import (
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse"
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse/fs"
 
-	"github.com/cubefs/cubefs/sdk/meta"
-	"github.com/cubefs/cubefs/util/stat"
-
-	"golang.org/x/net/context"
-
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/sdk/meta"
+	"github.com/cubefs/cubefs/util/auditlog"
 	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
+	"github.com/cubefs/cubefs/util/stat"
 )
 
 // used to locate the position in parent
@@ -123,28 +125,6 @@ func NewDir(s *Super, i *proto.InodeInfo, pino uint64, dirName string) fs.Node {
 	}
 }
 
-func (d *Dir) getCwd() string {
-	dirPath := ""
-	curIno := d.info.Inode
-	for curIno != d.super.rootIno {
-		d.super.fslock.Lock()
-		node, ok := d.super.nodeCache[curIno]
-		d.super.fslock.Unlock()
-		if !ok {
-			log.LogErrorf("Get node cache failed: ino(%v)", curIno)
-			return "unknown" + dirPath
-		}
-		curDir, ok := node.(*Dir)
-		if !ok {
-			log.LogErrorf("Type error: Can not convert node -> *Dir, ino(%v)", curDir.parentIno)
-			return "unknown" + dirPath
-		}
-		dirPath = "/" + curDir.name + dirPath
-		curIno = curDir.parentIno
-	}
-	return dirPath
-}
-
 // Attr set the attributes of a directory.
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	var err error
@@ -175,26 +155,30 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 
 	bgTime := stat.BeginStat()
 	var err error
+	var newInode uint64
 	metric := exporter.NewTPCnt("filecreate")
+	fullPath := path.Join(d.getCwd(), req.Name)
 	defer func() {
 		stat.EndStat("Create", err, bgTime, 1)
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: d.super.volname})
+		auditlog.LogClientOp("Create", fullPath, "nil", err, time.Since(start).Microseconds(), newInode, 0)
 	}()
 
-	info, err := d.super.mw.Create_ll(d.info.Inode, req.Name, proto.Mode(req.Mode.Perm()), req.Uid, req.Gid, nil)
+	info, err := d.super.mw.Create_ll(d.info.Inode, req.Name, proto.Mode(req.Mode.Perm()), req.Uid, req.Gid, nil,
+		fullPath, false)
 	if err != nil {
 		log.LogErrorf("Create: parent(%v) req(%v) err(%v)", d.info.Inode, req, err)
 		return nil, nil, ParseError(err)
 	}
 
 	d.super.ic.Put(info)
-	child := NewFile(d.super, info, uint32(req.Flags&DefaultFlag), d.info.Inode)
+	child := NewFile(d.super, info, uint32(req.Flags&DefaultFlag), d.info.Inode, req.Name)
+	newInode = info.Inode
 
 	d.super.ec.OpenStream(info.Inode)
 	d.super.fslock.Lock()
 	d.super.nodeCache[info.Inode] = child
 	d.super.fslock.Unlock()
-
 	if d.super.keepCache {
 		resp.Flags |= fuse.OpenKeepCache
 	}
@@ -221,6 +205,7 @@ func (d *Dir) Forget() {
 	d.super.fslock.Lock()
 	delete(d.super.nodeCache, ino)
 	d.super.fslock.Unlock()
+	d.super.mw.DeleteInoInfoCache(ino)
 }
 
 // Mkdir handles the mkdir request.
@@ -229,13 +214,17 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 
 	bgTime := stat.BeginStat()
 	var err error
+	var newInode uint64
 	metric := exporter.NewTPCnt("mkdir")
+	fullPath := path.Join(d.getCwd(), req.Name)
 	defer func() {
 		stat.EndStat("Mkdir", err, bgTime, 1)
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: d.super.volname})
+		auditlog.LogClientOp("Mkdir", fullPath, "nil", err, time.Since(start).Microseconds(), newInode, 0)
 	}()
-
-	info, err := d.super.mw.Create_ll(d.info.Inode, req.Name, proto.Mode(os.ModeDir|req.Mode.Perm()), req.Uid, req.Gid, nil)
+	log.LogDebugf("TRACE Mkdir:enter")
+	info, err := d.super.mw.Create_ll(d.info.Inode, req.Name, proto.Mode(os.ModeDir|req.Mode.Perm()), req.Uid,
+		req.Gid, nil, fullPath, false)
 	if err != nil {
 		log.LogErrorf("Mkdir: parent(%v) req(%v) err(%v)", d.info.Inode, req, err)
 		return nil, ParseError(err)
@@ -243,7 +232,7 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 
 	d.super.ic.Put(info)
 	child := NewDir(d.super, info, d.info.Inode, req.Name)
-
+	newInode = info.Inode
 	d.super.fslock.Lock()
 	d.super.nodeCache[info.Inode] = child
 	d.super.fslock.Unlock()
@@ -259,21 +248,30 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	start := time.Now()
 	d.dcache.Delete(req.Name)
+	dcacheKey := d.buildDcacheKey(d.info.Inode, req.Name)
+	d.super.dc.Delete(dcacheKey)
 
 	bgTime := stat.BeginStat()
 	var err error
+	var deletedInode uint64
 	metric := exporter.NewTPCnt("remove")
+	fullPath := path.Join(d.getCwd(), req.Name)
 	defer func() {
 		stat.EndStat("Remove", err, bgTime, 1)
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: d.super.volname})
+		auditlog.LogClientOp("Remove", fullPath, "nil", err, time.Since(start).Microseconds(), deletedInode, 0)
+		log.LogDebugf("Remove: parent(%v) entry(%v) consume %v", d.info.Inode, req.Name, time.Since(start).Seconds())
 	}()
+	log.LogDebugf("TRACE Remove: parent(%v) entry(%v)", d.info.Inode, req.Name)
 
-	info, err := d.super.mw.Delete_ll(d.info.Inode, req.Name, req.Dir)
+	info, err := d.super.mw.Delete_ll(d.info.Inode, req.Name, req.Dir, fullPath)
 	if err != nil {
 		log.LogErrorf("Remove: parent(%v) name(%v) err(%v)", d.info.Inode, req.Name, err)
 		return ParseError(err)
 	}
-
+	if info != nil {
+		deletedInode = info.Inode
+	}
 	d.super.ic.Delete(d.info.Inode)
 
 	if info != nil && info.Nlink == 0 && !proto.IsDir(info.Mode) {
@@ -293,8 +291,9 @@ func (d *Dir) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 // Lookup handles the lookup request.
 func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
 	var (
-		ino uint64
-		err error
+		ino      uint64
+		err      error
+		dcachev2 bool
 	)
 
 	bgTime := stat.BeginStat()
@@ -303,23 +302,58 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 	}()
 
 	log.LogDebugf("TRACE Lookup: parent(%v) req(%v)", d.info.Inode, req)
+	log.LogDebugf("TRACE Lookup: parent(%v) path(%v) d.super.bcacheDir(%v)", d.info.Inode, d.getCwd(), d.super.bcacheDir)
 
-	ino, ok := d.dcache.Get(req.Name)
-	if !ok {
-		ino, _, err = d.super.mw.Lookup_ll(d.info.Inode, req.Name)
-		if err != nil {
-			if err != syscall.ENOENT {
-				log.LogErrorf("Lookup: parent(%v) name(%v) err(%v)", d.info.Inode, req.Name, err)
+	if d.needDentrycache() {
+		dcachev2 = true
+	}
+	if dcachev2 {
+		lookupMetric := exporter.NewCounter("lookupDcache")
+		lookupMetric.AddWithLabels(1, map[string]string{exporter.Vol: d.super.volname})
+		dcacheKey := d.buildDcacheKey(d.info.Inode, req.Name)
+		dentryInfo := d.super.dc.Get(dcacheKey)
+		if dentryInfo == nil {
+			lookupMetric := exporter.NewCounter("lookupDcacheMiss")
+			lookupMetric.AddWithLabels(1, map[string]string{exporter.Vol: d.super.volname})
+			ino, _, err = d.super.mw.Lookup_ll(d.info.Inode, req.Name)
+			if err != nil {
+				if err != syscall.ENOENT {
+					log.LogErrorf("Lookup: parent(%v) name(%v) err(%v)", d.info.Inode, req.Name, err)
+				}
+				return nil, ParseError(err)
 			}
-			return nil, ParseError(err)
+			info := &proto.DentryInfo{
+				Name:  dcacheKey,
+				Inode: ino,
+			}
+			d.super.dc.Put(info)
+		} else {
+			lookupMetric := exporter.NewCounter("lookupDcacheHit")
+			lookupMetric.AddWithLabels(1, map[string]string{exporter.Vol: d.super.volname})
+			ino = dentryInfo.Inode
+			d.super.mw.AddInoInfoCache(ino, d.info.Inode, req.Name)
 		}
+	} else {
+		cino, ok := d.dcache.Get(req.Name)
+		if !ok {
+			cino, _, err = d.super.mw.Lookup_ll(d.info.Inode, req.Name)
+			if err != nil {
+				if err != syscall.ENOENT {
+					log.LogErrorf("Lookup: parent(%v) name(%v) err(%v)", d.info.Inode, req.Name, err)
+				}
+				return nil, ParseError(err)
+			}
+		} else {
+			d.super.mw.AddInoInfoCache(cino, d.info.Inode, req.Name)
+		}
+		ino = cino
 	}
 
 	info, err := d.super.InodeGet(ino)
 	if err != nil {
 		log.LogErrorf("Lookup: parent(%v) name(%v) ino(%v) err(%v)", d.info.Inode, req.Name, ino, err)
 		dummyInodeInfo := &proto.InodeInfo{Inode: ino}
-		dummyChild := NewFile(d.super, dummyInodeInfo, DefaultFlag, d.info.Inode)
+		dummyChild := NewFile(d.super, dummyInodeInfo, DefaultFlag, d.info.Inode, req.Name)
 		return dummyChild, nil
 	}
 	mode := proto.OsMode(info.Mode)
@@ -329,7 +363,7 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 		if mode.IsDir() {
 			child = NewDir(d.super, info, d.info.Inode, req.Name)
 		} else {
-			child = NewFile(d.super, info, DefaultFlag, d.info.Inode)
+			child = NewFile(d.super, info, DefaultFlag, d.info.Inode, req.Name)
 		}
 		d.super.nodeCache[ino] = child
 	}
@@ -339,6 +373,10 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 
 	log.LogDebugf("TRACE Lookup exit: parent(%v) req(%v) cost (%d)", d.info.Inode, req, time.Since(*bgTime).Microseconds())
 	return child, nil
+}
+
+func (d *Dir) buildDcacheKey(inode uint64, name string) string {
+	return fmt.Sprintf("%v_%v", inode, name)
 }
 
 func (d *Dir) ReadDir(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) ([]fuse.Dirent, error) {
@@ -353,12 +391,46 @@ func (d *Dir) ReadDir(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Rea
 		stat.EndStat("ReadDirLimit", err, bgTime, 1)
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: d.super.volname})
 	}()
-
-	dirCtx := d.dctx.GetCopy(req.Handle)
+	var dirCtx DirContext
+	if req.Offset != 0 {
+		dirCtx = d.dctx.GetCopy(req.Handle)
+	} else {
+		dirCtx = DirContext{}
+	}
 	children, err := d.super.mw.ReadDirLimit_ll(d.info.Inode, dirCtx.Name, limit)
 	if err != nil {
-		log.LogErrorf("readdirlimit: Readdir: ino(%v) err(%v)", d.info.Inode, err)
+		log.LogErrorf("readdirlimit: Readdir: ino(%v) err(%v) offset %v", d.info.Inode, err, req.Offset)
 		return make([]fuse.Dirent, 0), ParseError(err)
+	}
+
+	if req.Offset == 0 {
+		if len(children) == 0 {
+			dirents := make([]fuse.Dirent, 0, len(children))
+			dirents = append(dirents, fuse.Dirent{
+				Inode: d.info.Inode,
+				Type:  fuse.DT_Dir,
+				Name:  ".",
+			})
+			pid := uint64(req.Pid)
+			if d.info.Inode == 1 {
+				pid = d.info.Inode
+			}
+			dirents = append(dirents, fuse.Dirent{
+				Inode: pid,
+				Type:  fuse.DT_Dir,
+				Name:  "..",
+			})
+			return dirents, io.EOF
+		}
+		children = append([]proto.Dentry{{
+			Name:  ".",
+			Inode: d.info.Inode,
+			Type:  uint32(os.ModeDir),
+		}, {
+			Name:  "..",
+			Inode: uint64(req.Pid),
+			Type:  uint32(os.ModeDir),
+		}}, children...)
 	}
 
 	// skip the first one, which is already accessed
@@ -379,10 +451,15 @@ func (d *Dir) ReadDir(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Rea
 	inodes := make([]uint64, 0, len(children))
 	dirents := make([]fuse.Dirent, 0, len(children))
 
-	dcache := d.dcache
+	log.LogDebugf("Readdir ino(%v) path(%v) d.super.bcacheDir(%v)", d.info.Inode, d.getCwd(), d.super.bcacheDir)
+	var dcache *DentryCache
 	if !d.super.disableDcache {
 		dcache = NewDentryCache()
-		d.dcache = dcache
+	}
+
+	var dcachev2 bool
+	if d.needDentrycache() {
+		dcachev2 = true
 	}
 
 	for _, child := range children {
@@ -394,7 +471,15 @@ func (d *Dir) ReadDir(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Rea
 
 		inodes = append(inodes, child.Inode)
 		dirents = append(dirents, dentry)
-		dcache.Put(child.Name, child.Inode)
+		if dcachev2 {
+			info := &proto.DentryInfo{
+				Name:  d.buildDcacheKey(d.info.Inode, child.Name),
+				Inode: child.Inode,
+			}
+			d.super.dc.Put(info)
+		} else {
+			dcache.Put(child.Name, child.Inode)
+		}
 	}
 
 	infos := d.super.mw.BatchInodeGet(inodes)
@@ -402,6 +487,7 @@ func (d *Dir) ReadDir(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Rea
 		d.super.ic.Put(info)
 	}
 
+	d.dcache = dcache
 	elapsed := time.Since(start)
 	log.LogDebugf("TRACE ReadDir exit: ino(%v) (%v)ns %v", d.info.Inode, elapsed.Nanoseconds(), req)
 	return dirents, err
@@ -410,7 +496,6 @@ func (d *Dir) ReadDir(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Rea
 // ReadDirAll gets all the dentries in a directory and puts them into the cache.
 func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	start := time.Now()
-
 	bgTime := stat.BeginStat()
 	var err error
 	metric := exporter.NewTPCnt("readdir")
@@ -419,18 +504,42 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: d.super.volname})
 	}()
 
-	children, err := d.super.mw.ReadDir_ll(d.info.Inode)
-	if err != nil {
-		log.LogErrorf("Readdir: ino(%v) err(%v)", d.info.Inode, err)
-		return make([]fuse.Dirent, 0), ParseError(err)
+	// transform ReadDirAll to ReadDirLimit_ll
+	var noMore = false
+	var from = ""
+	var children []proto.Dentry
+	for !noMore {
+		batches, err := d.super.mw.ReadDirLimit_ll(d.info.Inode, from, DefaultReaddirLimit)
+		if err != nil {
+			log.LogErrorf("Readdir: ino(%v) err(%v) from(%v)", d.info.Inode, err, from)
+			return make([]fuse.Dirent, 0), ParseError(err)
+		}
+		batchNr := uint64(len(batches))
+		if batchNr == 0 || (from != "" && batchNr == 1) {
+			noMore = true
+			break
+		} else if batchNr < DefaultReaddirLimit {
+			noMore = true
+		}
+		if from != "" {
+			batches = batches[1:]
+		}
+		children = append(children, batches...)
+		from = batches[len(batches)-1].Name
 	}
 
 	inodes := make([]uint64, 0, len(children))
 	dirents := make([]fuse.Dirent, 0, len(children))
 
+	log.LogDebugf("Readdir ino(%v) path(%v) d.super.bcacheDir(%v)", d.info.Inode, d.getCwd(), d.super.bcacheDir)
 	var dcache *DentryCache
 	if !d.super.disableDcache {
 		dcache = NewDentryCache()
+	}
+
+	var dcachev2 bool
+	if d.needDentrycache() {
+		dcachev2 = true
 	}
 
 	for _, child := range children {
@@ -442,7 +551,15 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 
 		inodes = append(inodes, child.Inode)
 		dirents = append(dirents, dentry)
-		dcache.Put(child.Name, child.Inode)
+		if dcachev2 {
+			info := &proto.DentryInfo{
+				Name:  d.buildDcacheKey(d.info.Inode, child.Name),
+				Inode: child.Inode,
+			}
+			d.super.dc.Put(info)
+		} else {
+			dcache.Put(child.Name, child.Inode)
+		}
 	}
 
 	infos := d.super.mw.BatchInodeGet(inodes)
@@ -450,7 +567,6 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		d.super.ic.Put(info)
 	}
 	d.dcache = dcache
-
 	elapsed := time.Since(start)
 	log.LogDebugf("TRACE ReadDirAll: ino(%v) (%v)ns", d.info.Inode, elapsed.Nanoseconds())
 	return dirents, nil
@@ -463,23 +579,63 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 		log.LogErrorf("Rename: NOT DIR, parent(%v) req(%v)", d.info.Inode, req)
 		return fuse.ENOTSUP
 	}
+	log.LogDebugf("TRACE Rename: enter")
 	start := time.Now()
+	var srcInode uint64 // must exist
+	var dstInode uint64 // may not exist
+	var err error
+	if ino, ok := dstDir.dcache.Get(req.NewName); ok {
+		dstInode = ino
+	}
+	if ino, ok := d.dcache.Get(req.OldName); ok {
+		srcInode = ino
+	} else {
+		// will not get there
+		if ino, _, err := d.super.mw.Lookup_ll(d.info.Inode, req.OldName); err == nil {
+			srcInode = ino
+		}
+	}
 	d.dcache.Delete(req.OldName)
+	dcacheKey := d.buildDcacheKey(d.info.Inode, req.OldName)
+	d.super.dc.Delete(dcacheKey)
 
 	bgTime := stat.BeginStat()
-	var err error
+
 	metric := exporter.NewTPCnt("rename")
+	srcPath := path.Join(d.getCwd(), req.OldName)
+	dstPath := path.Join(dstDir.getCwd(), req.NewName)
 	defer func() {
 		stat.EndStat("Rename", err, bgTime, 1)
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: d.super.volname})
+		d.super.fslock.Lock()
+		node, ok := d.super.nodeCache[srcInode]
+		if ok && srcInode != 0 {
+			if dir, ok := node.(*Dir); ok {
+				dir.name = req.NewName
+				dir.parentIno = dstDir.info.Inode
+			} else {
+				file := node.(*File)
+				file.name = req.NewName
+				file.parentIno = dstDir.info.Inode
+			}
+		}
+		d.super.fslock.Unlock()
+		auditlog.LogClientOp("Rename", srcPath, dstPath, err, time.Since(start).Microseconds(), srcInode, dstInode)
 	}()
-
-	err = d.super.mw.Rename_ll(d.info.Inode, req.OldName, dstDir.info.Inode, req.NewName, true)
+	//changePathMap := d.super.mw.GetChangeQuota(d.getCwd()+"/"+req.OldName, dstDir.getCwd()+"/"+req.NewName)
+	if d.super.mw.EnableQuota {
+		if !d.canRenameByQuota(dstDir, req.OldName) {
+			return fuse.EPERM
+		}
+	}
+	err = d.super.mw.Rename_ll(d.info.Inode, req.OldName, dstDir.info.Inode, req.NewName, srcPath, dstPath, true)
 	if err != nil {
 		log.LogErrorf("Rename: parent(%v) req(%v) err(%v)", d.info.Inode, req, err)
 		return ParseError(err)
 	}
-
+	// if len(changePathMap) != 0 {
+	// 	d.super.mw.BatchModifyQuotaPath(changePathMap)
+	// }
 	d.super.ic.Delete(d.info.Inode)
 	d.super.ic.Delete(dstDir.info.Inode)
 
@@ -521,7 +677,7 @@ func (d *Dir) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.
 }
 
 func (d *Dir) Mknod(ctx context.Context, req *fuse.MknodRequest) (fs.Node, error) {
-	if (req.Mode&os.ModeNamedPipe == 0 && req.Mode&os.ModeSocket == 0) || req.Rdev != 0 {
+	if req.Rdev != 0 {
 		return nil, fuse.ENOSYS
 	}
 
@@ -534,15 +690,16 @@ func (d *Dir) Mknod(ctx context.Context, req *fuse.MknodRequest) (fs.Node, error
 		stat.EndStat("Mknod", err, bgTime, 1)
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: d.super.volname})
 	}()
-
-	info, err := d.super.mw.Create_ll(d.info.Inode, req.Name, proto.Mode(req.Mode), req.Uid, req.Gid, nil)
+	fullPath := path.Join(d.getCwd(), req.Name)
+	info, err := d.super.mw.Create_ll(d.info.Inode, req.Name, proto.Mode(req.Mode), req.Uid, req.Gid,
+		nil, fullPath, false)
 	if err != nil {
 		log.LogErrorf("Mknod: parent(%v) req(%v) err(%v)", d.info.Inode, req, err)
 		return nil, ParseError(err)
 	}
 
 	d.super.ic.Put(info)
-	child := NewFile(d.super, info, DefaultFlag, d.info.Inode)
+	child := NewFile(d.super, info, DefaultFlag, d.info.Inode, req.Name)
 
 	d.super.fslock.Lock()
 	d.super.nodeCache[info.Inode] = child
@@ -565,15 +722,16 @@ func (d *Dir) Symlink(ctx context.Context, req *fuse.SymlinkRequest) (fs.Node, e
 		stat.EndStat("Symlink", err, bgTime, 1)
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: d.super.volname})
 	}()
-
-	info, err := d.super.mw.Create_ll(parentIno, req.NewName, proto.Mode(os.ModeSymlink|os.ModePerm), req.Uid, req.Gid, []byte(req.Target))
+	fullPath := path.Join(d.getCwd(), req.NewName)
+	info, err := d.super.mw.Create_ll(parentIno, req.NewName, proto.Mode(os.ModeSymlink|os.ModePerm), req.Uid,
+		req.Gid, []byte(req.Target), fullPath, false)
 	if err != nil {
 		log.LogErrorf("Symlink: parent(%v) NewName(%v) err(%v)", parentIno, req.NewName, err)
 		return nil, ParseError(err)
 	}
 
 	d.super.ic.Put(info)
-	child := NewFile(d.super, info, DefaultFlag, d.info.Inode)
+	child := NewFile(d.super, info, DefaultFlag, d.info.Inode, req.NewName)
 
 	d.super.fslock.Lock()
 	d.super.nodeCache[info.Inode] = child
@@ -608,8 +766,8 @@ func (d *Dir) Link(ctx context.Context, req *fuse.LinkRequest, old fs.Node) (fs.
 		stat.EndStat("Link", err, bgTime, 1)
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: d.super.volname})
 	}()
-
-	info, err := d.super.mw.Link(d.info.Inode, req.NewName, oldInode.Inode)
+	fullPath := path.Join(d.getCwd(), req.NewName)
+	info, err := d.super.mw.Link(d.info.Inode, req.NewName, oldInode.Inode, fullPath)
 	if err != nil {
 		log.LogErrorf("Link: parent(%v) name(%v) ino(%v) err(%v)", d.info.Inode, req.NewName, oldInode.Inode, err)
 		return nil, ParseError(err)
@@ -620,7 +778,7 @@ func (d *Dir) Link(ctx context.Context, req *fuse.LinkRequest, old fs.Node) (fs.
 	d.super.fslock.Lock()
 	newFile, ok := d.super.nodeCache[info.Inode]
 	if !ok {
-		newFile = NewFile(d.super, info, DefaultFlag, d.info.Inode)
+		newFile = NewFile(d.super, info, DefaultFlag, d.info.Inode, req.NewName)
 		d.super.nodeCache[info.Inode] = newFile
 	}
 	d.super.fslock.Unlock()
@@ -774,4 +932,62 @@ func (d *Dir) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) err
 	}
 	log.LogDebugf("TRACE RemoveXattr: ino(%v) name(%v)", ino, name)
 	return nil
+}
+
+func (d *Dir) getCwd() string {
+	dirPath := ""
+	if d.info.Inode == d.super.rootIno {
+		return "/"
+	}
+	curIno := d.info.Inode
+	for curIno != d.super.rootIno {
+		d.super.fslock.Lock()
+		node, ok := d.super.nodeCache[curIno]
+		d.super.fslock.Unlock()
+		if !ok {
+			log.LogErrorf("Get node cache failed: ino(%v)", curIno)
+			return "unknown" + dirPath
+		}
+		curDir, ok := node.(*Dir)
+		if !ok {
+			log.LogErrorf("Type error: Can not convert node -> *Dir, ino(%v)", curDir.parentIno)
+			return "unknown" + dirPath
+		}
+		dirPath = "/" + curDir.name + dirPath
+		curIno = curDir.parentIno
+	}
+	return dirPath
+}
+
+func (d *Dir) needDentrycache() bool {
+	return !DisableMetaCache && d.super.bcacheDir != "" && strings.HasPrefix(d.getCwd(), d.super.bcacheDir)
+}
+
+func dentryExpired(info *proto.DentryInfo) bool {
+	return time.Now().UnixNano() > info.Expiration()
+}
+
+func dentrySetExpiration(info *proto.DentryInfo, t time.Duration) {
+	info.SetExpiration(time.Now().Add(t).UnixNano())
+}
+
+func (d *Dir) canRenameByQuota(dstDir *Dir, srcName string) bool {
+	fullPaths := d.super.mw.GetQuotaFullPaths()
+	if len(fullPaths) == 0 {
+		return true
+	}
+	var srcPath string
+	if d.getCwd() == "/" {
+		srcPath = "/" + srcName
+	} else {
+		srcPath = d.getCwd() + "/" + srcName
+	}
+
+	for _, fullPath := range fullPaths {
+		log.LogDebugf("srcPath [%v] fullPath[%v].", srcPath, fullPath)
+		if proto.IsAncestor(srcPath, fullPath) {
+			return false
+		}
+	}
+	return true
 }

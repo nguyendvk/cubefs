@@ -118,7 +118,7 @@ func TestClustermgrClient(t *testing.T) {
 
 		cli.client.(*MockClusterManager).EXPECT().UnlockVolume(any, any).Return(errcode.ErrUnlockNotAllow)
 		err = cli.UnlockVolume(ctx, proto.Vid(1))
-		require.NoError(t, err)
+		require.ErrorIs(t, errcode.ErrUnlockNotAllow, err)
 
 		cli.client.(*MockClusterManager).EXPECT().UnlockVolume(any, any).Return(errMock)
 		err = cli.UnlockVolume(ctx, proto.Vid(1))
@@ -199,7 +199,7 @@ func TestClustermgrClient(t *testing.T) {
 	{
 		// list broken disk
 		cli.client.(*MockClusterManager).EXPECT().ListDisk(any, any).Return(cmapi.ListDiskRet{}, errMock)
-		_, err := cli.ListBrokenDisks(ctx, 1)
+		_, err := cli.ListBrokenDisks(ctx)
 		require.True(t, errors.Is(err, errMock))
 	}
 	{
@@ -345,6 +345,18 @@ func TestClustermgrClient(t *testing.T) {
 		task1 := &proto.MigrateTask{TaskID: GenMigrateTaskID(proto.TaskTypeDiskRepair, proto.DiskID(1), proto.Vid(1))}
 		cli.client.(*MockClusterManager).EXPECT().DeleteKV(any, any).Return(nil)
 		err := cli.DeleteMigrateTask(ctx, task1.TaskID)
+		require.NoError(t, err)
+	}
+	{ // kv over defaultListTaskNum
+		cli.client.(*MockClusterManager).EXPECT().ListKV(any, any).Return(cmapi.ListKvRet{Marker: "has"}, nil)
+		cli.client.(*MockClusterManager).EXPECT().ListKV(any, any).DoAndReturn(
+			func(_ context.Context, args *cmapi.ListKvOpts) (ret cmapi.ListKvRet, err error) {
+				if args.Marker != "has" {
+					return cmapi.ListKvRet{}, errMock
+				}
+				return cmapi.ListKvRet{Marker: ""}, nil
+			})
+		_, err := cli.ListAllMigrateTasks(ctx, proto.TaskTypeDiskRepair)
 		require.NoError(t, err)
 	}
 	{

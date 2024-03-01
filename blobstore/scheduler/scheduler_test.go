@@ -30,7 +30,7 @@ import (
 
 // github.com/cubefs/cubefs/blobstore/scheduler/... module scheduler interfaces
 //go:generate mockgen -destination=./client_mock_test.go -package=scheduler -mock_names ClusterMgrAPI=MockClusterMgrAPI,BlobnodeAPI=MockBlobnodeAPI,IVolumeUpdater=MockVolumeUpdater,ProxyAPI=MockMqProxyAPI github.com/cubefs/cubefs/blobstore/scheduler/client ClusterMgrAPI,BlobnodeAPI,IVolumeUpdater,ProxyAPI
-//go:generate mockgen -destination=./base_mock_test.go -package=scheduler -mock_names IConsumer=MockConsumer,IProducer=MockProducer github.com/cubefs/cubefs/blobstore/scheduler/base IConsumer,IProducer
+//go:generate mockgen -destination=./base_mock_test.go -package=scheduler -mock_names KafkaConsumer=MockKafkaConsumer,GroupConsumer=MockGroupConsumer,IProducer=MockProducer github.com/cubefs/cubefs/blobstore/scheduler/base KafkaConsumer,GroupConsumer,IProducer
 //go:generate mockgen -destination=./scheduler_mock_test.go -package=scheduler -mock_names ITaskRunner=MockTaskRunner,IVolumeCache=MockVolumeCache,MMigrator=MockMigrater,IVolumeInspector=MockVolumeInspector,IClusterTopology=MockClusterTopology github.com/cubefs/cubefs/blobstore/scheduler ITaskRunner,IVolumeCache,MMigrator,IVolumeInspector,IClusterTopology
 
 const (
@@ -38,13 +38,34 @@ const (
 )
 
 var (
-	any     = gomock.Any()
-	errMock = errors.New("fake error")
+	any       = gomock.Any()
+	errMock   = errors.New("fake error")
+	testDisk1 = &client.DiskInfoSimple{
+		ClusterID:    1,
+		Idc:          "z0",
+		Rack:         "rack1",
+		Host:         "127.0.0.1:8000",
+		Status:       proto.DiskStatusNormal,
+		DiskID:       1,
+		FreeChunkCnt: 10,
+		UsedChunkCnt: 20,
+		MaxChunkCnt:  700,
+	}
+	testDisk2 = &client.DiskInfoSimple{
+		ClusterID:    1,
+		Idc:          "z0",
+		Rack:         "rack1",
+		Host:         "127.0.0.1:8000",
+		Status:       proto.DiskStatusNormal,
+		DiskID:       2,
+		FreeChunkCnt: 10,
+		UsedChunkCnt: 10,
+		MaxChunkCnt:  700,
+	}
 )
 
 func NewBroker(t *testing.T) *sarama.MockBroker {
 	mockFetchResponse := sarama.NewMockFetchResponse(t, 1)
-	mockFetchResponse.SetVersion(1)
 	var msg sarama.ByteEncoder = []byte("FOO")
 	for i := 0; i < 1000; i++ {
 		mockFetchResponse.SetMessage(testTopic, 0, int64(i), msg)

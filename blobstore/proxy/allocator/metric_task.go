@@ -16,7 +16,6 @@ package allocator
 
 import (
 	"context"
-	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -31,7 +30,7 @@ var proxyStatusMetric = prometheus.NewGaugeVec(
 		Name:      "volume_status",
 		Help:      "proxy status about allocator",
 	},
-	[]string{"service", "cluster", "idc", "codemode", "type"},
+	[]string{"service", "cluster", "idc", "host", "codemode", "type"},
 )
 
 func init() {
@@ -56,26 +55,27 @@ func (v *volumeMgr) metricReportTask() {
 
 func (v *volumeMgr) metricReport(ctx context.Context) {
 	span := trace.SpanFromContextSafe(ctx)
-	for codeMode, modeInfo := range v.modeInfos {
-		vols := modeInfo.volumes.List()
-		volNums := len(vols)
+	for codeMode, info := range v.modeInfos {
+		volNums := info.VolumeNum()
 		proxyStatusMetric.With(
 			prometheus.Labels{
 				"service":  "PROXY",
-				"cluster":  strconv.FormatUint(uint64(v.ClusterID), 10),
+				"cluster":  v.ClusterID.ToString(),
 				"idc":      v.Idc,
+				"host":     v.Host,
 				"codemode": codeMode.String(),
 				"type":     "volume_nums",
 			}).Set(float64(volNums))
 		proxyStatusMetric.With(
 			prometheus.Labels{
 				"service":  "PROXY",
-				"cluster":  strconv.FormatUint(uint64(v.ClusterID), 10),
+				"cluster":  v.ClusterID.ToString(),
 				"idc":      v.Idc,
+				"host":     v.Host,
 				"codemode": codeMode.String(),
 				"type":     "total_free_size",
-			}).Set(float64(modeInfo.totalFree))
-		span.Debugf("metric report total_free_size: %v, idc: %v, codemode: %v,", float64(modeInfo.totalFree),
-			v.Idc, codeMode.String())
+			}).Set(float64(info.TotalFree()))
+		span.Debugf("metric report total_free_size: %d, idc: %s, codemode: %s,",
+			info.TotalFree(), v.Idc, codeMode.String())
 	}
 }

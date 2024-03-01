@@ -53,7 +53,7 @@ func (c *Cluster) checkLoadMetaPartitions() {
 	}
 }
 
-func (mp *MetaPartition) checkSnapshot(clusterID string) {
+func (mp *MetaPartition) checkSnapshot(c *Cluster) {
 	if len(mp.LoadResponse) == 0 {
 		return
 	}
@@ -63,8 +63,13 @@ func (mp *MetaPartition) checkSnapshot(clusterID string) {
 	if !mp.isSameApplyID() {
 		return
 	}
-	mp.checkInodeCount(clusterID)
-	mp.checkDentryCount(clusterID)
+	ckInode := mp.checkInodeCount(c)
+	ckDentry := mp.checkDentryCount(c)
+	if ckInode && ckDentry {
+		mp.EqualCheckPass = true
+	} else {
+		mp.EqualCheckPass = false
+	}
 }
 
 func (mp *MetaPartition) doCompare() bool {
@@ -87,29 +92,61 @@ func (mp *MetaPartition) isSameApplyID() bool {
 	return rst
 }
 
-func (mp *MetaPartition) checkInodeCount(clusterID string) {
-	isEqual := true
+func (mp *MetaPartition) checkInodeCount(c *Cluster) (isEqual bool) {
+	isEqual = true
 	maxInode := mp.LoadResponse[0].MaxInode
+	maxInodeCount := mp.LoadResponse[0].InodeCount
+	inodeEqual := true
+	maxInodeEqual := true
+	if mp.IsRecover {
+		return
+	}
 	for _, loadResponse := range mp.LoadResponse {
 		diff := math.Abs(float64(loadResponse.MaxInode) - float64(maxInode))
 		if diff > defaultRangeOfCountDifferencesAllowed {
 			isEqual = false
+			inodeEqual = false
+			break
+		}
+		diff = math.Abs(float64(loadResponse.InodeCount) - float64(maxInodeCount))
+		if diff > defaultRangeOfCountDifferencesAllowed {
+			isEqual = false
+			maxInodeEqual = false
+			break
 		}
 	}
-
 	if !isEqual {
 		msg := fmt.Sprintf("inode count is not equal,vol[%v],mpID[%v],", mp.volName, mp.PartitionID)
 		for _, lr := range mp.LoadResponse {
-			inodeCountStr := strconv.FormatUint(lr.MaxInode, 10)
+			inodeMaxInodeStr := strconv.FormatUint(lr.MaxInode, 10)
+			inodeCountStr := strconv.FormatUint(lr.InodeCount, 10)
 			applyIDStr := strconv.FormatUint(uint64(lr.ApplyID), 10)
-			msg = msg + lr.Addr + " applyId[" + applyIDStr + "] maxInode[" + inodeCountStr + "],"
+			msg = msg + lr.Addr + " applyId[" + applyIDStr + "] maxInode[" + inodeMaxInodeStr + "] maxInodeCnt[" + inodeCountStr + "],"
 		}
-		Warn(clusterID, msg)
+		Warn(c.Name, msg)
+		if !maxInodeEqual {
+			c.inodeCountNotEqualMP.Store(mp.PartitionID, mp)
+		}
+		if !inodeEqual {
+			c.maxInodeNotEqualMP.Store(mp.PartitionID, mp)
+		}
+
+	} else {
+		if _, ok := c.inodeCountNotEqualMP.Load(mp.PartitionID); ok {
+			c.inodeCountNotEqualMP.Delete(mp.PartitionID)
+		}
+		if _, ok := c.maxInodeNotEqualMP.Load(mp.PartitionID); ok {
+			c.maxInodeNotEqualMP.Delete(mp.PartitionID)
+		}
 	}
+	return
 }
 
-func (mp *MetaPartition) checkDentryCount(clusterID string) {
-	isEqual := true
+func (mp *MetaPartition) checkDentryCount(c *Cluster) (isEqual bool) {
+	isEqual = true
+	if mp.IsRecover {
+		return
+	}
 	dentryCount := mp.LoadResponse[0].DentryCount
 	for _, loadResponse := range mp.LoadResponse {
 		diff := math.Abs(float64(loadResponse.DentryCount) - float64(dentryCount))
@@ -125,8 +162,14 @@ func (mp *MetaPartition) checkDentryCount(clusterID string) {
 			applyIDStr := strconv.FormatUint(uint64(lr.ApplyID), 10)
 			msg = msg + lr.Addr + " applyId[" + applyIDStr + "] dentryCount[" + dentryCountStr + "],"
 		}
-		Warn(clusterID, msg)
+		Warn(c.Name, msg)
+		c.dentryCountNotEqualMP.Store(mp.PartitionID, mp)
+	} else {
+		if _, ok := c.dentryCountNotEqualMP.Load(mp.PartitionID); ok {
+			c.dentryCountNotEqualMP.Delete(mp.PartitionID)
+		}
 	}
+	return
 }
 
 func (c *Cluster) scheduleToCheckMetaPartitionRecoveryProgress() {

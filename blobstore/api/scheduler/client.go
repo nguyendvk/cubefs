@@ -26,8 +26,9 @@ import (
 
 // defined http server path.
 const (
-	PathStats       = "/stats"
-	PathLeaderStats = "/leader/stats"
+	PathStats              = "/stats"
+	PathStatsLeader        = "/stats/leader"
+	PathStatsDiskMigrating = "/stats/disk/migrating"
 
 	PathTaskAcquire          = "/task/acquire"
 	PathTaskReclaim          = "/task/reclaim"
@@ -43,6 +44,8 @@ const (
 	PathTaskDetailURI = PathTaskDetail + "/:type/:id" // "/task/detail/:type/:id"
 	PathUpdateVolume  = "/update/vol"
 )
+
+const defaultHostSyncIntervalMs = 3600000 // 1 hour
 
 var errNoServiceAvailable = errors.New("no service available")
 
@@ -65,6 +68,7 @@ type IInspector interface {
 // ISchedulerStatus scheduler status.
 type ISchedulerStatus interface {
 	DetailMigrateTask(ctx context.Context, args *MigrateTaskDetailArgs) (detail MigrateTaskDetail, err error)
+	DiskMigratingStats(ctx context.Context, args *DiskMigratingStatsArgs) (ret *DiskMigratingStats, err error)
 	Stats(ctx context.Context, host string) (ret TasksStat, err error)
 	LeaderStats(ctx context.Context) (ret TasksStat, err error)
 }
@@ -122,7 +126,7 @@ func New(cfg *Config, service cmapi.APIService, clusterID proto.ClusterID) ISche
 		return hosts, nil
 	}
 	if cfg.HostSyncIntervalMs == 0 {
-		cfg.HostSyncIntervalMs = 1000
+		cfg.HostSyncIntervalMs = defaultHostSyncIntervalMs
 	}
 	if cfg.HostRetry == 0 {
 		cfg.HostRetry = 1

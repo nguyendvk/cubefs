@@ -13,6 +13,7 @@ This page contains a list of organizations who are using CubeFS in production or
 - **[BEIKE](https://ke.com):** BEIKE uses CubeFS to support its AI platform storing tons of model and material files. And more and more internal customers are migrating their data to CubeFS clusters.
 - **[LinkSure Network](https://cn.wifi.com)**: LinkSure uses CubeFS to store application logs running inside container environments as well as nginx logs. Also, they use CubeFS as the backend storage for Elasticsearch.
 - **[Reconova](http://www.reconova.com):** Reconova uses CubeFS to store massive small files in the production environment. It currently uses one CubeFS volume to store more than 80 million small files and each file around 40 kilobytes in size.
+- **[BIGO](https://www.bigo.sg/):** BIGO uses CubeFS to store logs for AI platform applications that running in the container environment, because CubeFS have excellent concurrent processing capability.
 
 ## Adopters
 
@@ -26,10 +27,11 @@ This page contains a list of organizations who are using CubeFS in production or
 | [BEIKE](https://www.ke.com) | ![production](https://img.shields.io/badge/-production-blue?style=flat) |
 | [Reconova](http://www.reconova.com) | ![production](https://img.shields.io/badge/-production-blue?style=flat) |
 | [LinkSure Network](https://cn.wifi.com) | ![production](https://img.shields.io/badge/-production-blue?style=flat) |
+| [BIGO LIVE](https://www.bigo.tv/cn/) | ![production](https://img.shields.io/badge/-production-blue?style=flat) |
+| [Xiaomi](https://www.mi.com/global/) | ![production](https://img.shields.io/badge/-production-blue?style=flat) |
+| [PITS Global Data Recovery Services](https://www.pitsdatarecovery.net/) | ![testing](https://img.shields.io/badge/-testing-green?style=flat) |
 | [Da-Jiang Innovations](https://www.dji.com/cn) | ![testing](https://img.shields.io/badge/-testing-green?style=flat) |
 | [Yanhuang Data](https://yanhuangdata.com/) | ![testing](https://img.shields.io/badge/-testing-green?style=flat) |
-| [BIGO LIVE](https://www.bigo.tv/cn/) | ![testing](https://img.shields.io/badge/-testing-green?style=flat) |
-| [Xiaomi](https://www.mi.com/global/) | ![testing](https://img.shields.io/badge/-testing-green?style=flat) |
 | [Sinosoft](http://www.sinosoft.com.cn) | ![testing](https://img.shields.io/badge/-testing-green?style=flat) |
 | [DADA](https://about.imdada.cn) | ![testing](https://img.shields.io/badge/-testing-green?style=flat) |
 | [Club Factory](https://www.wholeeprime.com/) | ![testing](https://img.shields.io/badge/-testing-green?style=flat) |

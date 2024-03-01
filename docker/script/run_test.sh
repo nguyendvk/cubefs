@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2018 The Chubao Authors.
+# Copyright 2018 The CubeFS Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 MntPoint=/cfs/mnt
 mkdir -p /cfs/bin /cfs/log /cfs/mnt
-src_path=/go/src/github.com/chubaofs/cfs
+src_path=/go/src/github.com/cubefs/cfs
 cli=/cfs/bin/cfs-cli
 conf_path=/cfs/conf
 
@@ -292,7 +292,9 @@ create_volumes ; sleep 2
 add_data_partitions ; sleep 3
 show_cluster_info
 start_client ; sleep 2
-run_ltptest
+if [ "$1"x = "-ltp"x ]; then
+    run_ltptest
+fi
 run_s3_test
 stop_client
 delete_volumes

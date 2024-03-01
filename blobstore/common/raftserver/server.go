@@ -28,6 +28,11 @@ import (
 	pb "go.etcd.io/etcd/raft/v3/raftpb"
 )
 
+const (
+	applyChCapacity = 512
+	applyChLength   = 400
+)
+
 type RaftServer interface {
 	Stop()
 	Propose(ctx context.Context, data []byte) error
@@ -98,7 +103,7 @@ func NewRaftServer(cfg *Config) (RaftServer, error) {
 		applyWait:      NewTimeList(),
 		propc:          make(chan propose, 512),
 		readStateC:     make(chan raft.ReadState, 64),
-		applyc:         make(chan apply, 512),
+		applyc:         make(chan apply, applyChCapacity),
 		snapshotC:      make(chan Snapshot),
 		snapMsgc:       make(chan pb.Message, cfg.MaxSnapConcurrency),
 		readwaitc:      make(chan struct{}),
@@ -113,6 +118,10 @@ func NewRaftServer(cfg *Config) (RaftServer, error) {
 	}
 	lastIndex, _ := store.LastIndex()
 	firstIndex, _ := store.FirstIndex()
+	hs, _, err := store.InitialState()
+	if err != nil {
+		return nil, err
+	}
 
 	log.Infof("load raft wal success, total: %dus, firstIndex: %d, lastIndex: %d, members: %+v",
 		time.Since(begin).Microseconds(), firstIndex, lastIndex, cfg.Members)
@@ -132,6 +141,9 @@ func NewRaftServer(cfg *Config) (RaftServer, error) {
 	rs.tr = NewTransport(cfg.ListenPort, rs)
 	for _, m := range cfg.Members {
 		rs.addMember(m)
+	}
+	if hs.Commit < cfg.Applied {
+		cfg.Applied = hs.Commit
 	}
 	raftCfg.Applied = cfg.Applied
 	store.SetApplied(cfg.Applied)
@@ -255,6 +267,7 @@ func (s *raftServer) Status() Status {
 		RaftState:      st.RaftState.String(),
 		Applied:        s.store.Applied(),
 		RaftApplied:    st.Applied,
+		ApplyingLength: len(s.applyc),
 		LeadTransferee: st.LeadTransferee,
 	}
 	for id, pr := range st.Progress {
@@ -317,6 +330,10 @@ func (s *raftServer) raftApply() {
 			snap := ap.snapshot
 			notifies = append(notifies, ap.notifyc)
 			n := len(s.applyc)
+			// if applyc length bigger than 80% of applyChCapacity, record the length in log
+			if n > applyChLength {
+				log.Warnf("applyc capacity is %d,now length is:%d, over %d", applyChCapacity, n, applyChLength)
+			}
 			for i := 0; i < n && raft.IsEmptySnap(snap); i++ {
 				ap = <-s.applyc
 				entries = append(entries, ap.entries...)
@@ -656,6 +673,7 @@ func (s *raftServer) linearizableReadLoop() {
 				done = true
 				isTimeout = true
 				nr.Notify(ErrTimeout)
+				log.Warnf("the length of applyC is %d", len(s.applyc))
 			case <-s.stopc:
 				cancel()
 				nr.Notify(ErrStopped)

@@ -50,8 +50,11 @@ type VolumeMgrConfig struct {
 	ApplyConcurrency             uint32 `json:"apply_concurrency"`
 	MinAllocableVolumeCount      int    `json:"min_allocable_volume_count"`
 	AllocatableDiskLoadThreshold int    `json:"allocatable_disk_load_threshold"`
+	AllocFactor                  int    `json:"alloc_factor"`
+	// the volume free size must big than AllocatableSize can alloc
+	AllocatableSize uint64 `json:"allocatable_size"`
 
-	// the volume free size small than FreezeThreshold treat filled
+	// the volume in Proxy which free size small than FreezeThreshold treat filled
 	FreezeThreshold  uint64            `json:"-"`
 	IDC              []string          `json:"-"`
 	UnavailableIDC   string            `json:"-"`
@@ -78,13 +81,19 @@ func (c *VolumeMgrConfig) checkAndFix() {
 		c.ApplyConcurrency = defaultApplyConcurrency
 	}
 	if c.MinAllocableVolumeCount <= 0 {
-		c.MinAllocableVolumeCount = defaultMinAllocableVolumeCount
+		c.MinAllocableVolumeCount = defaultMinAllocatableVolumeCount
 	}
 	if c.CheckExpiredVolumeIntervalS <= 0 {
 		c.CheckExpiredVolumeIntervalS = defaultCheckExpiredVolumeIntervalS
 	}
 	if c.AllocatableDiskLoadThreshold <= 0 {
 		c.AllocatableDiskLoadThreshold = NoDiskLoadThreshold
+	}
+	if c.AllocatableSize <= 0 {
+		c.AllocatableSize = defaultAllocatableSize
+	}
+	if c.AllocFactor <= 0 {
+		c.AllocFactor = defaultAllocFactor
 	}
 }
 
@@ -102,12 +111,11 @@ func NewVolumeMgr(conf VolumeMgrConfig, diskMgr diskmgr.DiskMgrAPI, scopeMgr sco
 	if err != nil {
 		return nil, errors.Info(err, "open transited table failed").Detail(err)
 	}
-
-	reserveSize, err := configMgr.Get(ctx, proto.VolumeReserveSizeKey)
+	freezeSize, err := configMgr.Get(ctx, proto.VolumeReserveSizeKey)
 	if err != nil {
 		return nil, errors.Info(err, "get volume reserve size from config manager failed").Detail(err)
 	}
-	conf.FreezeThreshold, err = strconv.ParseUint(reserveSize, 10, 64)
+	conf.FreezeThreshold, err = strconv.ParseUint(freezeSize, 10, 64)
 	if err != nil {
 		return nil, errors.Info(err, "parse volume reserve size failed").Detail(err)
 	}
@@ -141,7 +149,8 @@ func NewVolumeMgr(conf VolumeMgrConfig, diskMgr diskmgr.DiskMgrAPI, scopeMgr sco
 	}
 	allocConfig := allocConfig{
 		codeModes:                    volumeMgr.codeMode,
-		freezeThreshold:              conf.FreezeThreshold,
+		allocatableSize:              conf.AllocatableSize,
+		allocFactor:                  conf.AllocFactor,
 		allocatableDiskLoadThreshold: conf.AllocatableDiskLoadThreshold,
 	}
 	volAllocator := newVolumeAllocator(allocConfig)

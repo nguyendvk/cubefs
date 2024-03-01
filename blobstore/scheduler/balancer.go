@@ -17,13 +17,16 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sort"
 	"time"
 
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/recordlog"
+	"github.com/cubefs/cubefs/blobstore/common/rpc"
 	"github.com/cubefs/cubefs/blobstore/common/taskswitch"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
+	"github.com/cubefs/cubefs/blobstore/scheduler/base"
 	"github.com/cubefs/cubefs/blobstore/scheduler/client"
 	"github.com/cubefs/cubefs/blobstore/util/log"
 )
@@ -41,7 +44,6 @@ var (
 
 // BalanceMgrConfig balance task manager config
 type BalanceMgrConfig struct {
-	BalanceDiskCntLimit int   `json:"balance_disk_cnt_limit"`
 	MaxDiskFreeChunkCnt int64 `json:"max_disk_free_chunk_cnt"`
 	MinDiskFreeChunkCnt int64 `json:"min_disk_free_chunk_cnt"`
 	MigrateConfig
@@ -75,6 +77,7 @@ func NewBalanceMgr(clusterMgrCli client.ClusterMgrAPI, volumeUpdater client.IVol
 func (mgr *BalanceMgr) Run() {
 	go mgr.collectTaskLoop()
 	mgr.IMigrator.Run()
+	go mgr.checkAndClearJunkTasksLoop()
 }
 
 // Close close balance task manager
@@ -106,10 +109,10 @@ func (mgr *BalanceMgr) collectionTask() (err error) {
 	span, ctx := trace.StartSpanFromContext(context.Background(), "balance_collectionTask")
 	defer span.Finish()
 
-	needBalanceDiskCnt := mgr.cfg.BalanceDiskCntLimit - mgr.IMigrator.GetMigratingDiskNum()
+	needBalanceDiskCnt := mgr.cfg.DiskConcurrency - mgr.IMigrator.GetMigratingDiskNum()
 	if needBalanceDiskCnt <= 0 {
 		span.Warnf("the number of balancing disk is greater than config: current[%d], conf[%d]",
-			mgr.IMigrator.GetMigratingDiskNum(), mgr.cfg.BalanceDiskCntLimit)
+			mgr.IMigrator.GetMigratingDiskNum(), mgr.cfg.DiskConcurrency)
 		return ErrTooManyBalancingTasks
 	}
 
@@ -141,12 +144,12 @@ func (mgr *BalanceMgr) collectionTask() (err error) {
 func (mgr *BalanceMgr) selectDisks(maxFreeChunkCnt, minFreeChunkCnt int64) []*client.DiskInfoSimple {
 	var allDisks []*client.DiskInfoSimple
 	for idcName := range mgr.clusterTopology.GetIDCs() {
-		if idcDisks := mgr.clusterTopology.GetIDCDisks(idcName); idcDisks != nil {
-			if freeChunkCntMax(idcDisks) >= maxFreeChunkCnt {
-				allDisks = append(allDisks, idcDisks...)
-			}
+		maxFreeChunksDisk := mgr.clusterTopology.MaxFreeChunksDisk(idcName)
+		if maxFreeChunksDisk != nil && maxFreeChunksDisk.FreeChunkCnt >= maxFreeChunkCnt {
+			allDisks = append(allDisks, mgr.clusterTopology.GetIDCDisks(idcName)...)
 		}
 	}
+	sortDiskByFreeChunkCnt(allDisks)
 
 	var selected []*client.DiskInfoSimple
 	for _, disk := range allDisks {
@@ -210,12 +213,43 @@ func (mgr *BalanceMgr) selectBalanceVunit(ctx context.Context, diskID proto.Disk
 	return vuid, ErrNoBalanceVunit
 }
 
-func freeChunkCntMax(disks []*client.DiskInfoSimple) int64 {
-	var max int64
-	for _, disk := range disks {
-		if disk.FreeChunkCnt > max {
-			max = disk.FreeChunkCnt
+// checkAndClearJunkTasksLoop due to network timeout, it may still have some junk migrate tasks in clustermgr,
+// and we need to clear those tasks later
+func (mgr *BalanceMgr) checkAndClearJunkTasksLoop() {
+	t := time.NewTicker(clearJunkMigrationTaskInterval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-t.C:
+			mgr.checkAndClearJunkTasks()
+		case <-mgr.IMigrator.Done():
+			return
 		}
 	}
-	return max
+}
+
+func (mgr *BalanceMgr) checkAndClearJunkTasks() {
+	span, ctx := trace.StartSpanFromContext(context.Background(), "balance.clearJunkTasks")
+
+	for _, task := range mgr.DeletedTasks() {
+		if time.Since(task.DeletedTime) < junkMigrationTaskProtectionWindow {
+			continue
+		}
+		_, err := mgr.clusterMgrCli.GetMigrateTask(ctx, proto.TaskTypeBalance, task.TaskID)
+		if err != nil {
+			if rpc.DetectStatusCode(err) != http.StatusNotFound {
+				span.Errorf("get balance task from clustermanager failed: err[%+v]", err)
+				continue
+			}
+			// means there is no junk task and only delete task from memory
+		} else { // delete junk task when exists
+			span.Warnf("delete junk task: task_id[%s]", task.TaskID)
+			base.InsistOn(ctx, "delete junk task", func() error {
+				return mgr.clusterMgrCli.DeleteMigrateTask(ctx, task.TaskID)
+			})
+		}
+
+		mgr.ClearDeletedTaskByID(task.DiskID, task.TaskID)
+	}
 }

@@ -15,11 +15,13 @@
 package metanode
 
 import (
-	"github.com/xtaci/smux"
 	syslog "log"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/xtaci/smux"
 
 	masterSDK "github.com/cubefs/cubefs/sdk/master"
 
@@ -37,8 +39,9 @@ import (
 )
 
 var (
-	clusterInfo    *proto.ClusterInfo
-	masterClient   *masterSDK.MasterClient
+	clusterInfo *proto.ClusterInfo
+	//masterClient   *masterSDK.MasterClient
+	masterClient   *masterSDK.MasterCLientWithResolver
 	configTotalMem uint64
 	serverPort     string
 	smuxPortShift  int
@@ -49,22 +52,28 @@ var (
 // The MetaNode manages the dentry and inode information of the meta partitions on a meta node.
 // The data consistency is ensured by Raft.
 type MetaNode struct {
-	nodeId            uint64
-	listen            string
-	metadataDir       string // root dir of the metaNode
-	raftDir           string // root dir of the raftStore log
-	metadataManager   MetadataManager
-	localAddr         string
-	clusterId         string
-	raftStore         raftstore.RaftStore
-	raftHeartbeatPort string
-	raftReplicatePort string
-	zoneName          string
-	httpStopC         chan uint8
-	smuxStopC         chan uint8
-	metrics           *MetaNodeMetrics
-	tickInterval      int
-	raftRecvBufSize   int
+	nodeId                    uint64
+	listen                    string
+	bindIp                    bool
+	metadataDir               string // root dir of the metaNode
+	raftDir                   string // root dir of the raftStore log
+	metadataManager           MetadataManager
+	localAddr                 string
+	clusterId                 string
+	raftStore                 raftstore.RaftStore
+	raftHeartbeatPort         string
+	raftReplicatePort         string
+	raftRetainLogs            uint64
+	raftSyncSnapFormatVersion uint32 //format version of snapshot that raft leader sent to follower
+	zoneName                  string
+	httpStopC                 chan uint8
+	smuxStopC                 chan uint8
+	metrics                   *MetaNodeMetrics
+	tickInterval              int
+	raftRecvBufSize           int
+	connectionCnt             int64
+	clusterUuid               string
+	clusterUuidEnable         bool
 
 	control common.Control
 }
@@ -92,6 +101,10 @@ func (m *MetaNode) checkLocalPartitionMatchWithMaster() (err error) {
 		break
 	}
 
+	if err != nil {
+		return
+	}
+
 	if len(metaNodeInfo.PersistenceMetaPartitions) == 0 {
 		return
 	}
@@ -105,8 +118,12 @@ func (m *MetaNode) checkLocalPartitionMatchWithMaster() (err error) {
 	if len(lackPartitions) == 0 {
 		return
 	}
-	err = fmt.Errorf("LackPartitions %v on metanode %v,metanode cannot start", lackPartitions, m.localAddr+":"+m.listen)
-	log.LogErrorf(err.Error())
+	m.metrics.MetricMetaFailedPartition.SetWithLabels(float64(1), map[string]string{
+		"partids": fmt.Sprintf("%v", lackPartitions),
+		"node":    m.localAddr + ":" + m.listen,
+		"nodeid":  fmt.Sprintf("%d", m.nodeId),
+	})
+	log.LogErrorf("LackPartitions %v on metanode %v, please deal quickly", lackPartitions, m.localAddr+":"+m.listen)
 	return
 }
 
@@ -152,7 +169,6 @@ func doStart(s common.Server, cfg *config.Config) (err error) {
 		exporter.Warning(err.Error())
 		return
 	}
-
 	exporter.RegistConsul(m.clusterId, cfg.GetString("role"), cfg)
 	return
 }
@@ -169,6 +185,7 @@ func doShutdown(s common.Server) {
 	m.stopSmuxServer()
 	m.stopMetaManager()
 	m.stopRaftServer()
+	masterClient.Stop()
 }
 
 // Sync blocks the invoker's goroutine until the meta node shuts down.
@@ -183,6 +200,7 @@ func (m *MetaNode) parseConfig(cfg *config.Config) (err error) {
 	}
 	m.localAddr = cfg.GetString(cfgLocalIP)
 	m.listen = cfg.GetString(proto.ListenPort)
+	m.bindIp = cfg.GetBool(proto.BindIpKey)
 	serverPort = m.listen
 	m.metadataDir = cfg.GetString(cfgMetadataDir)
 	m.raftDir = cfg.GetString(cfgRaftDir)
@@ -191,11 +209,6 @@ func (m *MetaNode) parseConfig(cfg *config.Config) (err error) {
 	m.tickInterval = int(cfg.GetFloat(cfgTickInterval))
 	m.raftRecvBufSize = int(cfg.GetInt(cfgRaftRecvBufSize))
 	m.zoneName = cfg.GetString(cfgZoneName)
-	configTotalMem, _ = strconv.ParseUint(cfg.GetString(cfgTotalMem), 10, 64)
-
-	if configTotalMem == 0 {
-		return fmt.Errorf("bad totalMem config,Recommended to be configured as 80 percent of physical machine memory")
-	}
 
 	deleteBatchCount := cfg.GetInt64(cfgDeleteBatchCount)
 	if deleteBatchCount > 1 {
@@ -203,6 +216,26 @@ func (m *MetaNode) parseConfig(cfg *config.Config) (err error) {
 	}
 
 	total, _, err := util.GetMemInfo()
+	if err != nil {
+		log.LogErrorf("get total mem failed, err %s", err.Error())
+	}
+
+	ratioStr := cfg.GetString(cfgMemRatio)
+	if err == nil && ratioStr != "" {
+		ratio, _ := strconv.Atoi(ratioStr)
+		if ratio <= 0 || ratio >= 100 {
+			return fmt.Errorf("cfgMemRatio is not legal, shoule beteen 1-100, now %s", ratioStr)
+		}
+
+		configTotalMem = total * uint64(ratio) / 100
+		log.LogInfof("configTotalMem by ratio is: mem [%d], ratio[%d]", configTotalMem, ratio)
+	} else {
+		configTotalMem, _ = strconv.ParseUint(cfg.GetString(cfgTotalMem), 10, 64)
+		if configTotalMem == 0 {
+			return fmt.Errorf("bad totalMem config,Recommended to be configured as 80 percent of physical machine memory")
+		}
+	}
+
 	if err == nil && configTotalMem > total-util.GB {
 		return fmt.Errorf("bad totalMem config,Recommended to be configured as 80 percent of physical machine memory")
 	}
@@ -222,6 +255,34 @@ func (m *MetaNode) parseConfig(cfg *config.Config) (err error) {
 	if m.raftReplicatePort == "" {
 		return fmt.Errorf("bad cfgRaftReplicaPort config")
 	}
+
+	raftRetainLogs := cfg.GetString(cfgRetainLogs)
+	if raftRetainLogs != "" {
+		if m.raftRetainLogs, err = strconv.ParseUint(raftRetainLogs, 10, 64); err != nil {
+			return fmt.Errorf("%v, err:%v", proto.ErrInvalidCfg, err.Error())
+		}
+	}
+	if m.raftRetainLogs <= 0 {
+		m.raftRetainLogs = DefaultRaftNumOfLogsToRetain
+	}
+	syslog.Println("conf raftRetainLogs=", m.raftRetainLogs)
+	log.LogInfof("[parseConfig] raftRetainLogs[%v]", m.raftRetainLogs)
+
+	if cfg.HasKey(cfgRaftSyncSnapFormatVersion) {
+		raftSyncSnapFormatVersion := uint32(cfg.GetInt64(cfgRaftSyncSnapFormatVersion))
+		if raftSyncSnapFormatVersion < 0 || raftSyncSnapFormatVersion > SnapFormatVersion_1 {
+			m.raftSyncSnapFormatVersion = SnapFormatVersion_1
+			log.LogInfof("invalid config raftSyncSnapFormatVersion, using default[%v]", m.raftSyncSnapFormatVersion)
+		} else {
+			m.raftSyncSnapFormatVersion = raftSyncSnapFormatVersion
+			log.LogInfof("by config raftSyncSnapFormatVersion:[%v]", m.raftSyncSnapFormatVersion)
+		}
+	} else {
+		m.raftSyncSnapFormatVersion = SnapFormatVersion_1
+		log.LogInfof("using default raftSyncSnapFormatVersion[%v]", m.raftSyncSnapFormatVersion)
+	}
+	syslog.Println("conf raftSyncSnapFormatVersion=", m.raftSyncSnapFormatVersion)
+	log.LogInfof("[parseConfig] raftSyncSnapFormatVersion[%v]", m.raftSyncSnapFormatVersion)
 
 	constCfg := config.ConstConfig{
 		Listen:           m.listen,
@@ -254,7 +315,23 @@ func (m *MetaNode) parseConfig(cfg *config.Config) (err error) {
 	for _, addr := range addrs {
 		masters = append(masters, addr.(string))
 	}
-	masterClient = masterSDK.NewMasterClient(masters, false)
+
+	updateInterval := cfg.GetInt(configNameResolveInterval)
+	if updateInterval <= 0 || updateInterval > 60 {
+		log.LogWarnf("name resolving interval[1-60] is set to default: %v", DefaultNameResolveInterval)
+		updateInterval = DefaultNameResolveInterval
+	}
+
+	//masterClient = masterSDK.NewMasterClient(masters, false)
+	masterClient = masterSDK.NewMasterCLientWithResolver(masters, false, updateInterval)
+	if masterClient == nil {
+		err = fmt.Errorf("parseConfig: masters addrs format err[%v]", masters)
+		log.LogErrorf("parseConfig: masters addrs format err[%v]", masters)
+		return err
+	}
+	if err = masterClient.Start(); err != nil {
+		return err
+	}
 	err = m.validConfig()
 	return
 }
@@ -321,6 +398,25 @@ func (m *MetaNode) newMetaManager() (err error) {
 			return
 		}
 	}
+
+	if m.clusterUuidEnable {
+		if err = config.CheckOrStoreClusterUuid(m.metadataDir, m.clusterUuid, false); err != nil {
+			log.LogErrorf("CheckOrStoreClusterUuid failed: %v", err)
+			return fmt.Errorf("CheckOrStoreClusterUuid failed: %v", err)
+		}
+	}
+
+	constCfg := config.ConstConfig{
+		Listen:           m.listen,
+		RaftHeartbetPort: m.raftHeartbeatPort,
+		RaftReplicaPort:  m.raftReplicatePort,
+	}
+	var ok = false
+	if ok, err = config.CheckOrStoreConstCfg(m.metadataDir, config.DefaultConstConfigFile, &constCfg); !ok {
+		log.LogErrorf("constCfg check failed %v %v %v %v", m.metadataDir, config.DefaultConstConfigFile, constCfg, err)
+		return fmt.Errorf("constCfg check failed %v %v %v %v", m.metadataDir, config.DefaultConstConfigFile, constCfg, err)
+	}
+
 	// load metadataManager
 	conf := MetadataManagerConfig{
 		NodeID:    m.nodeId,
@@ -358,6 +454,8 @@ func (m *MetaNode) register() (err error) {
 			if m.localAddr == "" {
 				m.localAddr = clusterInfo.Ip
 			}
+			m.clusterUuid = clusterInfo.ClusterUuid
+			m.clusterUuidEnable = clusterInfo.ClusterUuidEnable
 			m.clusterId = clusterInfo.Cluster
 			nodeAddress = m.localAddr + ":" + m.listen
 			step++
@@ -381,4 +479,14 @@ func NewServer() *MetaNode {
 func getClusterInfo() (ci *proto.ClusterInfo, err error) {
 	ci, err = masterClient.AdminAPI().GetClusterInfo()
 	return
+}
+
+// AddConnection adds a connection.
+func (m *MetaNode) AddConnection() {
+	atomic.AddInt64(&m.connectionCnt, 1)
+}
+
+// RemoveConnection removes a connection.
+func (m *MetaNode) RemoveConnection() {
+	atomic.AddInt64(&m.connectionCnt, -1)
 }

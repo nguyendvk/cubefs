@@ -23,6 +23,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/cubefs/cubefs/blobstore/common/proto"
+	"github.com/cubefs/cubefs/blobstore/util/closer"
 	"github.com/cubefs/cubefs/blobstore/util/log"
 )
 
@@ -85,7 +86,7 @@ func (o *offsetMap) getOffset(pid int32) int64 {
 	if _, ok := o.offsetMap[pid]; ok {
 		return o.offsetMap[pid]
 	}
-	return 0
+	return sarama.OffsetOldest
 }
 
 func (o *offsetMap) setOffset(offset int64, pid int32) {
@@ -95,6 +96,7 @@ func (o *offsetMap) setOffset(offset int64, pid int32) {
 }
 
 type Monitor struct {
+	closer.Closer
 	clusterID                   proto.ClusterID
 	kafkaClient                 sarama.Client
 	topic                       string
@@ -108,7 +110,7 @@ type Monitor struct {
 	moduleName                  string
 }
 
-const DefauleintervalSecs = 60
+const DefaultIntervalSecs = 60
 
 func NewKafkaMonitor(
 	clusterID proto.ClusterID,
@@ -119,18 +121,18 @@ func NewKafkaMonitor(
 	intervalSecs int64) (*Monitor, error,
 ) {
 	monitor := Monitor{
-		clusterID:                   clusterID,
-		topic:                       topic,
-		pids:                        pids,
-		newestOffsetMap:             newOffsetMap(),
-		oldestOffsetMap:             newOffsetMap(),
-		consumeOffsetMap:            newOffsetMap(),
-		kafkaOffAcquireIntervalSecs: DefauleintervalSecs,
-		moduleName:                  moduleName,
+		Closer:           closer.New(),
+		clusterID:        clusterID,
+		topic:            topic,
+		pids:             pids,
+		newestOffsetMap:  newOffsetMap(),
+		oldestOffsetMap:  newOffsetMap(),
+		consumeOffsetMap: newOffsetMap(),
+		moduleName:       moduleName,
 	}
 
 	if intervalSecs == 0 {
-		intervalSecs = DefauleintervalSecs
+		intervalSecs = DefaultIntervalSecs
 	}
 	monitor.kafkaOffAcquireIntervalSecs = intervalSecs
 
@@ -153,28 +155,40 @@ func NewKafkaMonitor(
 }
 
 func (monitor *Monitor) loopAcquireKafkaOffset() {
+	ticker := time.NewTicker(time.Duration(monitor.kafkaOffAcquireIntervalSecs) * time.Second)
+	defer ticker.Stop()
+
 	for {
-		for _, pid := range monitor.pids {
-			newestOffset, err := monitor.kafkaClient.GetOffset(monitor.topic, pid, sarama.OffsetNewest)
-			if err != nil {
-				log.Error(fmt.Sprintf("get newest offset fail topic %v pid %v ", monitor.topic, pid))
-				continue
+		select {
+		case <-ticker.C:
+			for _, pid := range monitor.pids {
+				if err := monitor.update(pid); err != nil {
+					continue
+				}
 			}
-			log.Debug("loopAcquireKafkaOffset newestOffset:", newestOffset)
-			monitor.newestOffsetMap.setOffset(newestOffset, pid)
-
-			oldestOffset, err := monitor.kafkaClient.GetOffset(monitor.topic, pid, sarama.OffsetOldest)
-			if err != nil {
-				log.Error(fmt.Sprintf("get oldest offset fail topic %v pid %v ", monitor.topic, pid))
-				continue
-			}
-			log.Debug("loopAcquireKafkaOffset oldestOffset:", oldestOffset)
-			monitor.oldestOffsetMap.setOffset(oldestOffset, pid)
+			monitor.report()
+		case <-monitor.Closer.Done():
+			monitor.report()
+			return
 		}
-
-		monitor.report()
-		time.Sleep(time.Duration(monitor.kafkaOffAcquireIntervalSecs) * time.Second)
 	}
+}
+
+func (monitor *Monitor) update(pid int32) error {
+	newestOffset, err := monitor.kafkaClient.GetOffset(monitor.topic, pid, sarama.OffsetNewest)
+	if err != nil {
+		log.Errorf("get newest offset failed: topic[%s], pid[%d]", monitor.topic, pid)
+		return err
+	}
+	monitor.newestOffsetMap.setOffset(newestOffset, pid)
+
+	oldestOffset, err := monitor.kafkaClient.GetOffset(monitor.topic, pid, sarama.OffsetOldest)
+	if err != nil {
+		log.Errorf("get oldest offset failed: topic[%s], pid[%d]", monitor.topic, pid)
+		return err
+	}
+	monitor.oldestOffsetMap.setOffset(oldestOffset, pid)
+	return nil
 }
 
 func (monitor *Monitor) report() {
@@ -182,16 +196,20 @@ func (monitor *Monitor) report() {
 		oldestOffset := monitor.oldestOffsetMap.getOffset(pid)
 		newestOffset := monitor.newestOffsetMap.getOffset(pid)
 		consumeOffset := monitor.consumeOffsetMap.getOffset(pid)
-		latency := newestOffset - consumeOffset - 1 //-1，because the newestOffset is the next message offset
+		latency := int64(0)
+		if consumeOffset < oldestOffset && consumeOffset < 0 { // means not consumed yet
+			latency = newestOffset - oldestOffset - 1 //-1，because the newestOffset is the next message offset
+		} else {
+			latency = newestOffset - consumeOffset - 1
+		}
 		if latency < 0 {
 			latency = 0
 		}
 
-		monitor.reportOffsetMetric(pid, string("oldest"), float64(oldestOffset))
-		monitor.reportOffsetMetric(pid, string("newest"), float64(newestOffset))
-		monitor.reportOffsetMetric(pid, string("consume"), float64(consumeOffset))
+		monitor.reportOffsetMetric(pid, "oldest", float64(oldestOffset))
+		monitor.reportOffsetMetric(pid, "newest", float64(newestOffset))
+		monitor.reportOffsetMetric(pid, "consume", float64(consumeOffset))
 		monitor.reportLatencyMetric(pid, float64(latency))
-		log.Debug("Report...")
 	}
 }
 

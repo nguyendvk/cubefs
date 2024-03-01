@@ -45,11 +45,21 @@ var (
 )
 
 type blobGetArgs struct {
+	Cid      proto.ClusterID
 	Vid      proto.Vid
 	Bid      proto.BlobID
+	CodeMode codemode.CodeMode
 	BlobSize uint64
 	Offset   uint64
 	ReadSize uint64
+
+	ShardSize     int
+	ShardOffset   int
+	ShardReadSize int
+}
+
+func (blob *blobGetArgs) ID() string {
+	return fmt.Sprintf("blob(cid:%d vid:%d bid:%d)", blob.Cid, blob.Vid, blob.Bid)
 }
 
 type shardData struct {
@@ -63,6 +73,11 @@ type sortedVuid struct {
 	vuid   proto.Vuid
 	diskID proto.DiskID
 	host   string
+}
+
+func (vuid *sortedVuid) ID() string {
+	return fmt.Sprintf("blobnode(vuid:%d disk:%d host:%s) ecidx(%02d)",
+		vuid.vuid, vuid.diskID, vuid.host, vuid.index)
 }
 
 type pipeBuffer struct {
@@ -79,6 +94,7 @@ type pipeBuffer struct {
 //
 //  Read data shards firstly, if blob size is small or read few bytes
 //  then ec reconstruct-read, try to reconstruct from N+X to N+M
+//  Just read essential bytes in each shard when reconstruct-read.
 //
 //  sorted N+X is, such as we use mode EC6P10L2, X=2 and Read from idc=2
 //  shards like this
@@ -131,21 +147,20 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location access.Location
 		//   read few bytes: read bytes less than quarter of blobsize, like Range:[0-1].
 		if len(blobs) == 1 {
 			blob := blobs[0]
-			sizes, _ := ec.GetBufferSizes(int(blob.BlobSize), location.CodeMode.Tactic())
-			if int(blob.BlobSize) <= sizes.ShardSize || blob.ReadSize < blob.BlobSize/4 {
-				span.Debugf("read data shard only readsize:%d blobsize:%d shardsize:%d",
-					blob.ReadSize, blob.BlobSize, sizes.ShardSize)
+			if int(blob.BlobSize) <= blob.ShardSize || blob.ReadSize < blob.BlobSize/4 {
+				span.Debugf("read data shard only %s readsize:%d blobsize:%d shardsize:%d",
+					blob.ID(), blob.ReadSize, blob.BlobSize, blob.ShardSize)
 
-				reportDownload(clusterID, "Range", "-")
-				err := h.getDataShardOnly(ctx, getTime, w, serviceController, clusterID, blob)
+				err := h.getDataShardOnly(ctx, getTime, w, serviceController, blob)
 				if err != errNeedReconstructRead {
 					if err != nil {
 						span.Error("read data shard only", err)
-						reportDownload(clusterID, "Range", err.Error())
+						reportDownload(clusterID, "Direct", "error")
+					} else {
+						reportDownload(clusterID, "Direct", "-")
 					}
 					return err
 				}
-				reportDownload(clusterID, "Range", err.Error())
 				span.Info("read data shard only failed", err)
 			}
 		}
@@ -161,10 +176,9 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location access.Location
 			go func() {
 				defer close(ch)
 
-				var (
-					blobVolume  *controller.VolumePhy
-					sortedVuids []sortedVuid
-				)
+				var blobVolume *controller.VolumePhy
+				var sortedVuids []sortedVuid
+				tactic := location.CodeMode.Tactic()
 				for _, blob := range blobs {
 					var err error
 					if blobVolume == nil || blobVolume.Vid != blob.Vid {
@@ -175,36 +189,29 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location access.Location
 							return
 						}
 
-						tactic := blobVolume.CodeMode.Tactic()
 						// do not use local shards
 						sortedVuids = genSortedVuidByIDC(ctx, serviceController, h.IDC, blobVolume.Units[:tactic.N+tactic.M])
-						span.Debugf("to read blob(%d %d %d) with read-shard-x:%d active-shard-n:%d of data-n:%d party-n:%d",
-							clusterID, blob.Vid, blob.Bid, h.MinReadShardsX, len(sortedVuids), tactic.N, tactic.M)
+						span.Debugf("to read %s with read-shard-x:%d active-shard-n:%d of data-n:%d party-n:%d",
+							blob.ID(), h.MinReadShardsX, len(sortedVuids), tactic.N, tactic.M)
 						if len(sortedVuids) < tactic.N {
-							err = fmt.Errorf("broken blob(%d %d %d)", clusterID, blob.Vid, blob.Bid)
+							err = fmt.Errorf("broken %s", blob.ID())
 							span.Error(err)
 							ch <- pipeBuffer{err: err}
 							return
 						}
 					}
 
-					codeMode := blobVolume.CodeMode
-					tactic := codeMode.Tactic()
-					sizes, _ := ec.GetBufferSizes(int(blob.BlobSize), tactic)
-					shardSize := sizes.ShardSize
-
 					st := time.Now()
 					shards := make([][]byte, tactic.N+tactic.M)
 					for ii := range shards {
-						buf, _ := h.memPool.Alloc(shardSize)
+						buf, _ := h.memPool.Alloc(blob.ShardSize)
 						shards[ii] = buf
 					}
 					getTime.IncA(time.Since(st))
 
-					err = h.readOneBlob(ctx, getTime, serviceController, clusterID,
-						blobVolume.Vid, codeMode, blob, sortedVuids, shards)
+					err = h.readOneBlob(ctx, getTime, serviceController, blob, sortedVuids, shards)
 					if err != nil {
-						span.Error("read one blob", blob.Bid, err)
+						span.Error("read one blob", blob.ID(), err)
 						for _, buf := range shards {
 							h.memPool.Put(buf)
 						}
@@ -227,7 +234,6 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location access.Location
 		}()
 
 		var err error
-		reportDownload(clusterID, "EC", "-")
 		for line := range pipeline {
 			if line.err != nil {
 				err = line.err
@@ -279,9 +285,11 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location access.Location
 		}()
 
 		if err != nil {
+			reportDownload(clusterID, "EC", "error")
 			span.Error("get request error", err)
 			return err
 		}
+		reportDownload(clusterID, "EC", "-")
 		return nil
 	}, nil
 }
@@ -289,13 +297,13 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location access.Location
 // 1. try to min-read shards bytes
 // 2. if failed try to read next shard to reconstruct
 // 3. write the the right offset bytes to writer
+// 4. Just read essential bytes if the data is a segment of one shard.
 func (h *Handler) readOneBlob(ctx context.Context, getTime *timeReadWrite,
 	serviceController controller.ServiceController,
-	clusterID proto.ClusterID, vid proto.Vid, codeMode codemode.CodeMode,
 	blob blobGetArgs, sortedVuids []sortedVuid, shards [][]byte) error {
 	span := trace.SpanFromContextSafe(ctx)
 
-	tactic := codeMode.Tactic()
+	tactic := blob.CodeMode.Tactic()
 	sizes, err := ec.GetBufferSizes(int(blob.BlobSize), tactic)
 	if err != nil {
 		return err
@@ -307,11 +315,10 @@ func (h *Handler) readOneBlob(ctx context.Context, getTime *timeReadWrite,
 	if minShardsRead > len(sortedVuids) {
 		minShardsRead = len(sortedVuids)
 	}
-	shardSize := len(shards[0])
+	shardSize, shardOffset, shardReadSize := blob.ShardSize, blob.ShardOffset, blob.ShardReadSize
 
 	stopChan := make(chan struct{})
 	nextChan := make(chan struct{}, len(sortedVuids))
-
 	shardPipe := func() <-chan shardData {
 		ch := make(chan shardData)
 		go func() {
@@ -325,8 +332,7 @@ func (h *Handler) readOneBlob(ctx context.Context, getTime *timeReadWrite,
 				if _, ok := empties[vuid.index]; !ok {
 					wg.Add(1)
 					go func(vuid sortedVuid) {
-						ch <- h.readOneShard(ctx, serviceController, clusterID, vid,
-							shardSize, blob, vuid, stopChan)
+						ch <- h.readOneShard(ctx, serviceController, blob, vuid, stopChan)
 						wg.Done()
 					}(vuid)
 				}
@@ -345,8 +351,7 @@ func (h *Handler) readOneBlob(ctx context.Context, getTime *timeReadWrite,
 
 				wg.Add(1)
 				go func(vuid sortedVuid) {
-					ch <- h.readOneShard(ctx, serviceController, clusterID, vid,
-						shardSize, blob, vuid, stopChan)
+					ch <- h.readOneShard(ctx, serviceController, blob, vuid, stopChan)
 					wg.Done()
 				}(vuid)
 			}
@@ -404,21 +409,32 @@ func (h *Handler) readOneBlob(ctx context.Context, getTime *timeReadWrite,
 		}
 		// it will not wait all the shards, cos has no enough shards to reconstruct
 		if badShards > dataParityN-dataN {
-			span.Infof("bid(%d) bad(%d) has no enough to reconstruct", blob.Bid, badShards)
+			span.Infof("%s bad(%d) has no enough to reconstruct", blob.ID(), badShards)
 			close(stopChan)
 			break
 		}
 
 		// has bad shards, but have enough shards to reconstruct
 		if len(received) >= dataN+badShards {
-			span.Debugf("bid(%d) ready to ec reconstruct data", blob.Bid)
-			err := h.encoder[codeMode].ReconstructData(shards, badIdx)
+			var err error
+			if shardReadSize < shardSize {
+				span.Debugf("bid(%d) ready to segment ec reconstruct data", blob.Bid)
+				reportDownload(blob.Cid, "EC", "segment")
+				segments := make([][]byte, len(shards))
+				for idx := range shards {
+					segments[idx] = shards[idx][shardOffset : shardOffset+shardReadSize]
+				}
+				err = h.encoder[blob.CodeMode].ReconstructData(segments, badIdx)
+			} else {
+				span.Debugf("bid(%d) ready to ec reconstruct data", blob.Bid)
+				err = h.encoder[blob.CodeMode].ReconstructData(shards, badIdx)
+			}
 			if err == nil {
 				reconstructed = true
 				close(stopChan)
 				break
 			}
-			span.Infof("bid(%d) ec reconstruct data error:%s", blob.Bid, err.Error())
+			span.Errorf("%s ec reconstruct data error:%s", blob.ID(), err.Error())
 		}
 
 		if len(received) >= len(sortedVuids) {
@@ -441,12 +457,13 @@ func (h *Handler) readOneBlob(ctx context.Context, getTime *timeReadWrite,
 	if reconstructed {
 		return nil
 	}
-	return fmt.Errorf("broken blob(%d %d %d)", clusterID, blob.Vid, blob.Bid)
+	return fmt.Errorf("broken %s", blob.ID())
 }
 
 func (h *Handler) readOneShard(ctx context.Context, serviceController controller.ServiceController,
-	clusterID proto.ClusterID, vid proto.Vid, shardSize int,
 	blob blobGetArgs, vuid sortedVuid, stopChan <-chan struct{}) shardData {
+	clusterID, vid := blob.Cid, blob.Vid
+	shardOffset, shardReadSize := blob.ShardOffset, blob.ShardReadSize
 	span := trace.SpanFromContextSafe(ctx)
 	shardResult := shardData{
 		index:  vuid.index,
@@ -459,8 +476,8 @@ func (h *Handler) readOneShard(ctx context.Context, serviceController controller
 			Vuid:   vuid.vuid,
 			Bid:    blob.Bid,
 		},
-		Offset: 0,
-		Size:   int64(shardSize),
+		Offset: int64(shardOffset),
+		Size:   int64(shardReadSize),
 	}
 
 	var (
@@ -475,35 +492,30 @@ func (h *Handler) readOneShard(ctx context.Context, serviceController controller
 		}
 		return nil
 	}, nil); hErr != nil {
-		span.Warnf("hystrix: read blob(%d %d %d) on blobnode(%d %d %s) ecidx(%d): %s",
-			clusterID, vid, blob.Bid, vuid.vuid, vuid.diskID, vuid.host, vuid.index, hErr.Error())
+		span.Warnf("hystrix: read %s on %s: %s", blob.ID(), vuid.ID(), hErr.Error())
 		return shardResult
 	}
 
 	if err != nil {
 		if err == errPunishedDisk || err == errCanceledReadShard {
-			span.Debugf("read blob(%d %d %d) on blobnode(%d %d %s) ecidx(%d): %s",
-				clusterID, vid, blob.Bid, vuid.vuid, vuid.diskID, vuid.host, vuid.index, err.Error())
+			span.Warnf("read %s on %s: %s", blob.ID(), vuid.ID(), err.Error())
 			return shardResult
 		}
-		span.Warnf("read blob(%d %d %d) on blobnode(%d %d %s) ecidx(%d): %s",
-			clusterID, vid, blob.Bid, vuid.vuid, vuid.diskID, vuid.host, vuid.index, errors.Detail(err))
+		span.Warnf("read %s on %s: %s", blob.ID(), vuid.ID(), errors.Detail(err))
 		return shardResult
 	}
 	defer body.Close()
 
-	buf, err := h.memPool.Alloc(shardSize)
+	buf, err := h.memPool.Alloc(blob.ShardSize)
 	if err != nil {
 		span.Warn(err)
 		return shardResult
 	}
 
-	_, err = io.ReadFull(body, buf)
+	_, err = io.ReadFull(body, buf[shardOffset:shardOffset+shardReadSize])
 	if err != nil {
 		h.memPool.Put(buf)
-		span.Warnf("read blob(%d %d %d) on blobnode(%d %d %s) ecidx(%d): %s",
-			clusterID, vid, blob.Bid,
-			vuid.vuid, vuid.diskID, vuid.host, vuid.index, err.Error())
+		span.Warnf("read %s on %s: %s", blob.ID(), vuid.ID(), err.Error())
 		return shardResult
 	}
 
@@ -513,14 +525,13 @@ func (h *Handler) readOneShard(ctx context.Context, serviceController controller
 }
 
 func (h *Handler) getDataShardOnly(ctx context.Context, getTime *timeReadWrite,
-	w io.Writer, serviceController controller.ServiceController,
-	clusterID proto.ClusterID, blob blobGetArgs) error {
+	w io.Writer, serviceController controller.ServiceController, blob blobGetArgs) error {
 	span := trace.SpanFromContextSafe(ctx)
 	if blob.ReadSize == 0 {
 		return nil
 	}
 
-	blobVolume, err := h.getVolume(ctx, clusterID, blob.Vid, true)
+	blobVolume, err := h.getVolume(ctx, blob.Cid, blob.Vid, true)
 	if err != nil {
 		return err
 	}
@@ -557,10 +568,9 @@ func (h *Handler) getDataShardOnly(ctx context.Context, getTime *timeReadWrite,
 		}
 
 		body, err := h.getOneShardFromHost(ctx, serviceController, shard.Host, shard.DiskID, args,
-			firstShardIdx+i, clusterID, blob.Vid, 1, nil)
+			firstShardIdx+i, blob.Cid, blob.Vid, 1, nil)
 		if err != nil {
-			span.Warnf("read blob(%d %d %d) on blobnode(%d %d %s) ecidx(%d): %s",
-				clusterID, blob.Vid, blob.Bid,
+			span.Warnf("read %s on blobnode(vuid:%d disk:%d host:%s) ecidx(%02d): %s", blob.ID(),
 				shard.Vuid, shard.DiskID, shard.Host, firstShardIdx+i, errors.Detail(err))
 			return errNeedReconstructRead
 		}
@@ -641,7 +651,7 @@ func (h *Handler) getOneShardFromHost(ctx context.Context, serviceController con
 		// EIO and Readonly error, then we need to punish disk in local and no need to retry
 		case errcode.CodeDiskBroken, errcode.CodeVUIDReadonly:
 			h.punishDisk(ctx, clusterID, diskID, host, "BrokenOrRO")
-			span.Infof("punish disk:%d on:%s cos:blobnode/%d", diskID, host, code)
+			span.Warnf("punish disk:%d on:%s cos:blobnode/%d", diskID, host, code)
 			return true, fmt.Errorf("punished disk (%d %s)", diskID, host)
 
 		// vuid not found means the reflection between vuid and diskID has change,
@@ -671,7 +681,7 @@ func (h *Handler) getOneShardFromHost(ctx context.Context, serviceController con
 			}
 
 			h.punishDiskWith(ctx, clusterID, diskID, host, "NotFound")
-			span.Debugf("punish threshold disk:%d cos:blobnode/%d", diskID, code)
+			span.Warnf("punish threshold disk:%d cos:blobnode/%d", diskID, code)
 		}
 
 		// do not retry on timeout then punish threshold this disk
@@ -679,9 +689,12 @@ func (h *Handler) getOneShardFromHost(ctx context.Context, serviceController con
 			h.punishDiskWith(ctx, clusterID, diskID, host, "Timeout")
 			return true, err
 		}
+		if errorConnectionRefused(err) {
+			return true, err
+		}
 		span.Debugf("read from disk:%d blobnode/%s", diskID, err.Error())
 
-		err = errors.Base(err, fmt.Sprintf("get shard on (%d %s)", diskID, host))
+		err = errors.Base(err, fmt.Sprintf("get shard on (disk:%d host:%s)", diskID, host))
 		return false, err
 	})
 
@@ -689,7 +702,7 @@ func (h *Handler) getOneShardFromHost(ctx context.Context, serviceController con
 }
 
 func genLocationBlobs(location *access.Location, readSize uint64, offset uint64) ([]blobGetArgs, error) {
-	if offset+readSize > location.Size {
+	if readSize > location.Size || offset > location.Size || offset+readSize > location.Size {
 		return nil, fmt.Errorf("FileSize:%d ReadSize:%d Offset:%d", location.Size, readSize, offset)
 	}
 
@@ -701,6 +714,8 @@ func genLocationBlobs(location *access.Location, readSize uint64, offset uint64)
 	remainSize := readSize
 	firstBlobIdx := offset / blobSize
 	blobOffset := offset % blobSize
+
+	tactic := location.CodeMode.Tactic()
 
 	idx := uint64(0)
 	blobs := make([]blobGetArgs, 0, 1+(readSize+blobOffset)/blobSize)
@@ -715,12 +730,25 @@ func genLocationBlobs(location *access.Location, readSize uint64, offset uint64)
 			if idx >= firstBlobIdx {
 				toReadSize := minU64(remainSize, blobSize-blobOffset)
 				if toReadSize > 0 {
+					// update the last blob size
+					fixedBlobSize := minU64(location.Size-idx*blobSize, blobSize)
+
+					sizes, _ := ec.GetBufferSizes(int(fixedBlobSize), tactic)
+					shardSize := sizes.ShardSize
+					shardOffset, shardReadSize := shardSegment(shardSize, int(blobOffset), int(toReadSize))
+
 					blobs = append(blobs, blobGetArgs{
+						Cid:      location.ClusterID,
 						Vid:      blob.Vid,
 						Bid:      currBlobID,
-						BlobSize: minU64(location.Size-idx*blobSize, blobSize), // update the last blob size
+						CodeMode: location.CodeMode,
+						BlobSize: fixedBlobSize,
 						Offset:   blobOffset,
 						ReadSize: toReadSize,
+
+						ShardSize:     shardSize,
+						ShardOffset:   shardOffset,
+						ShardReadSize: shardReadSize,
 					})
 				}
 
@@ -820,4 +848,14 @@ func emptyDataShardIndexes(sizes ec.BufferSizes) map[int]struct{} {
 	}
 
 	return set
+}
+
+func shardSegment(shardSize, blobOffset, blobReadSize int) (shardOffset, shardReadSize int) {
+	shardOffset = blobOffset % shardSize
+	if lastOffset := shardOffset + blobReadSize; lastOffset > shardSize {
+		shardOffset, shardReadSize = 0, shardSize
+	} else {
+		shardReadSize = blobReadSize
+	}
+	return
 }

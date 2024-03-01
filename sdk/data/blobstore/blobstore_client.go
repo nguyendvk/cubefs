@@ -20,15 +20,14 @@ import (
 	"io"
 	"time"
 
+	"github.com/cubefs/cubefs/blobstore/api/access"
+	"github.com/cubefs/cubefs/blobstore/common/codemode"
+	ebsproto "github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util"
-	"github.com/cubefs/cubefs/util/stat"
-
-	"github.com/cubefs/blobstore/api/access"
-	"github.com/cubefs/blobstore/common/codemode"
-	ebsproto "github.com/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
+	"github.com/cubefs/cubefs/util/stat"
 	"github.com/google/uuid"
 )
 
@@ -38,7 +37,7 @@ const (
 )
 
 type BlobStoreClient struct {
-	client access.API //blobstore/api/access
+	client access.API
 }
 
 func NewEbsClient(cfg access.Config) (*BlobStoreClient, error) {
@@ -115,8 +114,6 @@ func (ebs *BlobStoreClient) Read(ctx context.Context, volName string, buf []byte
 	return readN, nil
 }
 
-/*
- */
 func (ebs *BlobStoreClient) Write(ctx context.Context, volName string, data []byte, size uint32) (location access.Location, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
@@ -126,7 +123,6 @@ func (ebs *BlobStoreClient) Write(ctx context.Context, volName string, data []by
 	requestId := uuid.New().String()
 	log.LogDebugf("TRACE Ebs Write Enter,requestId(%v)  len(%v)", requestId, size)
 	start := time.Now()
-	hashAlg := access.HashAlgMD5
 	ctx = access.WithRequestID(ctx, requestId)
 	metric := exporter.NewTPCnt(createOPMetric(data, "ebswrite"))
 	defer func() {
@@ -134,11 +130,9 @@ func (ebs *BlobStoreClient) Write(ctx context.Context, volName string, data []by
 	}()
 
 	for i := 0; i < MaxRetryTimes; i++ {
-		// access.API.Put
 		location, _, err = ebs.client.Put(ctx, &access.PutArgs{
-			Size:   int64(size),
-			Hashes: hashAlg,
-			Body:   bytes.NewReader(data),
+			Size: int64(size),
+			Body: bytes.NewReader(data),
 		})
 		if err == nil {
 			break

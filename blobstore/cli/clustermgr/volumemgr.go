@@ -28,6 +28,7 @@ import (
 	"github.com/cubefs/cubefs/blobstore/cli/common/cfmt"
 	"github.com/cubefs/cubefs/blobstore/cli/common/flags"
 	"github.com/cubefs/cubefs/blobstore/cli/common/fmt"
+	"github.com/cubefs/cubefs/blobstore/clustermgr/persistence/kvdb"
 	"github.com/cubefs/cubefs/blobstore/clustermgr/persistence/volumedb"
 	"github.com/cubefs/cubefs/blobstore/common/kvstore"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
@@ -86,6 +87,38 @@ func addCmdVolume(cmd *grumble.Command) {
 			clusterFlags(f)
 		},
 	})
+
+	command.AddCommand(&grumble.Command{
+		Name: "listVolumes",
+		Help: "list volumes",
+		Run:  cmdListVolumes,
+		Args: func(a *grumble.Args) {
+			a.Int("count", "number of volumes to list")
+			a.Uint64("marker", "list volumes start from special Vid", grumble.Default(uint64(0)))
+		},
+		Flags: func(f *grumble.Flags) {
+			flags.VerboseRegister(f)
+			clusterFlags(f)
+		},
+	})
+}
+
+func cmdListVolumes(c *grumble.Context) error {
+	ctx := common.CmdContext()
+	cmClient := newCMClient(c.Flags)
+
+	count := c.Args.Int("count")
+	marker := c.Args.Uint64("marker")
+	listVolumeArgs := &clustermgr.ListVolumeArgs{Count: count, Marker: proto.Vid(marker)}
+
+	volumes, err := cmClient.ListVolume(ctx, listVolumeArgs)
+	if err != nil {
+		return err
+	}
+	for _, vol := range volumes.Volumes {
+		fmt.Printf("%d: %+v\n", vol.Vid, vol.VolumeInfoBase)
+	}
+	return nil
 }
 
 func cmdUpdateVolume(c *grumble.Context) error {
@@ -249,4 +282,14 @@ func openVolumeTable(db *volumedb.VolumeDB) (*volumedb.VolumeTable, error) {
 		return nil, fmt.Errorf("open volume table failed, err: %s", err.Error())
 	}
 	return tbl, nil
+}
+
+func openKvDB(path string, readonly bool) (*kvdb.KvDB, error) {
+	db, err := kvdb.Open(path, false, func(option *kvstore.RocksDBOption) {
+		option.ReadOnly = readonly
+	})
+	if err != nil {
+		return nil, fmt.Errorf("open db failed, err: %s", err.Error())
+	}
+	return db, nil
 }
