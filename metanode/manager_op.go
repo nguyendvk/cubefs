@@ -143,6 +143,10 @@ func (m *metadataManager) opMasterHeartbeat(conn net.Conn, p *Packet,
 	return
 }
 
+/*
+Handler cho proto.OpCreateMetaPartition: tạo MetaPartition trên MetaNode
+  - gọi createPartition()
+*/
 func (m *metadataManager) opCreateMetaPartition(conn net.Conn, p *Packet,
 	remoteAddr string) (err error) {
 	defer func() {

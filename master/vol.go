@@ -305,6 +305,10 @@ func (vol *Vol) getDataPartitionByID(partitionID uint64) (dp *DataPartition, err
 	return vol.dataPartitions.get(partitionID)
 }
 
+/*
+tạo mới các meta partitions cho vol trong cluster `c`
+-
+*/
 func (vol *Vol) initMetaPartitions(c *Cluster, count int) (err error) {
 	// initialize k meta partitionMap at a time
 	var (
@@ -327,6 +331,7 @@ func (vol *Vol) initMetaPartitions(c *Cluster, count int) (err error) {
 		if index == count-1 {
 			end = defaultMaxMetaPartitionInodeID
 		}
+		//
 		if err = vol.createMetaPartition(c, start, end); err != nil {
 			log.LogErrorf("action[initMetaPartitions] vol[%v] init meta partition err[%v]", vol.Name, err)
 			break
@@ -655,6 +660,14 @@ func (vol *Vol) checkAutoDataPartitionCreation(c *Cluster) {
 	}
 }
 
+/*
+Kiểm tra vol có nên bị hạn chế write vì hết space?
+  - true khi thỏa toàn bộ:
+    -- totalUsedSpace > vol.capacity()
+    -- vol IsHot
+    -- vol.capacity() > 0
+    -- vol.DpReadOnlyWhenVolFull
+*/
 func (vol *Vol) shouldInhibitWriteBySpaceFull() bool {
 	if !vol.DpReadOnlyWhenVolFull {
 		return false
@@ -676,6 +689,14 @@ func (vol *Vol) shouldInhibitWriteBySpaceFull() bool {
 	return false
 }
 
+/*
+Kiểm tra vol có cần phải create DataPartition ko?
+  - false khi một trong các trường hợp sau:
+    -- vol.status == markDelete
+    -- vol.capacity == 0
+    -- vol bị hạn chế Write
+    -- vol IsCold và NoCache
+*/
 func (vol *Vol) needCreateDataPartition() (ok bool, err error) {
 
 	ok = false
@@ -1157,6 +1178,12 @@ func (vol *Vol) splitMetaPartition(c *Cluster, mp *MetaPartition, end uint64, me
 	return
 }
 
+/*
+create 1 Meta Partition:
+  - gọi doCreateMetaPartition(): __TODO
+  - lưu xuống RocksDB và sync qua Raft rằng: đã tạo Meta Partition
+  - addMetaPartition: trên mem, thêm Meta Partition mới tạo cho volume
+*/
 func (vol *Vol) createMetaPartition(c *Cluster, start, end uint64) (err error) {
 	var mp *MetaPartition
 	if mp, err = vol.doCreateMetaPartition(c, start, end); err != nil {
@@ -1169,6 +1196,12 @@ func (vol *Vol) createMetaPartition(c *Cluster, start, end uint64) (err error) {
 	return
 }
 
+/*
+Gửi request đến MetaNode để create Meta Partition:
+  - Tìm địa chỉ MetaNode phù hợp để gửi request
+  - Gửi request đến địa chỉ MetaNode trên để tạo Meta Partition
+  - afterCreation(): thêm thông tin Meta Partition mới tạo vào mem
+*/
 func (vol *Vol) doCreateMetaPartition(c *Cluster, start, end uint64) (mp *MetaPartition, err error) {
 	var (
 		hosts       []string
@@ -1179,6 +1212,8 @@ func (vol *Vol) doCreateMetaPartition(c *Cluster, start, end uint64) (mp *MetaPa
 
 	errChannel := make(chan error, vol.mpReplicaNum)
 
+	// tìm địa chỉ MetaNode phù hợp
+	// __TODO:
 	if c.isFaultDomain(vol) {
 		if hosts, peers, err = c.getHostFromDomainZone(vol.domainId, TypeMetaPartition, vol.mpReplicaNum); err != nil {
 			log.LogErrorf("action[doCreateMetaPartition] getHostFromDomainZone err[%v]", err)

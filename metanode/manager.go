@@ -578,6 +578,11 @@ func (m *metadataManager) detachPartition(id uint64) (err error) {
 	return
 }
 
+/*
+khởi tạo Meta Partition trên MetaNode
+
+	-
+*/
 func (m *metadataManager) createPartition(request *proto.CreateMetaPartitionRequest) (err error) {
 
 	partitionId := fmt.Sprintf("%d", request.PartitionID)

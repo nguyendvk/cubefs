@@ -2070,6 +2070,10 @@ func (m *Server) checkCreateReq(req *createVolReq) (err error) {
 
 }
 
+/*
+create Volume handler
+- gọi Cluster.createVol()
+*/
 func (m *Server) createVol(w http.ResponseWriter, r *http.Request) {
 
 	req := &createVolReq{}
@@ -2097,6 +2101,7 @@ func (m *Server) createVol(w http.ResponseWriter, r *http.Request) {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
 	}
+	// create Vol on memory of master Raft node
 	if vol, err = m.cluster.createVol(req); err != nil {
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return

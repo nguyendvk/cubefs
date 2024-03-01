@@ -194,6 +194,9 @@ func getAvailCarryDataNodeTab(maxTotal uint64, excludeHosts []string, dataNodes 
 	return
 }
 
+/*
+__TODO:
+*/
 func getAvailHosts(nodes *sync.Map, excludeHosts []string, replicaNum int, selectType int) (newHosts []string, peers []proto.Peer, err error) {
 	var (
 		maxTotalFunc      GetMaxTotal

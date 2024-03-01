@@ -26,6 +26,9 @@ import (
 	//"github.com/cubefs/cubefs/blobstore/util/errors"
 )
 
+/*
+__TODO:
+*/
 type MasterQuotaManager struct {
 	MpQuotaInfoMap map[uint64][]*proto.QuotaReportInfo
 	IdQuotaInfoMap map[uint32]*proto.QuotaInfo

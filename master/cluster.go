@@ -385,6 +385,7 @@ const (
 	TypeDataPartition uint32 = 0x02
 )
 
+// __TODO:
 func (c *Cluster) getHostFromDomainZone(domainId uint64, createType uint32, replicaNum uint8) (hosts []string, peers []proto.Peer, err error) {
 	hosts, peers, err = c.domainManager.getHostFromNodeSetGrp(domainId, replicaNum, createType)
 	return
@@ -1237,6 +1238,14 @@ func (c *Cluster) batchCreatePreLoadDataPartition(vol *Vol, preload *DataPartiti
 	return
 }
 
+/*
+Tạo một batch DataPartiton cho volume:
+  - needCreateDataPartition(): kiểm tra volume có đươc tạo thêm dp hay ko
+  - lần lượt gọi createDataPartition(): tạo dp
+
+NOTE:
+  - tạo 1 batch nhưng lại gọi lần lượt sync, ko async hay song song
+*/
 func (c *Cluster) batchCreateDataPartition(vol *Vol, reqCount int, init bool) (err error) {
 	if !init {
 		if _, err = vol.needCreateDataPartition(); err != nil {
@@ -1286,11 +1295,10 @@ func (c *Cluster) isFaultDomain(vol *Vol) bool {
 
 // Synchronously create a data partition.
 // 1. Choose one of the available data nodes.
-// 2. Assign it a partition ID.
-// 3. Communicate with the data node to synchronously create a data partition.
+// 2. allocateDataPartitionID(): Assign it a partition ID.
+// 3. syncCreateDataPartitionToDataNode(): Communicate with the data node to synchronously create a data partition.
 // - If succeeded, replicate the data through raft and persist it to RocksDB.
 // - Otherwise, throw errors
-
 func (c *Cluster) createDataPartition(volName string, preload *DataPartitionPreLoad) (dp *DataPartition, err error) {
 	log.LogInfof("action[createDataPartition] preload [%v]", preload)
 	var (
@@ -1325,6 +1333,8 @@ func (c *Cluster) createDataPartition(volName string, preload *DataPartitionPreL
 	defer vol.createDpMutex.Unlock()
 
 	errChannel := make(chan error, dpReplicaNum)
+
+	// __TODO:
 
 	if c.isFaultDomain(vol) {
 		if targetHosts, targetPeers, err = c.getHostFromDomainZone(vol.domainId, TypeDataPartition, dpReplicaNum); err != nil {
@@ -1413,6 +1423,11 @@ errHandler:
 	return
 }
 
+/*
+Gửi reuqest từ master đến DataNode để tạo dp
+  - syncCreateDataPartitionToDataNode(): tạo Admin Task với op=proto.OpCreateDataPartition và địa chỉ chỉ định
+  - syncSendAdminTask(): gửi request đến DataNode để tạo Data Partition trên Data Node
+*/
 func (c *Cluster) syncCreateDataPartitionToDataNode(host string, size uint64, dp *DataPartition,
 	peers []proto.Peer, hosts []string, createType int, partitionType int) (diskPath string, err error) {
 	log.LogInfof("action[syncCreateDataPartitionToDataNode] dp [%v] createtype[%v], partitionType[%v]", dp.PartitionID, createType, partitionType)
@@ -1428,6 +1443,11 @@ func (c *Cluster) syncCreateDataPartitionToDataNode(host string, size uint64, dp
 	return string(resp.Data), nil
 }
 
+/*
+Gửi request từ master đến MetaNode để tạo Meta Partition
+  - buildNewMetaPartitionTasks(): tạo Admin Task để gửi đến MetaNode với địa chỉ chỉ định
+  - syncSendAdminTask(): gửi request đến MetaNode để tạo Meta Partition trên MetaNode
+*/
 func (c *Cluster) syncCreateMetaPartitionToMetaNode(host string, mp *MetaPartition) (err error) {
 	hosts := make([]string, 0)
 	hosts = append(hosts, host)
@@ -1539,6 +1559,7 @@ func (c *Cluster) chooseZoneNormal(zones []*Zone, excludeNodeSets []uint64, excl
 	return
 }
 
+// __TODO:
 func (c *Cluster) getHostFromNormalZone(nodeType uint32, excludeZones []string, excludeNodeSets []uint64,
 	excludeHosts []string, replicaNum int,
 	zoneNum int, specifiedZone string) (hosts []string, peers []proto.Peer, err error) {
@@ -2901,8 +2922,14 @@ func (c *Cluster) checkZoneName(name string,
 	return
 }
 
-// Create a new volume.
-// By default we create 3 meta partitions and 10 data partitions during initialization.
+/*
+Create a new volume.
+  - init 3 (default) MetaPartitions
+  - có thể init đúng 10 cái DataPartitions
+
+NOTE:
+  - ko liên quan gì đến blobstore, EC
+*/
 func (c *Cluster) createVol(req *createVolReq) (vol *Vol, err error) {
 	if c.DisableAutoAllocate {
 		log.LogWarn("the cluster is frozen")
@@ -2917,6 +2944,7 @@ func (c *Cluster) createVol(req *createVolReq) (vol *Vol, err error) {
 		return
 	}
 
+	// khởi tạo thông tin của volume trên mem của các master node thông qua Raft
 	if vol, err = c.doCreateVol(req); err != nil {
 		goto errHandler
 	}
@@ -2925,6 +2953,7 @@ func (c *Cluster) createVol(req *createVolReq) (vol *Vol, err error) {
 	vol.initUidSpaceManager(c)
 	vol.initQuotaManager(c)
 
+	// init các MetaPartitions, default: 3 cái
 	if err = vol.initMetaPartitions(c, req.mpCount); err != nil {
 
 		vol.Status = markDelete
@@ -2938,6 +2967,8 @@ func (c *Cluster) createVol(req *createVolReq) (vol *Vol, err error) {
 		goto errHandler
 	}
 
+	// nếu CacheCapacity > 0 hoặc VolType = Hot
+	// -> init 10 cái DataPartitions
 	if vol.CacheCapacity > 0 || (proto.IsHot(vol.VolType) && vol.Capacity > 0) {
 		for retryCount := 0; readWriteDataPartitions < defaultInitMetaPartitionCount && retryCount < 3; retryCount++ {
 			err = vol.initDataPartitions(c)
@@ -2966,6 +2997,12 @@ errHandler:
 	return
 }
 
+/*
+Create Volume information on mem and RocksDB on master nodes via Raft
+  - IDAllocator.allocateCommonID(): cấp Volume ID
+  - syncAddVol(): ghi xuống RocksDB trên các master nodes thông qua Raft
+  - putVol(): lưu vào volume vào memory
+*/
 func (c *Cluster) doCreateVol(req *createVolReq) (vol *Vol, err error) {
 	c.createVolMutex.Lock()
 	defer c.createVolMutex.Unlock()
