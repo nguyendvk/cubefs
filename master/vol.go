@@ -307,7 +307,7 @@ func (vol *Vol) getDataPartitionByID(partitionID uint64) (dp *DataPartition, err
 
 /*
 tạo mới các meta partitions cho vol trong cluster `c`
--
+- gọi vol.createMetaPartition
 */
 func (vol *Vol) initMetaPartitions(c *Cluster, count int) (err error) {
 	// initialize k meta partitionMap at a time
@@ -1180,9 +1180,9 @@ func (vol *Vol) splitMetaPartition(c *Cluster, mp *MetaPartition, end uint64, me
 
 /*
 create 1 Meta Partition:
-  - gọi doCreateMetaPartition(): __TODO
+  - gọi doCreateMetaPartition(): gửi request đến MetaNode để tạo MP
   - lưu xuống RocksDB và sync qua Raft rằng: đã tạo Meta Partition
-  - addMetaPartition: trên mem, thêm Meta Partition mới tạo cho volume
+  - addMetaPartition: trên mem, thêm Meta Partition mới tạo vào volume
 */
 func (vol *Vol) createMetaPartition(c *Cluster, start, end uint64) (err error) {
 	var mp *MetaPartition
