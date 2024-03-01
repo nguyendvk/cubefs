@@ -507,6 +507,9 @@ func (mp *metaPartition) acucumUidSizeByLoad(ino *Inode) {
 	mp.uidManager.accumInoUidSize(ino, mp.uidManager.accumBase)
 }
 
+/*
+Mỗi 2 phút, mp.size = tổng các inode.Size
+*/
 func (mp *metaPartition) updateSize() {
 	timer := time.NewTicker(time.Minute * 2)
 	go func() {
@@ -547,7 +550,12 @@ func (mp *metaPartition) GetFreeListLen() int {
 	return mp.freeList.Len()
 }
 
-// Start starts a meta partition.
+/*
+Start starts a meta partition.
+  - mp.config.BeforeStart()
+  - mp.onStart()
+  - mp.AfterStart)
+*/
 func (mp *metaPartition) Start(isCreate bool) (err error) {
 	if atomic.CompareAndSwapUint32(&mp.state, common.StateStandby, common.StateStart) {
 		defer func() {
@@ -589,6 +597,14 @@ func (mp *metaPartition) Stop() {
 	}
 }
 
+/*
+__TODO:
+Khởi chạy mp với các việc sau:
+  - mp.load(isCreate): load mp từ snapshot hoặc meta hoặc lưu snapshot
+  - nếu vol IsCold: khởi tạo EbsClient
+  - khởi tạo Raft cho Meta Partition
+  - updateSize(): mỗi 2 phút, update mp.size = tổng của inode.Size
+*/
 func (mp *metaPartition) onStart(isCreate bool) (err error) {
 	defer func() {
 		if err == nil {
@@ -596,6 +612,7 @@ func (mp *metaPartition) onStart(isCreate bool) (err error) {
 		}
 		mp.onStop()
 	}()
+	// load lại mp từ disk hoặc ghi snapshot xuống disk
 	if err = mp.load(isCreate); err != nil {
 		err = errors.NewErrorf("[onStart] load partition id=%d: %s",
 			mp.config.PartitionId, err.Error())
@@ -649,6 +666,7 @@ func (mp *metaPartition) onStart(isCreate bool) (err error) {
 
 	go mp.startCheckerEvict()
 
+	// start Raft của MetaPartition
 	if err = mp.startRaft(); err != nil {
 		err = errors.NewErrorf("[onStart] start raft id=%d: %s",
 			mp.config.PartitionId, err.Error())
@@ -666,6 +684,9 @@ func (mp *metaPartition) onStart(isCreate bool) (err error) {
 	return
 }
 
+/*
+__TODO:
+*/
 func (mp *metaPartition) startScheduleTask() {
 	mp.startSchedule(mp.applyID)
 	mp.startFileStats()
@@ -836,6 +857,11 @@ func (mp *metaPartition) GetUniqId() uint64 {
 }
 
 // PersistMetadata is the wrapper of persistMetadata.
+/*
+Lưu mp.config xuống disk
+	- sortPeers trong mp.config: sort các peer của các raft node.
+	- gọi mp.persistMetadata(): để ghi mp.config xuống disk
+*/
 func (mp *metaPartition) PersistMetadata() (err error) {
 	mp.config.sortPeers()
 	err = mp.persistMetadata()
@@ -955,7 +981,11 @@ func (mp *metaPartition) LoadSnapshot(snapshotPath string) (err error) {
 	return mp.loadApplyID(snapshotPath)
 }
 
+/*
+load mp từ đĩa hoặc nếu mp mới được tạo (isCreate == true) thì lưu snapshot của mp xuống disk
+*/
 func (mp *metaPartition) load(isCreate bool) (err error) {
+	// load mp.config từ disk
 	if err = mp.loadMetadata(); err != nil {
 		return
 	}
@@ -964,12 +994,15 @@ func (mp *metaPartition) load(isCreate bool) (err error) {
 	// 2. store the snapshot files for new mp, because
 	// mp.load() will check all the snapshot files when mn startup
 	if isCreate {
+		// nếu tạo mới mp thì lưu snapshot cho metadata
 		if err = mp.storeSnapshotFiles(); err != nil {
 			err = errors.NewErrorf("[onStart] storeSnapshotFiles for partition id=%d: %s",
 				mp.config.PartitionId, err.Error())
 		}
 		return
 	}
+
+	// nếu không phải tạo mới thì load mp từ snapshot
 
 	snapshotPath := path.Join(mp.config.RootDir, snapshotDir)
 	if _, err = os.Stat(snapshotPath); err != nil {
@@ -980,6 +1013,9 @@ func (mp *metaPartition) load(isCreate bool) (err error) {
 	return mp.LoadSnapshot(snapshotPath)
 }
 
+/*
+lưu mp xuống disk thành snapshot
+*/
 func (mp *metaPartition) store(sm *storeMsg) (err error) {
 	log.LogWarnf("metaPartition %d store apply %v", mp.config.PartitionId, sm.applyIndex)
 	tmpDir := path.Join(mp.config.RootDir, snapshotDirTmp)
@@ -1224,6 +1260,7 @@ func (mp *metaPartition) canRemoveSelf() (canRemove bool, err error) {
 }
 
 // cacheTTLWork only happen in datalake situation
+// __TODO:
 func (mp *metaPartition) cacheTTLWork() (err error) {
 	// check volume type, only Cold volume will do the cache ttl.
 	volView, mcErr := masterClient.ClientAPI().GetVolumeWithoutAuthKey(mp.config.VolName)

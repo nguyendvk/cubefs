@@ -581,7 +581,10 @@ func (m *metadataManager) detachPartition(id uint64) (err error) {
 /*
 khởi tạo Meta Partition trên MetaNode
 
-	-
+  - NewMetaPartition(): khởi tạo mp trên mem
+  - PersistMetadata(): ghi mp.config xuống disk
+  - Start(): khởi tạo các job và instance của Meta Partition
+    ...
 */
 func (m *metadataManager) createPartition(request *proto.CreateMetaPartitionRequest) (err error) {
 
@@ -605,16 +608,18 @@ func (m *metadataManager) createPartition(request *proto.CreateMetaPartitionRequ
 		m.detachPartition(request.PartitionID)
 	}
 
+	// khởi tạo mp trên mem
 	partition := NewMetaPartition(mpc, m)
 	if partition == nil {
 		err = errors.NewErrorf("[createPartition] partition is nil")
 		return
 	}
+	// ghi mp.config xuống disk
 	if err = partition.PersistMetadata(); err != nil {
 		err = errors.NewErrorf("[createPartition]->%s", err.Error())
 		return
 	}
-
+	// khởi tạo các job và instance của Meta Partition
 	if err = partition.Start(true); err != nil {
 		os.RemoveAll(mpc.RootDir)
 		log.LogErrorf("load meta partition %v fail: %v", request.PartitionID, err)
@@ -622,6 +627,7 @@ func (m *metadataManager) createPartition(request *proto.CreateMetaPartitionRequ
 		return
 	}
 
+	// __TODO:
 	func() {
 		m.mu.Lock()
 		defer m.mu.Unlock()

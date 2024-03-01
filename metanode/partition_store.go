@@ -54,6 +54,9 @@ const (
 	uniqCheckerFile = "uniqChecker"
 )
 
+/*
+load mp.config từ disk
+*/
 func (mp *metaPartition) loadMetadata() (err error) {
 	metaFile := path.Join(mp.config.RootDir, metadataFile)
 	fp, err := os.OpenFile(metaFile, os.O_RDONLY, 0644)
@@ -724,6 +727,13 @@ func (mp *metaPartition) loadUniqChecker(rootDir string, crc uint32) (err error)
 	return
 }
 
+/*
+ghi mp.config xuống disk:
+  - mkdir -p
+  - OpenFile(".meta"): mở file tạm
+  - Marshal(mp.config) thành binary và ghi vào file .meta
+  - mv .meta meta: move file tạm sang file chính thức
+*/
 func (mp *metaPartition) persistMetadata() (err error) {
 	if err = mp.config.checkMeta(); err != nil {
 		err = errors.NewErrorf("[persistMetadata]->%s", err.Error())
