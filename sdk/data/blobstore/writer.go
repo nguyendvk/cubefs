@@ -332,6 +332,7 @@ LOOP:
 		return oeks[i].FileOffset < oeks[j].FileOffset
 	})
 	log.LogDebugf("WriteFromReader after sort: %v", oeks)
+	// ghi thông tin của các slice lên mp
 	if err = writer.mw.AppendObjExtentKeys(writer.ino, oeks); err != nil {
 		log.LogErrorf("WriteFromReader error,meta append ebsc extent keys fail,ino(%v), err(%v)", writer.ino, err)
 		return
@@ -479,7 +480,7 @@ func (writer *Writer) prepareWriteSlice(offset int, data []byte) []*rwSlice {
 /*
 ghi wSlice lên cluster:
   - gọi writer.ebsc.Write()
-  - tạo wSlice.objExtentKey từ thông tin các location (vị trí của các blob) trả về
+  - tạo wSlice.objExtentKey từ thông tin các location (vị trí của các blob) trả về. objExtentKey có thể dùng để gửi lên mp sau hàm này
 */
 func (writer *Writer) writeSlice(ctx context.Context, wSlice *rwSlice, wg bool) (err error) {
 	if wg {
@@ -505,14 +506,14 @@ func (writer *Writer) writeSlice(ctx context.Context, wSlice *rwSlice, wg bool) 
 		blobs = append(blobs, blob)
 	}
 	wSlice.objExtentKey = proto.ObjExtentKey{
-		Cid:        uint64(location.ClusterID),
-		CodeMode:   uint8(location.CodeMode),
-		Size:       location.Size,
-		BlobSize:   location.BlobSize,
-		Blobs:      blobs,
-		BlobsLen:   uint32(len(blobs)),
-		FileOffset: wSlice.fileOffset,
-		Crc:        location.Crc,
+		Cid:        uint64(location.ClusterID), // cluster ID
+		CodeMode:   uint8(location.CodeMode),   // EC mode
+		Size:       location.Size,              // slice size
+		BlobSize:   location.BlobSize,          // size of a blob
+		Blobs:      blobs,                      // thông tin các blobs của slice
+		BlobsLen:   uint32(len(blobs)),         // tổng số blob của slice
+		FileOffset: wSlice.fileOffset,          // vị trí bắt đầu của slice trong file lớn
+		Crc:        location.Crc,               // CRC checksum của slice
 	}
 	log.LogDebugf("TRACE blobStore,objExtentKey(%v)", wSlice.objExtentKey)
 

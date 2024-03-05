@@ -355,6 +355,10 @@ func (s *Service) Close() {
 	}
 }
 
+/*
+cấp thêm Bid
+- gọi ScopeMgr.Alloc
+*/
 func (s *Service) BidAlloc(c *rpc.Context) {
 	ctx := c.Request.Context()
 	span := trace.SpanFromContextSafe(ctx)

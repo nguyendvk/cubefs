@@ -96,6 +96,7 @@ func (b *bidMgr) allocBid(ctx context.Context) (err error) {
 	}
 	bidRet := &clustermgr.BidScopeRet{}
 	for try := 0; try < 3; try++ {
+		// proxy hỏi clusterMgr để cấp thêm 1 số lượng `args.Count = b.BidAllocNums` Blobs IDs
 		bidRet, err = b.clusterMgr.AllocBid(ctx, &args)
 		if err == nil {
 			break
@@ -129,13 +130,15 @@ Alloc `count` Bid
   - b.current = b.backup
   - cấp tiếp từ b.current
 
-??? TODO: Nếu b.backup + b.current ko đủ để cấp
+??? __TODO: Nếu b.backup + b.current ko đủ để cấp
+??? tại sao lại chia backup và current -> do proxy xin bid từ clustermgr
 */
 func (b *bidMgr) Alloc(ctx context.Context, count uint64) (bidRange []BidRange, err error) {
 	span := trace.SpanFromContextSafe(ctx)
 	bidRange = make([]BidRange, 0)
 
 	b.mu.Lock()
+	// nếu ko có backup ids: xin cấp thêm backups
 	defer func() {
 		if b.backup == nil {
 			select {

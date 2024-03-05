@@ -131,6 +131,8 @@ func (h *Handler) Put(ctx context.Context, rc io.Reader, size int64,
 			return nil, err
 		}
 
+		// size(readBuff) = bsize
+		// -> mỗi lần đọc là đọc 1 đoạn bsize
 		readBuff := buffer.DataBuf[:bsize]
 		shards, err := encoder.Split(buffer.ECDataBuf)
 		if err != nil {
@@ -308,6 +310,7 @@ func (h *Handler) writeToBlobnodes(ctx context.Context,
 					return true, nil
 				}
 
+				// errors handler
 				code := rpc.DetectStatusCode(err)
 				switch code {
 				case errcode.CodeDiskBroken, errcode.CodeDiskNotFound,
@@ -319,6 +322,7 @@ func (h *Handler) writeToBlobnodes(ctx context.Context,
 					}
 				}
 
+				// phạt các volume, Chunk nếu không ghi được do DiskBroken hoặc Readonly
 				switch code {
 				// EIO and Readonly error, then we need to punish disk in local and no necessary to retry
 				case errcode.CodeDiskBroken, errcode.CodeVUIDReadonly:

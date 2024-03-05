@@ -64,6 +64,11 @@ func (s *ScopeMgr) SetRaftServer(raftServer raftserver.RaftServer) {
 	s.raftServer = raftServer
 }
 
+/*
+cấp thêm `count` Bid
+- s.scopeItems[name] += uint64(count): tăng scope lên count
+- raftServer.Propose(): update rocksdb raftly
+*/
 func (s *ScopeMgr) Alloc(ctx context.Context, name string, count int) (base, new uint64, err error) {
 	if count <= 0 {
 		return 0, 0, ErrInvalidCount

@@ -96,7 +96,8 @@ func (h *Handler) allocFromAllocatorWithHystrix(ctx context.Context, codeMode co
 
 /*
 - nếu clusterID == 0: gọi h.clusterController.ChooseOne() để chọn clusterID
-- call proxy.Client.VolumeAlloc(): gửi request đến proxy để lấy các volume phù hợp
+- blobCount(size, blobSize): tính số blob cần có để lưu dữ liệu
+- call proxy.Client.VolumeAlloc(): gửi request đến proxy để lấy volume và các blobID phù hợp
 - loại các punished volume
 - tạo []access.SliceInfo từ []proxy.AllocRet
 */
@@ -118,7 +119,7 @@ func (h *Handler) allocFromAllocator(ctx context.Context, codeMode codemode.Code
 	args := proxy.AllocVolsArgs{
 		Fsize:    size,
 		CodeMode: codeMode,
-		BidCount: blobCount(size, blobSize),
+		BidCount: blobCount(size, blobSize), // tính trước số blobs cần để lưu dữ liệu
 	}
 
 	var allocRets []proxy.AllocRet

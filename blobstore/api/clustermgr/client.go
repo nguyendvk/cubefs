@@ -77,6 +77,7 @@ type BidScopeRet struct {
 }
 
 // BidAlloc return available bid scope
+// endpoint handler: blobstore/clustermgr/svr.go: func (s *Service) BidAlloc(c *rpc.Context)
 func (c *Client) AllocBid(ctx context.Context, args *BidScopeArgs) (ret *BidScopeRet, err error) {
 	ret = &BidScopeRet{}
 	err = c.PostWith(ctx, "/bid/alloc", ret, args)
