@@ -205,6 +205,17 @@ func (writer *Writer) cacheLevel2(wSlice *rwSlice) {
 	}
 }
 
+/*
+Ebs Write from io.Reader
+  - chia nhỏ binary data thành các buffer với len(buffer) = write.blockSize/
+  - với mỗi block, gửi các thông tin sau lên cluster bằng hàm writer.writeSlice() bằng goroutines
+    -- binray data trong buffer
+    -- len(buffer)
+    -- fileOffset: vị trí bắt đầu của buffer trong io.Reader
+
+NOTE:
+- Nếu len(reader) không chia hết cho writer.blockSize; chunk cuối cùng có len là phần dư (len(reader) % writer.blockSize)
+*/
 func (writer *Writer) WriteFromReader(ctx context.Context, reader io.Reader, h hash.Hash) (size uint64, err error) {
 	var (
 		tmp         = buf.ReadBufPool.Get().([]byte)
@@ -219,6 +230,7 @@ func (writer *Writer) WriteFromReader(ctx context.Context, reader io.Reader, h h
 	var oeksLock sync.RWMutex
 	oeks := make([]proto.ObjExtentKey, 0)
 
+	// ghi writer.buf lên cluster
 	writeBuff := func() {
 		bufSize := len(writer.buf)
 		log.LogDebugf("writeBuff: bufSize(%v), leftToWrite(%v), err(%v)", bufSize, leftToWrite, err)
@@ -267,6 +279,7 @@ func (writer *Writer) WriteFromReader(ctx context.Context, reader io.Reader, h h
 	}
 
 LOOP:
+	// chia nhỏ reader thành các chunk buffer với len(buffer) = writer.blockSize
 	for {
 		position := 0
 		leftToWrite, err = reader.Read(tmp)
@@ -463,6 +476,11 @@ func (writer *Writer) prepareWriteSlice(offset int, data []byte) []*rwSlice {
 	return wSlices
 }
 
+/*
+ghi wSlice lên cluster:
+  - gọi writer.ebsc.Write()
+  - tạo wSlice.objExtentKey từ thông tin các location (vị trí của các blob) trả về
+*/
 func (writer *Writer) writeSlice(ctx context.Context, wSlice *rwSlice, wg bool) (err error) {
 	if wg {
 		defer writer.wg.Done()

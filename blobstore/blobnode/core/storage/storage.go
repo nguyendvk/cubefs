@@ -74,6 +74,11 @@ func (stg *storage) RawStorage() core.Storage {
 	return nil
 }
 
+/*
+write shard xuống đĩa
+  - data.Write()
+  - meta.Write()
+*/
 func (stg *storage) Write(ctx context.Context, b *core.Shard) (err error) {
 	data, meta := stg.data, stg.meta
 
@@ -84,6 +89,16 @@ func (stg *storage) Write(ctx context.Context, b *core.Shard) (err error) {
 	}
 
 	// write meta
+	/*
+		lưu xuống RocksDB trên Node (ko Raft):
+		- key: (chunkID, bid)
+		- value:
+			-- shard version: __TODO: don't know
+			-- shard.Size: không bị thay đổi trong hàm data.Write()
+			-- shard CRC checksum: được tính trong hàm data.Write()
+			-- shard Offset trong file chunk: được tính trong hàm data.Write()
+			-- Flag: 1 trong 3 cờ default, normal, mark delete
+	*/
 	return meta.Write(ctx, b.Bid, core.ShardMeta{
 		Version: _shardVer[0],
 		Size:    b.Size,

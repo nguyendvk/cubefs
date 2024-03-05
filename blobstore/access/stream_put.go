@@ -42,6 +42,16 @@ import (
 // Put put one object
 //     required: size, file size
 //     optional: hasher map to calculate hash.Hash
+//
+/*
+Access Object Put handler:
+- make hasher
+- allocFromAllocatorWithHystrix(): gửi request đến proxy để xin các blobs
+- split data thành các blob
+- foreach blob:
+	-- EC encode blob thành các EC shards nhỏ hơn
+	-- writeToBlobnodesWithHystrix: write EC shards lên blobnode tới vị trí của vuid
+*/
 func (h *Handler) Put(ctx context.Context, rc io.Reader, size int64,
 	hasherMap access.HasherMap) (*access.Location, error) {
 	span := trace.SpanFromContextSafe(ctx)
@@ -166,6 +176,9 @@ func (h *Handler) Put(ctx context.Context, rc io.Reader, size int64,
 	return location, nil
 }
 
+/*
+call writeToBlobnodes()
+*/
 func (h *Handler) writeToBlobnodesWithHystrix(ctx context.Context,
 	blob blobIdent, shards [][]byte, callback func()) error {
 	safe := make(chan struct{}, 1)
@@ -190,6 +203,9 @@ type shardPutStatus struct {
 // writeToBlobnodes write shards to blobnodes.
 // takeover ec buffer release by callback.
 // return if had quorum successful shards, then wait all shards in background.
+/*
+__TODO:
+*/
 func (h *Handler) writeToBlobnodes(ctx context.Context,
 	blob blobIdent, shards [][]byte, callback func()) (err error) {
 	span := trace.SpanFromContextSafe(ctx)
@@ -204,6 +220,7 @@ func (h *Handler) writeToBlobnodes(ctx context.Context,
 		}()
 	}()
 
+	// get volume information from memory
 	volume, err := h.getVolume(ctx, clusterID, vid, true)
 	if err != nil {
 		return
@@ -258,6 +275,7 @@ func (h *Handler) writeToBlobnodes(ctx context.Context,
 			defer spanChild.Finish()
 
 		RETRY:
+			// lấy thông tin host để gửi request từ thông tin diskID
 			hostInfo, err := serviceController.GetDiskHost(ctxChild, diskID)
 			if err != nil {
 				span.Error("get disk host failed", errors.Detail(err))
@@ -279,6 +297,7 @@ func (h *Handler) writeToBlobnodes(ctx context.Context,
 			writeErr = retry.ExponentialBackoff(3, 200).RuptOn(func() (bool, error) {
 				args.Body = bytes.NewReader(shards[index])
 
+				// put shard to blobnode
 				crc, err = h.blobnodeClient.PutShard(ctxChild, host, args)
 				if err == nil {
 					if !crcDisabled && crc != crcOrigin {

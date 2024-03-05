@@ -45,6 +45,9 @@ type encoderReader struct {
 	err    error     //
 }
 
+/*
+Thêm CRC checksum và copy binary data theo từng block cho binary data của io.Reader, trả về io.Writer
+*/
 func (enc *Encoder) Encode(from io.Reader, limitSize int64, to io.Writer) (n int64, err error) {
 	if !isValidBlockLen(int64(enc.block.length())) {
 		panic(ErrInvalidBlock)
@@ -57,6 +60,9 @@ func (enc *Encoder) Encode(from io.Reader, limitSize int64, to io.Writer) (n int
 	return io.CopyN(to, reader, encSize)
 }
 
+/*
+Lần lượt gọi nextBlock() rồi copy r.block vào b. Mỗi block có tổ chức 4 bytes đầu chứa CRC checksum, phần còn lại lưu nội dung
+*/
 func (r *limitEncoderReader) Read(b []byte) (n int, err error) {
 	if r.err != nil {
 		return 0, r.err
@@ -84,6 +90,11 @@ func (r *limitEncoderReader) Read(b []byte) (n int, err error) {
 	return
 }
 
+/*
+Set next block cho reader
+- 4 bytes (32 bíts) đầu tiên cho checksum
+- các bytes còn lại để lưu dữ liệu
+*/
 func (r *limitEncoderReader) nextBlock() (err error) {
 	blockPayloadLen := r.block.payload()
 

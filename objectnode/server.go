@@ -268,6 +268,7 @@ func handleStart(s common.Server, cfg *config.Config) (err error) {
 	}
 	o.updateRegion(ci.Cluster)
 	log.LogInfof("handleStart: get cluster information: region(%v)", o.region)
+	// Nếu có setup và config EC subsystem, objectnode khởi tạo EbsClient để gửi request đến EC subsystem
 	if ci.EbsAddr != "" {
 		err = newEbsClient(ci, cfg)
 		if err != nil {

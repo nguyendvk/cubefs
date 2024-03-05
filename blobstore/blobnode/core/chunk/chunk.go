@@ -246,12 +246,15 @@ func (cs *chunk) Sync(ctx context.Context) (err error) {
 
 /*
 Need Shard:
-	- Size
-	- Flag
-	- Body (Reader)
+  - Size
+  - Flag
+  - Body (Reader)
+
 Fill Shard:
-	- Offset
-	- Crc
+  - Offset
+  - Crc
+
+gọi stg.Write()
 */
 func (cs *chunk) Write(ctx context.Context, b *core.Shard) (err error) {
 	if b.Vuid != cs.vuid {
@@ -276,6 +279,7 @@ func (cs *chunk) Write(ctx context.Context, b *core.Shard) (err error) {
 
 	cs.lock.RUnlock()
 
+	// storage Write
 	if err = stg.Write(ctx, b); err != nil {
 		return err
 	}
@@ -358,11 +362,11 @@ func (cs *chunk) VuidMeta() (vm *core.VuidMeta) {
 
 /*
 Fill Shard:
-	- Offset
-	- Size
-	- Crc
-	- Flag
-	- Body (Reader)
+  - Offset
+  - Size
+  - Crc
+  - Flag
+  - Body (Reader)
 */
 func (cs *chunk) NewReader(ctx context.Context, id proto.BlobID) (s *core.Shard, err error) {
 	elem := cs.consistent.Begin(id)
@@ -381,11 +385,11 @@ func (cs *chunk) NewReader(ctx context.Context, id proto.BlobID) (s *core.Shard,
 
 /*
 Fill Shard:
-	- Offset
-	- Size
-	- Crc
-	- Flag
-	- Body (Reader)
+  - Offset
+  - Size
+  - Crc
+  - Flag
+  - Body (Reader)
 */
 func (cs *chunk) NewRangeReader(ctx context.Context, id proto.BlobID, from, to int64) (s *core.Shard, err error) {
 	elem := cs.consistent.Begin(id)
@@ -426,13 +430,14 @@ func (cs *chunk) newRangeReader(ctx context.Context, stg core.Storage, id proto.
 
 /*
 Need Shard:
-	- Writer 	(To net)
+  - Writer 	(To net)
+
 Fill Shard:
-	- From, To 	(may fix)
-	- Offset
-	- Size
-	- Crc
-	- Flag
+  - From, To 	(may fix)
+  - Offset
+  - Size
+  - Crc
+  - Flag
 */
 func (cs *chunk) Read(ctx context.Context, b *core.Shard) (n int64, err error) {
 	span := trace.SpanFromContextSafe(ctx)
@@ -465,14 +470,15 @@ func (cs *chunk) Read(ctx context.Context, b *core.Shard) (n int64, err error) {
 
 /*
 Need Shard:
-	- From 		(may fix)
-	- To 		(may fix)
-	- Writer 	(To net)
+  - From 		(may fix)
+  - To 		(may fix)
+  - Writer 	(To net)
+
 Fill Shard:
-	- Offset
-	- Size
-	- Crc
-	- Flag
+  - Offset
+  - Size
+  - Crc
+  - Flag
 */
 func (cs *chunk) RangeRead(ctx context.Context, b *core.Shard) (n int64, err error) {
 	span := trace.SpanFromContextSafe(ctx)

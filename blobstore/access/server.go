@@ -346,7 +346,12 @@ func (s *Service) PutAt(c *rpc.Context) {
 	span.Infof("done /putat request hash:%+v", hashSumMap.All())
 }
 
-// Alloc alloc one location
+/*
+	Alloc alloc one location
+
+Trả về 1 location, là 1 list các blobs
+Gọi StreamHandler.Alloc()
+*/
 func (s *Service) Alloc(c *rpc.Context) {
 	args := new(access.AllocArgs)
 	if err := c.ParseArgs(args); err != nil {
@@ -633,13 +638,13 @@ func httpError(err error) error {
 }
 
 // genTokens generate tokens
-// 1. Returns 0 token if has no blobs.
-// 2. Returns 1 token if file size less than blobsize.
-// 3. Returns len(blobs) tokens if size divided by blobsize.
-// 4. Otherwise returns len(blobs)+1 tokens, the last token
-//    will be used by the last blob, even if the last slice blobs' size
-//    less than blobsize.
-// 5. Each segment blob has its specified token include the last blob.
+//  1. Returns 0 token if has no blobs.
+//  2. Returns 1 token if file size less than blobsize.
+//  3. Returns len(blobs) tokens if size divided by blobsize.
+//  4. Otherwise returns len(blobs)+1 tokens, the last token
+//     will be used by the last blob, even if the last slice blobs' size
+//     less than blobsize.
+//  5. Each segment blob has its specified token include the last blob.
 func genTokens(location *access.Location) []string {
 	tokens := make([]string, 0, len(location.Blobs)+1)
 

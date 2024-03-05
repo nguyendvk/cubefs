@@ -580,19 +580,32 @@ func (v *Volume) ListFilesV2(opt *ListFilesV2Option) (result *ListFilesV2Result,
 	return
 }
 
-// PutObject creates or updates target path objects and data.
-// Differentiate whether a target is a file or a directory by identifying its MIME type.
-// When the MIME type is "application/directory", the target object is a directory.
-// During processing, conflicts may occur because the actual type of the target object is
-// different from the expected type.
-//
-// For example, create a directory called "backup", but a file called "backup" already exists.
-// When a conflict occurs, the method returns an syscall.EINVAL error.
-//
-// An syscall.EINVAL error is returned indicating that a part of the target path expected to be a file
-// but actual is a directory.
-// An syscall.EINVAL error is returned indicating that a part of the target path expected to be a directory
-// but actual is a file.
+/*
+	PutObject creates or updates target path objects and data.
+
+Differentiate whether a target is a file or a directory by identifying its MIME type.
+When the MIME type is "application/directory", the target object is a directory.
+During processing, conflicts may occur because the actual type of the target object is
+different from the expected type.
+
+For example, create a directory called "backup", but a file called "backup" already exists.
+When a conflict occurs, the method returns an syscall.EINVAL error.
+
+An syscall.EINVAL error is returned indicating that a part of the target path expected to be a file
+but actual is a directory.
+An syscall.EINVAL error is returned indicating that a part of the target path expected to be a directory
+but actual is a file.
+Thực hiện put objeput lên cluster:
+  - recursiveMakeDirectory(): mkdir -p
+  - InodeCreate_ll(): khởi tạo inode và gửi lên các meta partition
+  - OpenStream():
+  - if vol IsCold: ebsWrite(): write lên EC subsystem
+  - if vol IsHot: streamWrite(), Flush(): write lên data partitions
+  - applyInodeToDEntry(): lưu Inode vào DEntry trên meta partition
+
+NOTE:
+  - vol IsCold thì sao phải OpenStream()??
+*/
 func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (fsInfo *FSFileInfo, err error) {
 	defer func() {
 		// Audit behavior
@@ -820,6 +833,9 @@ func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (f
 	return fsInfo, nil
 }
 
+/*
+__TODO
+*/
 func (v *Volume) applyInodeToDEntry(parentId uint64, name string, inode uint64, fullPath string) (err error) {
 	var existMode uint32
 	_, existMode, err = v.mw.Lookup_ll(parentId, name)
@@ -1306,6 +1322,10 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 	return fInfo, nil
 }
 
+/*
+write lên EC subsystem
+  - gọi getEbsWrite(inode).WriteFromReader()
+*/
 func (v *Volume) ebsWrite(inode uint64, reader io.Reader, h hash.Hash) (size uint64, err error) {
 	ctx := context.Background()
 	size, err = v.getEbsWriter(inode).WriteFromReader(ctx, reader, h)

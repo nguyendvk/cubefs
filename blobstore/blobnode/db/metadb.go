@@ -128,6 +128,9 @@ func (md *metadb) Flush(ctx context.Context) (err error) {
 	return
 }
 
+/*
+lưu KV vào db
+*/
 func (md *metadb) Put(ctx context.Context, kv rdb.KV) (err error) {
 	req := Request{
 		Type: msgPut,
@@ -142,6 +145,9 @@ func (md *metadb) Put(ctx context.Context, kv rdb.KV) (err error) {
 	resCh := req.Register()
 
 	md.applyToken(ctx, iot)
+	/*
+		gửi request vào channel của md. các request sẽ được ghi xuống rocksdb
+	*/
 	md.writeReqs <- req
 
 	select {

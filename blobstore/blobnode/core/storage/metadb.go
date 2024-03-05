@@ -107,6 +107,10 @@ func parseShardKey(data []byte) (key core.ShardKey, err error) {
 	return key, nil
 }
 
+/*
+write kv metadata trên blobnode:
+- gọi db.Put()
+*/
 func (cm *metafile) writeData(ctx context.Context, Key []byte, Value []byte) error {
 	span := trace.SpanFromContextSafe(ctx)
 
@@ -175,6 +179,10 @@ func (cm *metafile) InnerDB() db.MetaHandler {
 	return cm.db
 }
 
+/*
+ghi Metadata trên blobnode
+- gọi writeData(): lưu kv với key: (ChunkID, bid); value: value core.ShardMeta
+*/
 func (cm *metafile) Write(ctx context.Context, bid proto.BlobID, value core.ShardMeta) (err error) {
 	id := core.ShardKey{
 		Chunk: cm.id,

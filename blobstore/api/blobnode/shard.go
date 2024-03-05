@@ -57,6 +57,10 @@ type PutShardRet struct {
 	Crc uint32 `json:"crc"`
 }
 
+/*
+Put Shard data into blobnode at `host` address at disk ID: diskid, VolumeUnit: vuid, Blob ID: bid, ...
+endpoint handler: /blobstore/blobnode/shard.go: func (s *Service) ShardPut(c *rpc.Context)
+*/
 func (c *client) PutShard(ctx context.Context, host string, args *PutShardArgs) (crc uint32, err error) {
 	if args.Size > MaxShardSize {
 		err = bloberr.ErrShardSizeTooLarge

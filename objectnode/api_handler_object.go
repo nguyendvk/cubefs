@@ -1172,6 +1172,7 @@ func (o *ObjectNode) getBucketV2Handler(w http.ResponseWriter, r *http.Request) 
 
 // Put object
 // API reference: https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html
+// gọi vol.PutObject()
 func (o *ObjectNode) putObjectHandler(w http.ResponseWriter, r *http.Request) {
 	var err error
 	var errorCode *ErrorCode
@@ -1276,6 +1277,7 @@ func (o *ObjectNode) putObjectHandler(w http.ResponseWriter, r *http.Request) {
 		ACL:          acl,
 	}
 	var startPut = time.Now()
+	// volume put object
 	if fsFileInfo, err = vol.PutObject(param.Object(), r.Body, opt); err != nil {
 		log.LogErrorf("putObjectHandler: put object fail: requestId(%v) volume(%v) path(%v) remote(%v) err(%v)",
 			GetRequestID(r), vol.Name(), param.Object(), getRequestIP(r), err)

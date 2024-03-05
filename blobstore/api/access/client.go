@@ -52,7 +52,9 @@ const (
 type RPCConnectMode uint8
 
 // timeout: [short - - - - - - - - -> long]
-//       quick --> general --> default --> slow --> nolimit
+//
+//	quick --> general --> default --> slow --> nolimit
+//
 // speed: 40MB -->  20MB   -->  10MB   --> 4MB  --> nolimit
 const (
 	DefaultConnMode RPCConnectMode = iota
@@ -385,6 +387,14 @@ func getClient(cfg *Config, hosts []string) rpc.Client {
 	return rpc.NewLbClient(lbConfig, nil)
 }
 
+/*
+Implement interface access.API.Put. Ở phía client trước khi gọi đến access:
+  - nếu put data lớn, nên chia nhỏ để gửi nhiều lần, gọi putParts()
+  - nếu data nhỏ, có thể thực hiện put trong 1 request, gọi putObject()
+
+NOTE:
+- data lớn khi Size > MaxSizePutOnce
+*/
 func (c *client) Put(ctx context.Context, args *PutArgs) (location Location, hashSumMap HashSumMap, err error) {
 	if args.Size == 0 {
 		hashSumMap := args.Hashes.ToHashSumMap()
@@ -401,6 +411,10 @@ func (c *client) Put(ctx context.Context, args *PutArgs) (location Location, has
 	return c.putParts(ctx, args)
 }
 
+/*
+gửi request putObject lên access server
+endpoint handler at: blobstore/access/server.go: func (s *Service) Put(c *rpc.Context)
+*/
 func (c *client) putObject(ctx context.Context, args *PutArgs) (location Location, hashSumMap HashSumMap, err error) {
 	rpcClient := c.rpcClient.Load().(rpc.Client)
 
@@ -427,6 +441,12 @@ type blobPart struct {
 	buf   []byte
 }
 
+/*
+Đồng thời gửi request /putat lên access
+handler endpoint: /blobstore/access/server.go: func (s *Service) PutAt(c *rpc.Context)
+
+Nếu có err thì xóa các part đã upload bằng request /deleteblob lên access
+*/
 func (c *client) putPartsBatch(ctx context.Context, parts []blobPart) error {
 	rpcClient := c.rpcClient.Load().(rpc.Client)
 
@@ -464,8 +484,13 @@ func (c *client) putPartsBatch(ctx context.Context, parts []blobPart) error {
 	return nil
 }
 
+/*
+khởi tạo `PartConcurrence - 1` channel để đọc data từ io.Reader reqBody.
+Mỗi channel chứa các buffer với size(buffer) = blobSize
+*/
 func (c *client) readerPipeline(span trace.Span, reqBody io.Reader,
 	closeCh <-chan struct{}, size, blobSize int) <-chan []byte {
+	// ??? vì sao lại - 1
 	ch := make(chan []byte, c.config.PartConcurrence-1)
 	go func() {
 		for size > 0 {
@@ -490,6 +515,7 @@ func (c *client) readerPipeline(span trace.Span, reqBody io.Reader,
 				close(ch)
 				return
 			case ch <- buf:
+				// block gorountine hiện tại đến khi ch có request lấy buf
 			}
 
 			size -= toread
@@ -499,6 +525,12 @@ func (c *client) readerPipeline(span trace.Span, reqBody io.Reader,
 	return ch
 }
 
+/*
+put file lớn lên access:
+  - gửi post request lên access: /alloc với parameter size để xin cấp vị trí ghi blob
+  - split args.Body thành các blobs nhỏ hơn
+  - song song put các blob lên access với vị trí đã được cấp ( tạo được `PartConcurrence` goroutines cùng lúc)
+*/
 func (c *client) putParts(ctx context.Context, args *PutArgs) (Location, HashSumMap, error) {
 	span := trace.SpanFromContextSafe(ctx)
 	rpcClient := c.rpcClient.Load().(rpc.Client)
@@ -543,6 +575,10 @@ func (c *client) putParts(ctx context.Context, args *PutArgs) (Location, HashSum
 
 	// alloc
 	allocResp := &AllocResp{}
+	/*
+		hỏi cấp location (gồm các blobs) để ghi file với size = args.Size
+		endpoint handler: blob/access/server.go: func (s *Service) Alloc(c *rpc.Context)
+	*/
 	if err := rpcClient.PostWith(ctx, "/alloc", allocResp, AllocArgs{Size: uint64(args.Size)}); err != nil {
 		return allocResp.Location, nil, err
 	}
@@ -552,6 +588,7 @@ func (c *client) putParts(ctx context.Context, args *PutArgs) (Location, HashSum
 
 	// buffer pipeline
 	closeCh := make(chan struct{})
+	// loc.Size = args.Size
 	bufferPipe := c.readerPipeline(span, reqBody, closeCh, int(loc.Size), int(loc.BlobSize))
 	defer func() {
 		close(closeCh)
@@ -584,6 +621,7 @@ func (c *client) putParts(ctx context.Context, args *PutArgs) (Location, HashSum
 			return Location{}, nil, errcode.ErrAccessReadRequestBody
 		}
 		readSize += len(buf)
+		// khởi tạo parts là list của blobPart, lưu data cần push
 		parts = append(parts, blobPart{size: len(buf), buf: buf})
 
 		more := true
@@ -606,6 +644,7 @@ func (c *client) putParts(ctx context.Context, args *PutArgs) (Location, HashSum
 		}
 
 		tryTimes := c.config.MaxPartRetry
+		// gán blobPart tướng ứng với loc.Blobs (vị trí lưu trên blobnode)
 		for {
 			if len(loc.Blobs) > MaxLocationBlobs {
 				releaseBuffer(parts)
@@ -632,12 +671,13 @@ func (c *client) putParts(ctx context.Context, args *PutArgs) (Location, HashSum
 				}
 			}
 
+			// put nguyên 1 batch parts
 			err := c.putPartsBatch(ctx, parts)
 			if err == nil {
 				for _, part := range parts {
 					remainSize -= uint64(part.size)
 					currBlobCount++
-					// next blobs
+					// nếu đã ghi hết vào blobs của SliceInfo hiện tại -> next blobs
 					if loc.Blobs[currBlobIdx].Count == currBlobCount {
 						currBlobIdx++
 						currBlobCount = 0
@@ -648,6 +688,7 @@ func (c *client) putParts(ctx context.Context, args *PutArgs) (Location, HashSum
 			}
 			span.Warn("putat parts", err)
 
+			// retry...
 			if tryTimes > 0 { // has retry setting
 				if tryTimes == 1 {
 					releaseBuffer(parts)

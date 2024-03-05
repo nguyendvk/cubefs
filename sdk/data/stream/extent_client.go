@@ -318,6 +318,7 @@ func (client *ExtentClient) SetClientID(id uint64) (err error) {
 }
 
 // Open request shall grab the lock until request is sent to the request channel
+// nếu chưa có Streamer cho inode thì khởi tạo Streamer mới và thêm vào client.streamers
 func (client *ExtentClient) OpenStream(inode uint64) error {
 	client.streamerLock.Lock()
 	s, ok := client.streamers[inode]

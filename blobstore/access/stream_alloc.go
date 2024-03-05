@@ -32,11 +32,12 @@ import (
 var errAllocatePunishedVolume = errors.New("allocate punished volume")
 
 // Alloc access interface /alloc
-//     required: size, file size
-//     optional: blobSize > 0, alloc with blobSize
-//               assignClusterID > 0, assign to alloc in this cluster certainly
-//               codeMode > 0, alloc in this codemode
-//     return: a location of file
+//
+//	required: size, file size
+//	optional: blobSize > 0, alloc with blobSize
+//	          assignClusterID > 0, assign to alloc in this cluster certainly
+//	          codeMode > 0, alloc in this codemode
+//	return: a location of file
 func (h *Handler) Alloc(ctx context.Context, size uint64, blobSize uint32,
 	assignClusterID proto.ClusterID, codeMode codemode.CodeMode) (*access.Location, error) {
 	span := trace.SpanFromContextSafe(ctx)
@@ -80,6 +81,10 @@ func (h *Handler) Alloc(ctx context.Context, size uint64, blobSize uint32,
 	return location, nil
 }
 
+/*
+gửi request đến proxy để xin vị trí lưu các blobs
+- call allocFromAllocator()
+*/
 func (h *Handler) allocFromAllocatorWithHystrix(ctx context.Context, codeMode codemode.CodeMode, size uint64, blobSize uint32,
 	clusterID proto.ClusterID) (cid proto.ClusterID, bidRets []access.SliceInfo, err error) {
 	err = hystrix.Do(allocCommand, func() error {
@@ -89,6 +94,12 @@ func (h *Handler) allocFromAllocatorWithHystrix(ctx context.Context, codeMode co
 	return
 }
 
+/*
+- nếu clusterID == 0: gọi h.clusterController.ChooseOne() để chọn clusterID
+- call proxy.Client.VolumeAlloc(): gửi request đến proxy để lấy các volume phù hợp
+- loại các punished volume
+- tạo []access.SliceInfo từ []proxy.AllocRet
+*/
 func (h *Handler) allocFromAllocator(ctx context.Context, codeMode codemode.CodeMode, size uint64, blobSize uint32,
 	clusterID proto.ClusterID) (proto.ClusterID, []access.SliceInfo, error) {
 	span := trace.SpanFromContextSafe(ctx)

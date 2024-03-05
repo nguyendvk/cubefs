@@ -426,10 +426,12 @@ func (s *Service) ShardDelete(c *rpc.Context) {
 }
 
 /*
- *  method:         POST
- *  url:            /shard/put/diskid/{diskid}/vuid/{vuid}/bid/{bid}/size/{size}?iotype={iotype}
- *  request body:   bidData
- */
+*  method:         POST
+*  url:            /shard/put/diskid/{diskid}/vuid/{vuid}/bid/{bid}/size/{size}?iotype={iotype}
+*  request body:   bidData
+- Lấy thông tin vị trí ghi tại DiskID, Vuid
+- gọi ChunkAPI.Write() để ghi xuống file chunk
+*/
 func (s *Service) ShardPut(c *rpc.Context) {
 	args := new(bnapi.PutShardArgs)
 	if err := c.ParseArgs(args); err != nil {
@@ -469,6 +471,7 @@ func (s *Service) ShardPut(c *rpc.Context) {
 	ctx = limitio.SetLimitTrack(ctx)
 
 	s.lock.RLock()
+	// get DiskAPI from DiskID
 	ds, exist := s.Disks[args.DiskID]
 	s.lock.RUnlock()
 	if !exist {
@@ -476,6 +479,8 @@ func (s *Service) ShardPut(c *rpc.Context) {
 		return
 	}
 
+	// get ChunkStorage with Vuid.
+	// Volume Unit là Chunk
 	cs, exist := ds.GetChunkStorage(args.Vuid)
 	if !exist {
 		c.RespondError(bloberr.ErrNoSuchVuid)
@@ -508,10 +513,12 @@ func (s *Service) ShardPut(c *rpc.Context) {
 		return
 	}
 
+	// tạo ShardWriter mới
 	shard := core.NewShardWriter(args.Bid, args.Vuid, uint32(args.Size), c.Request.Body)
 
 	start = time.Now()
 
+	// Thực hiện write shard xuống chunk
 	err = cs.Write(ctx, shard)
 	span.AppendTrackLog("disk.put", start, err)
 	if err != nil {

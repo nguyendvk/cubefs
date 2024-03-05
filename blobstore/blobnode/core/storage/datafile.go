@@ -286,6 +286,7 @@ func (cd *datafile) parseMeta() (err error) {
 	return
 }
 
+// tăng wOff để cấp space từ [pos, cd.wOff mới)
 func (cd *datafile) allocSpace(fsize int64) (pos int64, err error) {
 	cd.wLock.Lock()
 	defer cd.wLock.Unlock()
@@ -293,11 +294,20 @@ func (cd *datafile) allocSpace(fsize int64) (pos int64, err error) {
 	pos = cd.wOff
 
 	cd.wOff += fsize
+	// làm chẵn theo _pageSize
 	cd.wOff = core.AlignSize(cd.wOff, _pageSize)
 
 	return pos, nil
 }
 
+/*
+blobnode write raw data to disk:
+- core.Alignphysize(): tính trước size của data cần ghi
+- cd.allocSpace(): đăng ký space để ghi xuống file chunk
+- ghi header
+- ghi body, có hỗ trợ thêm CRC checksum cho từng block
+- ghi footer
+*/
 func (cd *datafile) Write(ctx context.Context, shard *core.Shard) error {
 	span := trace.SpanFromContextSafe(ctx)
 
@@ -307,6 +317,7 @@ func (cd *datafile) Write(ctx context.Context, shard *core.Shard) error {
 		start  time.Time
 	)
 
+	// lấy tổng size thực sự cần ghi
 	phySize := core.Alignphysize(int64(shard.Size))
 
 	// allocate space
@@ -329,6 +340,7 @@ func (cd *datafile) Write(ctx context.Context, shard *core.Shard) error {
 	}
 
 	start = time.Now()
+	// Write header xuống file
 	_, err = qoswAt.WriteAt(headerbuf, pos)
 	span.AppendTrackLog("hdr.w", start, err)
 	if err != nil {
@@ -358,6 +370,7 @@ func (cd *datafile) Write(ctx context.Context, shard *core.Shard) error {
 		return err
 	}
 
+	// Thêm CRC checksum cho binary data và ghi xuống disk
 	_, err = encoder.Encode(tr, int64(shard.Size), tw)
 	span.AppendTrackLogWithDuration("net.r", tr.Duration(), err)
 	span.AppendTrackLogWithDuration("dat.w", twRaw.Duration(), err)

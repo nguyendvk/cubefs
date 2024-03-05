@@ -345,6 +345,10 @@ func (v *volumeMgr) initModeInfo(ctx context.Context) (err error) {
 	return
 }
 
+/*
+-	call BidMgr.Alloc(): cấp các bid
+- allocVid(): cấp vid
+*/
 func (v *volumeMgr) Alloc(ctx context.Context, args *proxy.AllocVolsArgs) (allocRets []proxy.AllocRet, err error) {
 	allocBidScopes, err := v.BidMgr.Alloc(ctx, args.BidCount)
 	if err != nil {
@@ -397,6 +401,12 @@ func (v *volumeMgr) List(ctx context.Context, codeMode codemode.CodeMode) (vids 
 	return
 }
 
+/*
+choose next available VolumeID:
+  - v.preIdx++
+  - curIdx = preIdx % vols
+  - duyệt 1 vòng các vols bắt đầu từ curIdx: nếu modifySpace(vols[i]) = true -> vols[i] vẫn còn available: return vols[i].Vid
+*/
 func (v *volumeMgr) getNextVid(ctx context.Context, vols []*volume, modeInfo *modeInfo, args *proxy.AllocVolsArgs) (proto.Vid, error) {
 	curIdx := int(atomic.AddUint64(&v.preIdx, uint64(1)) % uint64(len(vols)))
 	l := len(vols) + curIdx
@@ -409,6 +419,20 @@ func (v *volumeMgr) getNextVid(ctx context.Context, vols []*volume, modeInfo *mo
 	return 0, errcode.ErrNoAvaliableVolume
 }
 
+/*
+kiểm tra 1 volume có available hay ko; nếu có: modifySpace cho volume
+-	false nếu:
+  - thuộc args.Excludes
+  - bị gắn tag deleted
+  - không đủ dung lượng để cấp mới
+
+- modifySpace:
+  - tăng Used giảm Free
+  - Nếu Free < v.VolumeReserveSize -> volume bị full:
+    -- gắn cờ volume bị deleted
+    -- modeInfo.totalFree -= volInfo.Free
+    -- xóa volume: modeInfo.volumes.Delete(volID)
+*/
 func (v *volumeMgr) modifySpace(ctx context.Context, volInfo *volume, modeInfo *modeInfo, args *proxy.AllocVolsArgs) bool {
 	span := trace.SpanFromContextSafe(ctx)
 	for _, id := range args.Excludes {
@@ -439,6 +463,11 @@ func (v *volumeMgr) modifySpace(ctx context.Context, volInfo *volume, modeInfo *
 	return true
 }
 
+/*
+cấp VolumeID
+  - call getAvailableVols(): lấy các volume của EC CodeMode
+  - call getNextVid(): lấy 1 available volume mà còn đủ space trong list ở trên
+*/
 func (v *volumeMgr) allocVid(ctx context.Context, args *proxy.AllocVolsArgs) (proto.Vid, error) {
 	span := trace.SpanFromContextSafe(ctx)
 	info := v.modeInfos[args.CodeMode]
@@ -460,6 +489,9 @@ func (v *volumeMgr) allocVid(ctx context.Context, args *proxy.AllocVolsArgs) (pr
 	return vid, nil
 }
 
+/*
+lấy các available volumes thuộc args.CodeMode
+*/
 func (v *volumeMgr) getAvailableVols(ctx context.Context, args *proxy.AllocVolsArgs) (vols []*volume, err error) {
 	span := trace.SpanFromContextSafe(ctx)
 	info := v.modeInfos[args.CodeMode]
