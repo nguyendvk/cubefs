@@ -295,6 +295,9 @@ func NewKafkaConsumer(brokers []string, commitInterval time.Duration, offsetGett
 	}
 }
 
+/*
+Khởi tạo kafka consumer của framework với input topic và chạy loop Consume trong goroutines
+*/
 func (cli *kafkaClient) StartKafkaConsumer(taskType proto.TaskType, topic string, fn func(msg *sarama.ConsumerMessage,
 	consumerPause ConsumerPause) bool) (GroupConsumer, error) {
 	config := sarama.NewConfig()

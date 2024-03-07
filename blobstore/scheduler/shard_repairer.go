@@ -185,6 +185,9 @@ func (mgr *ShardRepairMgr) Close() {
 	mgr.stopConsumer()
 }
 
+/*
+mỗi 1s check, nếu mgr.Enabled thì startConsumer()
+*/
 func (mgr *ShardRepairMgr) runTask() {
 	t := time.NewTicker(time.Second)
 	span := trace.SpanFromContextSafe(context.Background())
@@ -207,6 +210,10 @@ func (mgr *ShardRepairMgr) runTask() {
 	}
 }
 
+/*
+khởi tạo 3 kafka consumer với các topic: "shard_repair" , "shard_repair_prior", "shard_repair_failed" (this is default)
+Khi có message trong topic thì sẽ gọi hàm: mgr.Consume
+*/
 func (mgr *ShardRepairMgr) startConsumer() error {
 	if mgr.consumerRunning() {
 		return nil
@@ -253,6 +260,9 @@ func (mgr *ShardRepairMgr) GetErrorStats() (errStats []string, totalErrCnt uint6
 }
 
 // Consume consume kafka messages: if message is not consume will return false, otherwise return true
+/*
+- gọi mgr.consume()
+*/
 func (mgr *ShardRepairMgr) Consume(msg *sarama.ConsumerMessage, consumerPause base.ConsumerPause) bool {
 	var (
 		repairMsg *proto.ShardRepairMsg

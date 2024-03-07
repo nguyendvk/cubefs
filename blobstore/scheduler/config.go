@@ -104,8 +104,8 @@ type ServiceRegisterConfig struct {
 // ShardRepairKafkaConfig is kafka config of shard repair
 type ShardRepairKafkaConfig struct {
 	BrokerList             []string
-	TopicNormals           []string
-	TopicFailed            string
+	TopicNormals           []string // default: ["shard_repair", "shard_repair_prior"]
+	TopicFailed            string   // default: "shard_repair_failed"
 	FailMsgSenderTimeoutMs int64
 }
 

@@ -214,6 +214,9 @@ func (mgr *VolumeInspectMgr) Run() {
 	go mgr.run()
 }
 
+/*
+mỗi vài giây, inspectRun()
+*/
 func (mgr *VolumeInspectMgr) run() {
 	t := time.NewTicker(time.Duration(mgr.cfg.InspectIntervalS) * time.Second)
 	defer t.Stop()
@@ -520,6 +523,7 @@ func (mgr *VolumeInspectMgr) trySendShardRepairMsg(ctx context.Context, vid prot
 		return nil
 	}
 
+	// gửi request repair đến proxy với reason "inspect"
 	err := mgr.repairShardSender.SendShardRepairMsg(ctx, vid, bid, badIdxs)
 	if err != nil {
 		return err

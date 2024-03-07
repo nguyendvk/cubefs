@@ -394,6 +394,7 @@ func (h *Handler) clearGarbage(ctx context.Context, location *access.Location) e
 			span.Warn(err)
 			return err
 		}
+		// gửi request đến proxy để delete toàn bộ blobs trong location
 		err = h.proxyClient.SendDeleteMsg(ctx, host, deleteArgs)
 		if err != nil {
 			if errorTimeout(err) || errorConnectionRefused(err) {

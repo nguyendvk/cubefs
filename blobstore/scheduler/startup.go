@@ -54,6 +54,9 @@ var (
 	conf    Config
 )
 
+/*
+function init scheduler
+*/
 func init() {
 	mod := &cmd.Module{
 		Name:       proto.ServiceNameScheduler,
@@ -74,6 +77,9 @@ func initConfig(args []string) (*cmd.Config, error) {
 	return &conf.Config, nil
 }
 
+/*
+khởi chạy scheduler
+*/
 func setUp() (*rpc.Router, []rpc.ProgressHandler) {
 	var err error
 	service, err = NewService(&conf)
@@ -89,6 +95,13 @@ func tearDown() {
 }
 
 // NewService returns scheduler service
+/*
+Khởi chạy scheduler mới:
+	...
+	- tạo kafka client
+	- tạo shardRepairMgr có sử dụng kafkaClient
+	- tạo deleteMgr có sử dụng kafkaClient
+*/
 func NewService(conf *Config) (svr *Service, err error) {
 	if err := conf.fixConfig(); err != nil {
 		log.Errorf("service config check failed: err[%v]", err)
@@ -141,6 +154,7 @@ func NewService(conf *Config) (svr *Service, err error) {
 		return nil, fmt.Errorf("service register: err:[%w]", err)
 	}
 
+	// run blob_delete_mgr và shard_repair_mgr
 	if err = svr.RunTask(); err != nil {
 		return nil, err
 	}
@@ -203,6 +217,7 @@ func NewService(conf *Config) (svr *Service, err error) {
 		return nil, err
 	}
 
+	// run các managers
 	go svr.Run()
 	return svr, nil
 }

@@ -34,6 +34,9 @@ type LbConfig struct {
 	HostSyncIntervalMs int64 `json:"host_sync_interval_ms"`
 }
 
+/*
+client gửi requests đến proxy nhưng chỉ gửi các request push msg repair hoặc delete vào topic của kafka
+*/
 type lbClient struct {
 	Client
 	selector  selector.Selector
@@ -74,6 +77,9 @@ func NewMQLbClient(cfg *LbConfig, service clustermgr.APIService, clusterID proto
 	}
 }
 
+/*
+gọi proxy.client.SendDeleteMsg()
+*/
 func (c *lbClient) SendDeleteMsg(ctx context.Context, args *DeleteArgs) (err error) {
 	span := trace.SpanFromContextSafe(ctx)
 
@@ -92,6 +98,9 @@ func (c *lbClient) SendDeleteMsg(ctx context.Context, args *DeleteArgs) (err err
 	return err
 }
 
+/*
+gọi proxy.client.SendShardRepairMsg()
+*/
 func (c *lbClient) SendShardRepairMsg(ctx context.Context, args *ShardRepairArgs) (err error) {
 	span := trace.SpanFromContextSafe(ctx)
 	ctx = trace.ContextWithSpan(ctx, span)

@@ -22,8 +22,10 @@ import (
 )
 
 // SendRepairMessage send repair message to kafka
-// 1. message from access
-// 2. message from scheduler
+//  1. message from access; reason = "access-repair"
+//     -> refer to: blobstore/access/stream_put.go: h.sendRepairMsgBg(ctx, blob, badIdxes)
+//  2. message from scheduler; reason = "inspect"
+//     -> refer to: blobstore/volume_inspector.go: mgr.trySendShardRepairMsg(ctx, vid, bid, bads)
 func (s *Service) SendRepairMessage(c *rpc.Context) {
 	span := trace.SpanFromContextSafe(c.Request.Context())
 	ctx := trace.ContextWithSpan(c.Request.Context(), span)

@@ -93,6 +93,7 @@ func (h *Handler) Put(ctx context.Context, rc io.Reader, size int64,
 	}
 
 	uploadSucc := false
+	// defer để đảm bảo nếu ko upload thành công thì sẽ delete các blobs trong location
 	defer func() {
 		if !uploadSucc {
 			span.Infof("put failed clean location %+v", location)
@@ -414,6 +415,7 @@ func (h *Handler) writeToBlobnodes(ctx context.Context,
 			}
 			badIdxes = append(badIdxes, uint8(idx))
 		}
+		// nếu len(badIdxes) -> gửi request repair đến proxy
 		if len(badIdxes) > 0 {
 			h.sendRepairMsgBg(ctx, blob, badIdxes)
 		}
