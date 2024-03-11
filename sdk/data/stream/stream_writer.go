@@ -102,6 +102,10 @@ func (s *Streamer) IssueOpenRequest() error {
 	return nil
 }
 
+/*
+gửi WriteRequest đến channel
+handler at: `func (s *Streamer) handleRequest`
+*/
 func (s *Streamer) IssueWriteRequest(offset int, data []byte, flags int, checkFunc func() error) (write int, err error) {
 	if atomic.LoadInt32(&s.status) >= StreamerError {
 		return 0, errors.New(fmt.Sprintf("IssueWriteRequest: stream writer in error status, ino(%v)", s.inode))
@@ -277,6 +281,9 @@ func (s *Streamer) handleRequest(request interface{}) {
 	}
 }
 
+/*
+thực hiện ghi data lên DP
+*/
 func (s *Streamer) write(data []byte, offset, size, flags int, checkFunc func() error) (total int, err error) {
 	var direct bool
 
@@ -294,6 +301,7 @@ func (s *Streamer) write(data []byte, offset, size, flags int, checkFunc func() 
 	ctx := context.Background()
 	s.client.writeLimiter.Wait(ctx)
 
+	// Khởi tạo các ExtentRequest để điều chỉnh file
 	requests := s.extents.PrepareWriteRequests(offset, size, data)
 	log.LogDebugf("Streamer write: ino(%v) prepared requests(%v)", s.inode, requests)
 
@@ -303,15 +311,22 @@ func (s *Streamer) write(data []byte, offset, size, flags int, checkFunc func() 
 		if req.ExtentKey == nil {
 			continue
 		}
+		/*
+			Nếu tồn tại extent cũ (req.ExtentKey != nil) lúc PrepareWriteRequests
+			-> ko phải là write lần đầu
+			-> flush để đảm bảo file đã hoàn chỉnh ở lần write trước
+		*/
 		err = s.flush()
 		if err != nil {
 			return
 		}
+		// PrepareWriteRequests lại
 		requests = s.extents.PrepareWriteRequests(offset, size, data)
 		log.LogDebugf("Streamer write: ino(%v) prepared requests after flush(%v)", s.inode, requests)
 		break
 	}
 
+	// duyệt từng NewExtentRequest: neu la extent cu -> doOverwrite; neu la extent moi -> doWrite
 	for _, req := range requests {
 		var writeSize int
 		if req.ExtentKey != nil {
@@ -432,6 +447,10 @@ func (s *Streamer) doOverwrite(req *ExtentRequest, direct bool) (total int, err 
 	return
 }
 
+// thực hiện write NewExtentRequest
+//   - tao ExtentHandler moi: NewExtentHandler(s, offset, storeMode, 0)
+//   - ExtentHandler.write để push request
+//   - Nếu thành công, thêm ExtentHandler vào dirtylist, đánh dấu ExtentHandler đang cần được flush
 func (s *Streamer) doWrite(data []byte, offset, size int, direct bool) (total int, err error) {
 	var (
 		ek        *proto.ExtentKey
@@ -443,6 +462,7 @@ func (s *Streamer) doWrite(data []byte, offset, size int, direct bool) (total in
 	if offset > 0 || offset+size > s.tinySizeLimit() {
 		storeMode = proto.NormalExtentType
 	} else {
+		// if offset == 0 && size <= s.tinySizeLimit()
 		storeMode = proto.TinyExtentType
 	}
 
@@ -498,10 +518,13 @@ func (s *Streamer) doWrite(data []byte, offset, size int, direct bool) (total in
 
 			s.closeOpenHandler()
 		}
-	} else {
+	} else { // if volType = cold
+		// Tạo ExtentHandler mới
 		s.handler = NewExtentHandler(s, offset, storeMode, 0)
 		s.dirty = false
+		// ExtentHandler tạo và push các WritePacket để gửi các block
 		ek, err = s.handler.write(data, offset, size, direct)
+		// Nếu thành công, thêm ExtentHandler vào dirtylist, đánh dấu ExtentHandler đang cần được flush
 		if err == nil && ek != nil {
 			if !s.dirty {
 				s.dirtylist.Put(s.handler)
@@ -527,6 +550,9 @@ func (s *Streamer) doWrite(data []byte, offset, size int, direct bool) (total in
 	return
 }
 
+// Day tat ca data cua file len cluster.
+// - Goi tat ca dirtyExtentHandler.flush()
+// - Remove dirtyExtentHandler neu flush thanh cong
 func (s *Streamer) flush() (err error) {
 	for {
 		element := s.dirtylist.Get()

@@ -1144,6 +1144,7 @@ func (dp *DataPartition) startEvict() {
 		case <-ttlTimer.C:
 			log.LogDebugf("start [doExtentTtl] vol(%s), dp(%d).", vv.Name, dp.partitionID)
 			ttlStart := time.Now()
+			// chạy cacheTtl để xóa cache (default: 30 ngày)
 			dp.doExtentTtl(cacheTtl)
 			log.LogDebugf("action[doExtentTtl] vol(%v), dp(%v), cost (%v)ms.", vv.Name, dp.partitionID, time.Since(ttlStart))
 

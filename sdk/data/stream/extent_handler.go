@@ -16,10 +16,11 @@ package stream
 
 import (
 	"fmt"
-	"github.com/cubefs/cubefs/util/stat"
 	"net"
 	"sync/atomic"
 	"time"
+
+	"github.com/cubefs/cubefs/util/stat"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/wrapper"
@@ -136,6 +137,9 @@ func (eh *ExtentHandler) String() string {
 		eh.id, eh.inode, eh.fileOffset, eh.size, eh.storeMode, eh.status)
 }
 
+// ExtentHandler write data bằng cách lần lươt write các block với size=blksize=eh.stream.tinySizeLimit() hoặc util.BlockSize
+//   - tạo các WritePacket để ghi block với op=proto.OpWrite,proto.OpSyncWrite;
+//   - push các Packet đi
 func (eh *ExtentHandler) write(data []byte, offset, size int, direct bool) (ek *proto.ExtentKey, err error) {
 	var total, write int
 

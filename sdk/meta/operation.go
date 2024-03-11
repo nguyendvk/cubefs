@@ -163,6 +163,9 @@ func (mw *MetaWrapper) quotaIcreate(mp *MetaPartition, mode, uid, gid uint32, ta
 	return statusOK, resp.Info, nil
 }
 
+/*
+gui request to Meta Partition de tao inode; op = proto.OpMetaCreateInode
+*/
 func (mw *MetaWrapper) icreate(mp *MetaPartition, mode, uid, gid uint32, target []byte, fullPath string) (status int,
 	info *proto.InodeInfo, err error) {
 	bgTime := stat.BeginStat()

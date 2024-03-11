@@ -328,6 +328,7 @@ func (s *ExtentStore) initBaseFileID() error {
 }
 
 // Write writes the given extent to the disk.
+// - call extent.Write
 func (s *ExtentStore) Write(extentID uint64, offset, size int64, data []byte, crc uint32, writeType int, isSync bool, isBackupWrite bool) (err error) {
 	var (
 		e  *Extent
@@ -447,6 +448,9 @@ func (s *ExtentStore) Read(extentID uint64, offset, size int64, nbuf []byte, isR
 	return
 }
 
+/*
+trả về list ExtentInfos
+*/
 func (s *ExtentStore) DumpExtents() (extInfos SortedExtentInfos) {
 	s.eiMutex.RLock()
 	for _, v := range s.extentInfoMap {

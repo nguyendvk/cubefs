@@ -1976,6 +1976,9 @@ func (m *Server) volShrink(w http.ResponseWriter, r *http.Request) {
 	sendOkReply(w, r, newSuccessHTTPReply(msg))
 }
 
+/*
+check tính đúng đắn của create volume request và set các para thiếu về default
+*/
 func (m *Server) checkCreateReq(req *createVolReq) (err error) {
 
 	if !proto.IsHot(req.volType) && !proto.IsCold(req.volType) {
@@ -2072,6 +2075,7 @@ func (m *Server) checkCreateReq(req *createVolReq) (err error) {
 
 /*
 create Volume handler
+- parse và set default parameter
 - gọi Cluster.createVol()
 */
 func (m *Server) createVol(w http.ResponseWriter, r *http.Request) {
@@ -2091,6 +2095,7 @@ func (m *Server) createVol(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// check tính đúng đắn của create volume request và set các para thiếu về default
 	if err = m.checkCreateReq(req); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return

@@ -441,6 +441,10 @@ func (client *ExtentClient) SetFileSize(inode uint64, size int) {
 }
 
 // Write writes the data.
+/*
+- gọi client.GetStreamer(inode): lấy streamer từ mem
+- gọi IssueWriteRequest(): gửi write
+*/
 func (client *ExtentClient) Write(inode uint64, offset int, data []byte, flags int, checkFunc func() error) (write int, err error) {
 	prefix := fmt.Sprintf("Write{ino(%v)offset(%v)size(%v)}", inode, offset, len(data))
 	s := client.GetStreamer(inode)

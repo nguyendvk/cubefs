@@ -196,6 +196,17 @@ func (writer *Writer) doParallelWrite(ctx context.Context, data []byte, offset i
 	return
 }
 
+/*
+nếu writer.fileCache || (cacheAction == 2 và wSlice.fileOffsets + wslice.size < cacheThreshold (def = 10M)):
+  - copy wSlice.Data vào buf
+  - writer.asyncCache(): ghi buf lên dp bằng goroutines
+
+NOTE:
+Như description: https://cubefs.io/docs/master/maintenance/admin-api/master/volume.html#update thì:
+  - cacheThreshold: The size limit of the cached file. Only files smaller than this value will be written to the cache
+
+Vậy dù file size lớn hơn `cacheThreshold` thì nó vẫn cache các slice đầu ??
+*/
 func (writer *Writer) cacheLevel2(wSlice *rwSlice) {
 	if writer.cacheAction == proto.RWCache && (wSlice.fileOffset+uint64(wSlice.size)) < uint64(writer.cacheThreshold) || writer.fileCache {
 		buf := make([]byte, wSlice.size)
@@ -207,12 +218,15 @@ func (writer *Writer) cacheLevel2(wSlice *rwSlice) {
 
 /*
 Ebs Write from io.Reader
-  - chia nhỏ binary data thành các buffer với len(buffer) = write.blockSize/
-  - với mỗi block, gửi các thông tin sau lên cluster bằng hàm writer.writeSlice() bằng goroutines
-    -- binray data trong buffer
+- chia nhỏ binary data thành các buffer với len(buffer) = write.blockSize/
+- với mỗi slice :
+  - gửi các thông tin sau lên cluster bằng hàm writer.writeSlice() bằng goroutines:
+    -- binary data trong buffer
     -- len(buffer)
     -- fileOffset: vị trí bắt đầu của buffer trong io.Reader
+  - gọi cacheLevel2 để cache khi Write
 
+- ghi thông tin của các slice lên mp
 NOTE:
 - Nếu len(reader) không chia hết cho writer.blockSize; chunk cuối cùng có len là phần dư (len(reader) % writer.blockSize)
 */
@@ -523,6 +537,9 @@ func (writer *Writer) writeSlice(ctx context.Context, wSlice *rwSlice, wg bool) 
 	return
 }
 
+/*
+Gọi extentClient.Write() với flag proto.FlagsCache
+*/
 func (writer *Writer) asyncCache(ino uint64, offset int, data []byte) {
 	var err error
 	bgTime := stat.BeginStat()

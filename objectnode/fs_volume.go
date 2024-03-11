@@ -604,7 +604,7 @@ Thực hiện put objeput lên cluster:
   - applyInodeToDEntry(): lưu Inode vào DEntry trên meta partition
 
 NOTE:
-  - vol IsCold thì sao phải OpenStream()??
+  - vol IsCold vẫn phải OpenStream(): để cache lại trên dp
 */
 func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (fsInfo *FSFileInfo, err error) {
 	defer func() {

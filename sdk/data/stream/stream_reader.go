@@ -49,7 +49,7 @@ type Streamer struct {
 	once sync.Once
 
 	handler    *ExtentHandler   // current open handler
-	dirtylist  *DirtyExtentList // dirty handlers
+	dirtylist  *DirtyExtentList // dirty handlers. La cac extent được đánh dấu để flush, push data len cluster
 	dirty      bool             // whether current open handler is in the dirty list
 	isOpen     bool
 	needBCache bool
