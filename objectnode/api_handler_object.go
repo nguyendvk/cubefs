@@ -270,6 +270,7 @@ func (o *ObjectNode) getObjectHandler(w http.ResponseWriter, r *http.Request) {
 	if isRangeRead {
 		w.WriteHeader(http.StatusPartialContent)
 	}
+	// gọi Volume->readFile()
 	err = vol.readFile(fileInfo.Inode, fileSize, param.Object(), w, offset, size)
 	if err == syscall.ENOENT {
 		errorCode = NoSuchKey

@@ -1515,6 +1515,9 @@ func (v *Volume) readFile(inode, inodeSize uint64, path string, writer io.Writer
 	}
 }
 
+/*
+read EC
+*/
 func (v *Volume) readEbs(inode, inodeSize uint64, path string, writer io.Writer, offset, size uint64) error {
 	var upper = size + offset
 	if upper > inodeSize {
@@ -1523,6 +1526,7 @@ func (v *Volume) readEbs(inode, inodeSize uint64, path string, writer io.Writer,
 
 	ctx := context.Background()
 	_ = context.WithValue(ctx, "objectnode", 1)
+	// lấy EC reader
 	reader := v.getEbsReader(inode)
 	var n int
 	var rest uint64

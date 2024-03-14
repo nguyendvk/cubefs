@@ -17,12 +17,13 @@ package blobstore
 import (
 	"context"
 	"fmt"
-	"github.com/cubefs/cubefs/sdk/data/manager"
 	"io"
 	"os"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/cubefs/cubefs/sdk/data/manager"
 
 	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/stat"
@@ -149,6 +150,7 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 		size = len(buf)
 	}
 
+	// lấy Slice Info từ MP
 	rSlices, err = reader.prepareEbsSlice(offset, uint32(size))
 	log.LogDebugf("TRACE reader Read. ino(%v)  rSlices-length(%v) ", reader.ino, len(rSlices))
 
@@ -163,6 +165,7 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 		reader.err = make(chan error, sliceSize)
 		for _, rs := range rSlices {
 			pool.Execute(rs, func(param *rwSlice) {
+				// đọc slice
 				reader.readSliceRange(ctx, param)
 			})
 		}
@@ -271,6 +274,12 @@ func (reader *Reader) buildExtentKey(rs *rwSlice) {
 
 }
 
+/*
+read 1 Slice:
+- bcache.Get(): lấy từ local cache
+- extentClient.ReadExtent(): lấy cache từ DP
+- ebs.Read(): lấy từ EC subsystem
+*/
 func (reader *Reader) readSliceRange(ctx context.Context, rs *rwSlice) (err error) {
 	defer reader.wg.Done()
 	log.LogDebugf("TRACE blobStore readSliceRange Enter. ino(%v)  rs.fileOffset(%v),rs.rOffset(%v),rs.rSize(%v) ", reader.ino, rs.fileOffset, rs.rOffset, rs.rSize)

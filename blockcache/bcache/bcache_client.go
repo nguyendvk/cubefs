@@ -62,6 +62,9 @@ func NewBcacheClient() *BcacheClient {
 	return bClient
 }
 
+/*
+__TODO:
+*/
 func (bc *BcacheClient) Get(key string, buf []byte, offset uint64, size uint32) (int, error) {
 	var err error
 	bgTime := stat.BeginStat()

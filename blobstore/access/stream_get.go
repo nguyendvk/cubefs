@@ -50,9 +50,15 @@ type blobGetArgs struct {
 	Bid      proto.BlobID
 	CodeMode codemode.CodeMode
 	BlobSize uint64
-	Offset   uint64
-	ReadSize uint64
+	Offset   uint64 // Vị trí bắt đầu để get data trong blob
+	ReadSize uint64 // Số lượng bytes cần read từ vị trí offset
 
+	// nếu chỉ cần đọc 1 đoạn nhỏ trong 1 shard thì:
+	// - ShardOffset: vị trí bắt đầu để get trong 1 shard đó
+	// - ShardReadSize = ReadSize
+	// else:
+	// - ShardOffset: 0
+	// - ShardReadSize = ShardSize
 	ShardSize     int
 	ShardOffset   int
 	ShardReadSize int
@@ -87,32 +93,34 @@ type pipeBuffer struct {
 }
 
 // Get read file
-//     required: location, readSize
-//     optional: offset(default is 0)
 //
-//     first return value is data transfer to copy data after argument checking
+//	   required: location, readSize
+//	   optional: offset(default is 0)
 //
-//  Read data shards firstly, if blob size is small or read few bytes
-//  then ec reconstruct-read, try to reconstruct from N+X to N+M
-//  Just read essential bytes in each shard when reconstruct-read.
+//	   first return value is data transfer to copy data after argument checking
 //
-//  sorted N+X is, such as we use mode EC6P10L2, X=2 and Read from idc=2
-//  shards like this
-//              data N 6        |    parity M 10     | local L 2
-//        d1  d2  d3  d4  d5  d6  p1 .. p5  p6 .. p10  l1  l2
-//   idc   1   1   1   2   2   2     1         2        1   2
+//	Read data shards firstly, if blob size is small or read few bytes
+//	then ec reconstruct-read, try to reconstruct from N+X to N+M
+//	Just read essential bytes in each shard when reconstruct-read.
 //
-//sorted  d4  d5  d6  p6 .. p10  d1  d2  d3  p1 .. p5
-//read-1 [d4                p10]
-//read-2 [d4                p10  d1]
-//read-3 [d4                p10  d1  d2]
-//...
-//read-9 [d4                                       p5]
-//failed
+//	sorted N+X is, such as we use mode EC6P10L2, X=2 and Read from idc=2
+//	shards like this
+//	            data N 6        |    parity M 10     | local L 2
+//	      d1  d2  d3  d4  d5  d6  p1 .. p5  p6 .. p10  l1  l2
+//	 idc   1   1   1   2   2   2     1         2        1   2
+//
+// sorted  d4  d5  d6  p6 .. p10  d1  d2  d3  p1 .. p5
+// read-1 [d4                p10]
+// read-2 [d4                p10  d1]
+// read-3 [d4                p10  d1  d2]
+// ...
+// read-9 [d4                                       p5]
+// failed
 func (h *Handler) Get(ctx context.Context, w io.Writer, location access.Location, readSize, offset uint64) (func() error, error) {
 	span := trace.SpanFromContextSafe(ctx)
 	span.Debugf("get request cluster:%d size:%d offset:%d", location.ClusterID, readSize, offset)
 
+	// tính toán thông tin các blobs
 	blobs, err := genLocationBlobs(&location, readSize, offset)
 	if err != nil {
 		span.Info("illegal argument", err)
@@ -171,6 +179,8 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location access.Location
 		// Alloc N+M shard buffers here, and release after written to client.
 		// Replace not-empty buffers in readBlob, need release old-buffers in that function.
 		closeCh := make(chan struct{})
+
+		// pipeline là func trả về 1 readonly pipeBuffer channel
 		pipeline := func() <-chan pipeBuffer {
 			ch := make(chan pipeBuffer, 1)
 			go func() {
@@ -209,6 +219,7 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location access.Location
 					}
 					getTime.IncA(time.Since(st))
 
+					// read data vào shards
 					err = h.readOneBlob(ctx, getTime, serviceController, blob, sortedVuids, shards)
 					if err != nil {
 						span.Error("read one blob", blob.ID(), err)
@@ -233,6 +244,7 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location access.Location
 			return ch
 		}()
 
+		// copy data từ các shards và blob từ pipeline vào w
 		var err error
 		for line := range pipeline {
 			if line.err != nil {
@@ -297,7 +309,7 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location access.Location
 // 1. try to min-read shards bytes
 // 2. if failed try to read next shard to reconstruct
 // 3. write the the right offset bytes to writer
-// 4. Just read essential bytes if the data is a segment of one shard.
+// 4. Just read essential bytes if the data is a segment of one shard. -> xem genLocationBlobs()
 func (h *Handler) readOneBlob(ctx context.Context, getTime *timeReadWrite,
 	serviceController controller.ServiceController,
 	blob blobGetArgs, sortedVuids []sortedVuid, shards [][]byte) error {
@@ -328,6 +340,7 @@ func (h *Handler) readOneBlob(ctx context.Context, getTime *timeReadWrite,
 				close(ch)
 			}()
 
+			// đọc 1 số lượng `minShardsRead`
 			for _, vuid := range sortedVuids[:minShardsRead] {
 				if _, ok := empties[vuid.index]; !ok {
 					wg.Add(1)
@@ -338,6 +351,12 @@ func (h *Handler) readOneBlob(ctx context.Context, getTime *timeReadWrite,
 				}
 			}
 
+			/*
+				Loop tiếp các shard còn lại, tại mỗi shard:
+					- nếu stopChan đc trigger, return luôn
+					- đợi nextChan đc trigger, read shard
+					- next shard.
+			*/
 			for _, vuid := range sortedVuids[minShardsRead:] {
 				if _, ok := empties[vuid.index]; ok {
 					continue
@@ -460,6 +479,8 @@ func (h *Handler) readOneBlob(ctx context.Context, getTime *timeReadWrite,
 	return fmt.Errorf("broken %s", blob.ID())
 }
 
+/*
+ */
 func (h *Handler) readOneShard(ctx context.Context, serviceController controller.ServiceController,
 	blob blobGetArgs, vuid sortedVuid, stopChan <-chan struct{}) shardData {
 	clusterID, vid := blob.Cid, blob.Vid
@@ -637,6 +658,7 @@ func (h *Handler) getOneShardFromHost(ctx context.Context, serviceController con
 			context.Background(), "GetFromBlobnode", span.TraceID())
 		defer spanChild.Finish()
 
+		//
 		body, _, err := h.blobnodeClient.RangeGetShard(ctxChild, host, &args)
 		if err == nil {
 			rbody = body
@@ -701,6 +723,9 @@ func (h *Handler) getOneShardFromHost(ctx context.Context, serviceController con
 	return rbody, rerr
 }
 
+/*
+Sinh ra toàn bộ các blob cần đọc để đọc các byte trong khoản [offset, readSize)
+*/
 func genLocationBlobs(location *access.Location, readSize uint64, offset uint64) ([]blobGetArgs, error) {
 	if readSize > location.Size || offset > location.Size || offset+readSize > location.Size {
 		return nil, fmt.Errorf("FileSize:%d ReadSize:%d Offset:%d", location.Size, readSize, offset)
@@ -743,7 +768,7 @@ func genLocationBlobs(location *access.Location, readSize uint64, offset uint64)
 						Bid:      currBlobID,
 						CodeMode: location.CodeMode,
 						BlobSize: fixedBlobSize,
-						Offset:   blobOffset,
+						Offset:   blobOffset, // trong blob này, đọc từ trong range [`Offset`, `Offset` + `ReadSize`]
 						ReadSize: toReadSize,
 
 						ShardSize:     shardSize,
@@ -850,11 +875,20 @@ func emptyDataShardIndexes(sizes ec.BufferSizes) map[int]struct{} {
 	return set
 }
 
+/*
+Nếu chỉ cần đọc 1 segment trong 1 shard của 1 blob: set vị trí đọc đó
+else defaultly: đọc hết cả shard
+*/
 func shardSegment(shardSize, blobOffset, blobReadSize int) (shardOffset, shardReadSize int) {
 	shardOffset = blobOffset % shardSize
 	if lastOffset := shardOffset + blobReadSize; lastOffset > shardSize {
+		// nếu vị trí cuối cùng được đọc trong Shard > shardSize
+		// -> đọc nhiều hơn 1 shards
+		// -> đọc hết cả shard
 		shardOffset, shardReadSize = 0, shardSize
 	} else {
+		// đọc duy nhất 1 đoạn trong 1 shard
+		// -> đọc từ [shardOffset, shardOfffset + blobReadsize)
 		shardReadSize = blobReadSize
 	}
 	return

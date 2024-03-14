@@ -391,6 +391,8 @@ func (s *Service) Alloc(c *rpc.Context) {
 }
 
 // Get read file
+// - gọi transfer = streamHandler.Get()
+// - gọi transfer()
 func (s *Service) Get(c *rpc.Context) {
 	args := new(access.GetArgs)
 	if err := c.ParseArgs(args); err != nil {
@@ -410,6 +412,7 @@ func (s *Service) Get(c *rpc.Context) {
 
 	w := c.Writer
 	writer := s.limiter.Writer(ctx, w)
+	// trả về hàm transfer để đẩy data vào writer
 	transfer, err := s.streamHandler.Get(ctx, writer, args.Location, args.ReadSize, args.Offset)
 	if err != nil {
 		span.Error("stream get prepare failed", errors.Detail(err))

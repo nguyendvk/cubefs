@@ -49,6 +49,10 @@ func NewEbsClient(cfg access.Config) (*BlobStoreClient, error) {
 	}, err
 }
 
+/*
+gửi request Get lên access để read data bằng hàm: ebs.client.Get()
+endpoint handler tại: /blobstore/access/server.go: func (s *Service) Get
+*/
 func (ebs *BlobStoreClient) Read(ctx context.Context, volName string, buf []byte, offset uint64, size uint64, oek proto.ObjExtentKey) (readN int, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {

@@ -145,6 +145,10 @@ type RangeGetShardArgs struct {
 	Size   int64 `json:"size"`
 }
 
+/*
+send request to host to get shard
+endpoint handler at: blobstore/blobnode/shard.go: func (s *Service) ShardGet
+*/
 func (c *client) RangeGetShard(ctx context.Context, host string, args *RangeGetShardArgs) (
 	body io.ReadCloser, shardCrc uint32, err error,
 ) {
