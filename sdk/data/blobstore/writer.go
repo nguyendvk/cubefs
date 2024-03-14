@@ -226,7 +226,7 @@ Ebs Write from io.Reader
     -- fileOffset: vị trí bắt đầu của buffer trong io.Reader
   - gọi cacheLevel2 để cache khi Write
 
-- ghi thông tin của các slice lên mp
+- MetaWrapper.AppendObjExtentKeys(inode, sorted_eoks): ghi thông tin của các slice lên mp
 NOTE:
 - Nếu len(reader) không chia hết cho writer.blockSize; chunk cuối cùng có len là phần dư (len(reader) % writer.blockSize)
 */

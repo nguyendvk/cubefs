@@ -1883,6 +1883,17 @@ func (mw *MetaWrapper) appendExtentKeys(mp *MetaPartition, inode uint64, extents
 	return
 }
 
+/*
+ghi list of ObjExtentKey của `inode`len mp với Opcode = AppendObjExtentKeys
+request như sau:
+
+	VolName:     // volume name
+	PartitionID: // mp.PartitionID,
+	Inode:       // inode,
+	Extents:     // extents,
+
+endpoint handler: metanode/manager_op.go: func (m *metadataManager) opMetaBatchObjExtentsAdd
+*/
 func (mw *MetaWrapper) appendObjExtentKeys(mp *MetaPartition, inode uint64, extents []proto.ObjExtentKey) (status int, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {

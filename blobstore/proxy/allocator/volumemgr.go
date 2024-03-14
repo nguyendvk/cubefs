@@ -406,6 +406,9 @@ choose next available VolumeID:
   - v.preIdx++
   - curIdx = preIdx % vols
   - duyệt 1 vòng các vols bắt đầu từ curIdx: nếu modifySpace(vols[i]) = true -> vols[i] vẫn còn available: return vols[i].Vid
+
+NOTES:
+  - ??? preIdx dùng chung cho nhiều codemode. Vậy cũng ko có tác dụng phân tán lựa chọn
 */
 func (v *volumeMgr) getNextVid(ctx context.Context, vols []*volume, modeInfo *modeInfo, args *proxy.AllocVolsArgs) (proto.Vid, error) {
 	curIdx := int(atomic.AddUint64(&v.preIdx, uint64(1)) % uint64(len(vols)))

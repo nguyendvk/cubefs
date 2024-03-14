@@ -27,6 +27,9 @@ import (
 	"github.com/cubefs/cubefs/util/log"
 )
 
+/*
+check quota and trả về thông tin của iNode
+*/
 func (mp *metaPartition) CheckQuota(inodeId uint64, p *Packet) (iParm *Inode, inode *Inode, err error) {
 	iParm = NewInode(inodeId, 0)
 	status := mp.isOverQuota(inodeId, true, false)
@@ -310,6 +313,9 @@ func (mp *metaPartition) BatchExtentAppend(req *proto.AppendExtentKeysRequest, p
 	return
 }
 
+/*
+ghi ObjExtent vào RocksDB Raftly
+*/
 func (mp *metaPartition) BatchObjExtentAppend(req *proto.AppendObjExtentKeysRequest, p *Packet) (err error) {
 
 	var ino *Inode
@@ -319,6 +325,7 @@ func (mp *metaPartition) BatchObjExtentAppend(req *proto.AppendObjExtentKeysRequ
 	}
 
 	objExtents := req.Extents
+	// thêm các ObjExtents vào ino
 	for _, objExtent := range objExtents {
 		err = ino.ObjExtents.Append(objExtent)
 		if err != nil {
@@ -326,11 +333,14 @@ func (mp *metaPartition) BatchObjExtentAppend(req *proto.AppendObjExtentKeysRequ
 			return
 		}
 	}
+	// Marshal ino
 	val, err := ino.Marshal()
 	if err != nil {
 		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
 		return
 	}
+	// submit request to raft cluster
+	// handler at: metanode/partition_fsmop_inode.go: unc (mp *metaPartition) fsmAppendObjExtents(
 	resp, err := mp.submit(opFSMObjExtentsAdd, val)
 	if err != nil {
 		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))

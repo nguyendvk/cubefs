@@ -1853,6 +1853,7 @@ func (m *metadataManager) opMetaBatchObjExtentsAdd(conn net.Conn, p *Packet, rem
 		err = errors.NewErrorf("[%v] req: %v, resp: %v", p.GetOpMsgWithReqAndResult(), req, err.Error())
 		return
 	}
+	// get mp with req.PartitionID from mem
 	mp, err := m.getPartition(req.PartitionID)
 	if err != nil {
 		p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
