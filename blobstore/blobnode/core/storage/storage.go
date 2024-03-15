@@ -129,6 +129,9 @@ func (stg *storage) NewRangeReader(ctx context.Context, b *core.Shard, from, to 
 	return rc, nil
 }
 
+/*
+thay đổi meta: Flag của shard thành bnapi.ShardStatusMarkDelete
+*/
 func (stg *storage) MarkDelete(ctx context.Context, bid proto.BlobID) (err error) {
 	meta := stg.meta
 
@@ -151,6 +154,11 @@ func (stg *storage) MarkDelete(ctx context.Context, bid proto.BlobID) (err error
 	return nil
 }
 
+/*
+- kiểm tra trong meta phần data đã được đánh dấu xóa chưa -> chỉ xóa khi đã đánh dấu
+- meta.Delete(): xóa trong meta
+- data.Delete(): xóa trong data
+*/
 func (stg *storage) Delete(ctx context.Context, bid proto.BlobID) (n int64, err error) {
 	span := trace.SpanFromContextSafe(ctx)
 

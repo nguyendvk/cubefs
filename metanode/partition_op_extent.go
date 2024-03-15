@@ -314,7 +314,7 @@ func (mp *metaPartition) BatchExtentAppend(req *proto.AppendExtentKeysRequest, p
 }
 
 /*
-ghi ObjExtent vào RocksDB Raftly
+ghi ObjExtent vào Mem Raftly
 */
 func (mp *metaPartition) BatchObjExtentAppend(req *proto.AppendObjExtentKeysRequest, p *Packet) (err error) {
 

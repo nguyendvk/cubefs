@@ -508,6 +508,10 @@ func (mp *metaPartition) fsmExtentsTruncate(ino *Inode) (resp *InodeResponse) {
 	return
 }
 
+/*
+SetDeleteMark() cho inode nếu đó là thư mục rỗng hoặc file. Nếu là file, inode được thêm vào mp.freeList
+inode trong mp.freeList sẽ được pop và xử lý tại: metanode/partition_free_list.go: func (mp *metaPartition) deleteWorker
+*/
 func (mp *metaPartition) fsmEvictInode(ino *Inode) (resp *InodeResponse) {
 	resp = NewInodeResponse()
 

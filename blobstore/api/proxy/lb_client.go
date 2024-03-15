@@ -35,7 +35,7 @@ type LbConfig struct {
 }
 
 /*
-client gửi requests đến proxy nhưng chỉ gửi các request push msg repair hoặc delete vào topic của kafka
+client gửi requests đến proxy nhưng ko tự tìm host phù hợp với selector
 */
 type lbClient struct {
 	Client
@@ -78,7 +78,8 @@ func NewMQLbClient(cfg *LbConfig, service clustermgr.APIService, clusterID proto
 }
 
 /*
-gọi proxy.client.SendDeleteMsg()
+- Tìm hosts
+- gọi proxy.client.SendDeleteMsg() với các hosts vừa tìm được
 */
 func (c *lbClient) SendDeleteMsg(ctx context.Context, args *DeleteArgs) (err error) {
 	span := trace.SpanFromContextSafe(ctx)

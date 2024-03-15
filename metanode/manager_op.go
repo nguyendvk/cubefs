@@ -924,6 +924,9 @@ func (m *metadataManager) opBatchMetaEvictInode(conn net.Conn, p *Packet,
 	return
 }
 
+/*
+- gọi mp.EvictInode
+*/
 func (m *metadataManager) opMetaEvictInode(conn net.Conn, p *Packet,
 	remoteAddr string) (err error) {
 	req := &proto.EvictInodeRequest{}

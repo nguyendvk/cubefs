@@ -1310,6 +1310,7 @@ func (o *ObjectNode) putObjectHandler(w http.ResponseWriter, r *http.Request) {
 
 // Delete object
 // API reference: https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html .
+// gọi Vol.deletePath()
 func (o *ObjectNode) deleteObjectHandler(w http.ResponseWriter, r *http.Request) {
 	var (
 		err       error

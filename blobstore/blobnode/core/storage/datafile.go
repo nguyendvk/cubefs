@@ -439,6 +439,10 @@ func (cd *datafile) Read(ctx context.Context, shard *core.Shard, from, to uint32
 	return r, nil
 }
 
+/*
+- cd.ef.ReadAt(): đọc nội dung shard và kiểm tra các thông tin
+- cd.ef.Discard(): punch hole
+*/
 func (cd *datafile) Delete(ctx context.Context, shard *core.Shard) (err error) {
 	var ns core.Shard
 	var discardSize int64

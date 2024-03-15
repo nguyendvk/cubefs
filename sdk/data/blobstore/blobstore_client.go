@@ -157,6 +157,10 @@ func (ebs *BlobStoreClient) Write(ctx context.Context, volName string, data []by
 	return location, nil
 }
 
+/*
+gửi request delete lên access để xóa các blob trong `oeks`
+- gọi ebs.client.Delete(): endpoint handler tại: blobstore/api/access/client.go: func (c *client) Delete
+*/
 func (ebs *BlobStoreClient) Delete(oeks []proto.ObjExtentKey) (err error) {
 	bgTime := stat.BeginStat()
 	defer func() {

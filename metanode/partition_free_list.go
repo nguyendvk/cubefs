@@ -95,6 +95,7 @@ func (mp *metaPartition) deleteWorker() {
 		default:
 		}
 
+		// ko phải leader thì sleep
 		if _, isLeader = mp.IsLeader(); !isLeader {
 			time.Sleep(AsyncDeleteInterval)
 			continue
@@ -119,7 +120,7 @@ func (mp *metaPartition) deleteWorker() {
 		batchCount := DeleteBatchCount()
 		delayDeleteInos := make([]uint64, 0)
 		for idx = 0; idx < int(batchCount); idx++ {
-			// batch get free inode from the freeList
+			// batch get free inode from the freeList và bỏ vào buffSlice
 			ino := mp.freeList.Pop()
 			if ino == 0 {
 				break
@@ -143,7 +144,9 @@ func (mp *metaPartition) deleteWorker() {
 			mp.freeList.Push(delayDeleteIno)
 		}
 
+		// append các giá trị `inos` vào delInodeFp
 		mp.persistDeletedInodes(buffSlice)
+		// xóa các thông tin inode trên MP và (EC hoặc DP)
 		mp.deleteMarkedInodes(buffSlice)
 		sleepCnt++
 	}
@@ -196,7 +199,11 @@ func (mp *metaPartition) batchDeleteExtentsByPartition(partitionDeleteExtents ma
 	return
 }
 
-// Delete the marked inodes.
+/*
+Delete the marked inodes.
+- xóa EBS hoặc Replicated raw data
+- xóa các thông tin inode trong btree
+*/
 func (mp *metaPartition) deleteMarkedInodes(inoSlice []uint64) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -250,6 +257,7 @@ func (mp *metaPartition) deleteMarkedInodes(inoSlice []uint64) {
 		allInodes = shouldCommit
 	}
 
+	// xóa replicated data theo `deleteExtentsByPartition`
 	shouldCommit, shouldRePushToFreeList = mp.batchDeleteExtentsByPartition(deleteExtentsByPartition, allInodes)
 	bufSlice := make([]byte, 0, 8*len(shouldCommit))
 	for _, inode := range shouldCommit {
@@ -262,6 +270,7 @@ func (mp *metaPartition) deleteMarkedInodes(inoSlice []uint64) {
 			"response %s", shouldCommit, err.Error())
 	}
 
+	// xóa các thông tin của inode trong btree
 	for _, inode := range shouldCommit {
 		if err == nil {
 			mp.internalDeleteInode(inode)
@@ -281,6 +290,10 @@ func (mp *metaPartition) deleteMarkedInodes(inoSlice []uint64) {
 	}
 }
 
+/*
+raftly delete inode với OpCode=opFSMInternalDeleteInode
+handler tại:  metanode/partition_fsmop_inode.go: func (mp *metaPartition) internalDelete(
+*/
 func (mp *metaPartition) syncToRaftFollowersFreeInode(hasDeleteInodes []byte) (err error) {
 	if len(hasDeleteInodes) == 0 {
 		return
@@ -455,6 +468,13 @@ func (mp *metaPartition) doBatchDeleteExtentsByPartition(partitionID uint64, ext
 
 const maxDelCntOnce = 512
 
+/*
+xóa EC data của Inode trong allInodes
+Với mỗi inode, chạy trong goroutines:
+- gọi mp.deleteObjExtents() để xóa các data blobs
+- nếu thành công thì append inode vào `shouldCommit`
+- nếu có err thì append inode vào `shouldPushToFreeList`, để xóa lại sau
+*/
 func (mp *metaPartition) doBatchDeleteObjExtentsInEBS(allInodes []*Inode) (shouldCommit []*Inode, shouldPushToFreeList []*Inode) {
 	shouldCommit = make([]*Inode, 0, len(allInodes))
 	shouldPushToFreeList = make([]*Inode, 0)
@@ -492,6 +512,10 @@ func (mp *metaPartition) doBatchDeleteObjExtentsInEBS(allInodes []*Inode) (shoul
 	return
 }
 
+/*
+delete các blob trong list các ObjExtentKey
+- mp.ebsClient.Delete(): gửi request delete blob lên access
+*/
 func (mp *metaPartition) deleteObjExtents(oeks []proto.ObjExtentKey) (err error) {
 	total := len(oeks)
 
@@ -507,6 +531,7 @@ func (mp *metaPartition) deleteObjExtents(oeks []proto.ObjExtentKey) (err error)
 	return err
 }
 
+// append các giá trị `inos` vào delInodeFp
 func (mp *metaPartition) persistDeletedInodes(inos []uint64) {
 	for _, ino := range inos {
 		if _, err := mp.delInodeFp.WriteString(fmt.Sprintf("%v\n", ino)); err != nil {

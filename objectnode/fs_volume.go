@@ -878,6 +878,11 @@ func (v *Volume) applyInodeToDEntry(parentId uint64, name string, inode uint64, 
 // Notes:
 // This method will only returns internal system errors.
 // This method will not return syscall.ENOENT error
+/*
+- gọi recursiveLookupTarget(): tìm inode, thông tin của path
+- gọi extentClient.EvictStream():
+- gọi metaWrapper.Evict(): evict trên MP
+*/
 func (v *Volume) DeletePath(path string) (err error) {
 	defer func() {
 		// Audit behavior
@@ -894,6 +899,7 @@ func (v *Volume) DeletePath(path string) (err error) {
 	var ino uint64
 	var name string
 	var mode os.FileMode
+	// tìm inode và parent của path
 	parent, ino, name, mode, err = v.recursiveLookupTarget(path)
 	if err != nil {
 		// An unexpected error occurred

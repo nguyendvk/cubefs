@@ -431,6 +431,10 @@ func (mw *MetaWrapper) iclearCache(mp *MetaPartition, inode uint64) (status int,
 	return status, nil
 }
 
+/*
+send packet với Opcode=proto.OpMetaEvictInode đến MP
+endpoint handler at: metanode/manager_op.go: func (m *metadataManager) opMetaEvictInode
+*/
 func (mw *MetaWrapper) ievict(mp *MetaPartition, inode uint64, fullPath string) (status int, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {

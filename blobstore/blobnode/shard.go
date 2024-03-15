@@ -287,6 +287,7 @@ func (s *Service) ShardStat(c *rpc.Context) {
  *  url:            /shard/markdelete/diskid/{diskid}/vuid/{vuid}/bid/{bid}
  *  request body:   json.Marshal(deleteArgs)
  */
+// gọi chunkAPI.MarkDelete()
 func (s *Service) ShardMarkdelete(c *rpc.Context) {
 	args := new(bnapi.DeleteShardArgs)
 	if err := c.ParseArgs(args); err != nil {
@@ -359,6 +360,7 @@ func (s *Service) ShardMarkdelete(c *rpc.Context) {
  *  url:            /shard/delete/diskid/{diskid}/vuid/{vuid}/bid/{bid}
  *  request body:   json.Marshal(deleteArgs)
  */
+// gọi chunkAPI.Delete
 func (s *Service) ShardDelete(c *rpc.Context) {
 	args := new(bnapi.DeleteShardArgs)
 	if err := c.ParseArgs(args); err != nil {

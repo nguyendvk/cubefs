@@ -570,7 +570,11 @@ func (mp *metaPartition) CreateInodeLink(req *LinkInodeReq, p *Packet, remoteAdd
 	return
 }
 
-// EvictInode evicts an inode.
+/*
+	EvictInode evicts an inode.
+
+- raftly submit opFSMEvictInode + value là Inode: handler tại: metanode/partition_fsmop_inode.go: func (mp *metaPartition) fsmEvictInode
+*/
 func (mp *metaPartition) EvictInode(req *EvictInodeReq, p *Packet, remoteAddr string) (err error) {
 	start := time.Now()
 	if mp.IsEnableAuditLog() {

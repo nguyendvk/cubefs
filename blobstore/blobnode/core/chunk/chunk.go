@@ -548,6 +548,9 @@ func (cs *chunk) rangeRead(ctx context.Context, stg core.Storage, s *core.Shard,
 	return n, nil
 }
 
+/*
+gọi core.storage.MarkDelete()
+*/
 func (cs *chunk) MarkDelete(ctx context.Context, bid proto.BlobID) (err error) {
 	span := trace.SpanFromContextSafe(ctx)
 
@@ -576,6 +579,9 @@ func (cs *chunk) MarkDelete(ctx context.Context, bid proto.BlobID) (err error) {
 	return nil
 }
 
+/*
+gọi core.storage.Delete()
+*/
 func (cs *chunk) Delete(ctx context.Context, bid proto.BlobID) (err error) {
 	span := trace.SpanFromContextSafe(ctx)
 

@@ -273,6 +273,9 @@ func (mgr *BlobDeleteMgr) Close() {
 	mgr.stopConsumer()
 }
 
+/*
+mỗi 1 giây, kiểm tra và khởi tạo kafka consumer nếu chưa tạo. Các consumer này sẽ thực thi hàm Consume() khi có gói tin
+*/
 func (mgr *BlobDeleteMgr) runTask() {
 	t := time.NewTicker(time.Second)
 	span := trace.SpanFromContextSafe(context.Background())
@@ -345,6 +348,7 @@ func (mgr *BlobDeleteMgr) GetErrorStats() (errStats []string, totalErrCnt uint64
 }
 
 // Consume consume kafka message: if message is not consume will return false, otherwise return true
+// gọi mgr.consume()
 func (mgr *BlobDeleteMgr) Consume(msg *sarama.ConsumerMessage, consumerPause base.ConsumerPause) (consumed bool) {
 	var (
 		ret    delBlobRet
@@ -405,6 +409,9 @@ func (mgr *BlobDeleteMgr) Consume(msg *sarama.ConsumerMessage, consumerPause bas
 	return ret.status != DeleteStatusUndo
 }
 
+/*
+- gọi deleteWithCheckVolConsistency
+*/
 func (mgr *BlobDeleteMgr) consume(ctx context.Context, delMsg *proto.DeleteMsg, consumerPause base.ConsumerPause) delBlobRet {
 	// quick exit if consumer is pause
 	select {
@@ -450,12 +457,19 @@ func (mgr *BlobDeleteMgr) consume(ctx context.Context, delMsg *proto.DeleteMsg, 
 	return delBlobRet{status: DeleteStatusDone}
 }
 
+/*
+gọi deleteBlob
+*/
 func (mgr *BlobDeleteMgr) deleteWithCheckVolConsistency(ctx context.Context, msg *proto.DeleteMsg) error {
 	return DoubleCheckedRun(ctx, mgr.clusterTopology, msg.Vid, func(info *client.VolumeInfoSimple) (*client.VolumeInfoSimple, error) {
 		return mgr.deleteBlob(ctx, info, msg)
 	})
 }
 
+/*
+- gọi markDelBlob: gọi deleteShards() markDelete=true
+- gọi delBlob: gọi deleteShards() với markDelete=false
+*/
 func (mgr *BlobDeleteMgr) deleteBlob(ctx context.Context, volInfo *client.VolumeInfoSimple, msg *proto.DeleteMsg) (newVol *client.VolumeInfoSimple, err error) {
 	deleteStageMgr := newDeleteStageMgr()
 	deleteStageMgr.setBlobDelStage(msg.BlobDelStages)
@@ -556,6 +570,11 @@ func (mgr *BlobDeleteMgr) deleteShards(
 	return newVolInfo, nil
 }
 
+/*
+delete 1 shard:
+- nếu markDelete: gọi blobnodeCli.MarkDelete() -> endpoint handler: blobstore/blobnode/shard.go: func (s *Service) ShardMarkdelete
+- nếu !markDelete: gọi blobnodeCli.Delete() -> endpoint handler: blobstore/blobnode/shard.go: func (s *Service) ShardDelete
+*/
 func (mgr *BlobDeleteMgr) deleteShard(ctx context.Context, location proto.VunitLocation,
 	bid proto.BlobID, stageMgr *deleteStageMgr, markDelete bool) (err error) {
 	span := trace.SpanFromContextSafe(ctx)
