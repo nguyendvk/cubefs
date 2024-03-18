@@ -1502,6 +1502,10 @@ func (mw *MetaWrapper) link(parentID uint64, name string, ino uint64, fullPath s
 	return info, nil
 }
 
+/*
+- gọi mw.getPartitionByInode: lấy mp chứa inode
+- gọi mw.ievict(): gửi request đến  metanode
+*/
 func (mw *MetaWrapper) Evict(inode uint64, fullPath string) error {
 	mp := mw.getPartitionByInode(inode)
 	if mp == nil {

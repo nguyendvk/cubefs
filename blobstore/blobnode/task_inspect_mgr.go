@@ -43,6 +43,7 @@ func NewInspectTaskMgr(concurrency int, bidGetter client.IBlobNode, reporter sch
 }
 
 // AddTask adds inspect task
+// gọi mgr.doInspect: thực hiện inspect task
 func (mgr *InspectTaskMgr) AddTask(ctx context.Context, task *proto.VolumeInspectTask) error {
 	span := trace.SpanFromContextSafe(ctx)
 	if err := mgr.taskLimit.Acquire(); err != nil {
@@ -65,6 +66,10 @@ func (mgr *InspectTaskMgr) RunningTaskSize() int {
 	return mgr.taskLimit.Running()
 }
 
+/*
+thực hiện inspect:
+-
+*/
 func (mgr *InspectTaskMgr) doInspect(ctx context.Context, task *proto.VolumeInspectTask) *proto.VolumeInspectRet {
 	span := trace.SpanFromContextSafe(ctx)
 

@@ -206,6 +206,9 @@ func (s *WorkerService) Run() {
 	s.loopAcquireTask()
 }
 
+/*
+mỗi `acquire_interval_ms`(default: 500) ms, gọi tryAcquireTask():w
+*/
 func (s *WorkerService) loopAcquireTask() {
 	ticker := time.NewTicker(time.Duration(s.AcquireIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
@@ -219,11 +222,16 @@ func (s *WorkerService) loopAcquireTask() {
 	}
 }
 
+/*
+gọi acquireTask():
+gọi acquireInspectTask():
+*/
 func (s *WorkerService) tryAcquireTask() {
+	// __TODO
 	if s.hasTaskRunnerResource() {
 		s.acquireTask()
 	}
-
+	// nếu lượng inspectTask đang tr< s.InspectConcurrency
 	if s.hasInspectTaskResource() {
 		s.acquireInspectTask()
 	}

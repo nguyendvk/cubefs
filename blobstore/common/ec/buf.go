@@ -22,17 +22,17 @@ import (
 
 // Buffer one ec blob's reused buffer
 // Manually manage the DataBuf in Ranged mode, do not Split it
-//  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-//  |   data      |    align bytes    |       partiy        | local |
-//  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-//  |   DataBuf   |
-//  |<--DataSize->|
-//  - - - - - - - - - - - - - - - - - -
-//  |            ECDataBuf            |
-//  |<--         ECDataSize        -->|
-//  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-//  |                           ECBuf                               |
-//  |<---                       ECSize                          --->|
+//   - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+//     |   data      |    align bytes    |       partiy        | local |
+//   - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+//     |   DataBuf   |
+//     |<--DataSize->|
+//   - - - - - - - - - - - - - - - - - -
+//     |            ECDataBuf            |
+//     |<--         ECDataSize        -->|
+//   - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+//     |                           ECBuf                               |
+//     |<---                       ECSize                          --->|
 type Buffer struct {
 	tactic codemode.Tactic
 	pool   *resourcepool.MemPool
@@ -74,6 +74,11 @@ func newBuffer(dataSize, from, to int, tactic codemode.Tactic, pool *resourcepoo
 		return nil, ErrInvalidCodeMode
 	}
 
+	/*
+		Tính toán shardSize = ceil(len(data)/N)
+		if shardSize nhỏ hơn threshold < tatic.MinShardSize: shardSize = MinShardSize
+		refer to: https://cubefs.io/docs/master/design/blobstore.html#small-file-optimization
+	*/
 	shardSize := (dataSize + shardN - 1) / shardN
 	// align per shard with tactic MinShardSize
 	if shardSize < tactic.MinShardSize {

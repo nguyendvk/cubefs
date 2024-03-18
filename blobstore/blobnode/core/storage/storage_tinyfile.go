@@ -72,6 +72,12 @@ func (stg *tinyfileStorage) writeToMemory(b *core.Shard) (body []byte, err error
 	return body, nil
 }
 
+/*
+nếu meta.SupportInline() && b.size <= tinyfile threshold (default: 8byte, max threshold: 128Kib ):
+- ghi shard vào meta.Buffer và ko ghi xuống data
+else:
+- stg.storage.Write(): ghi như bth
+*/
 func (stg *tinyfileStorage) Write(ctx context.Context, b *core.Shard) (err error) {
 	if !stg.canInline(b.Size) {
 		return stg.storage.Write(ctx, b)

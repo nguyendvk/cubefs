@@ -215,7 +215,7 @@ func (mgr *VolumeInspectMgr) Run() {
 }
 
 /*
-mỗi vài giây, inspectRun()
+mỗi vài giây (default: 1), inspectRun()
 */
 func (mgr *VolumeInspectMgr) run() {
 	t := time.NewTicker(time.Duration(mgr.cfg.InspectIntervalS) * time.Second)
@@ -232,6 +232,11 @@ func (mgr *VolumeInspectMgr) run() {
 	}
 }
 
+/*
+gọi prepare: sinh các inspect tasks cho các volume
+gọi waitCompleted: đợi các inspect tasks completed
+gọi finish: repair the bad
+*/
 func (mgr *VolumeInspectMgr) inspectRun() {
 	span, ctx := trace.StartSpanFromContext(context.Background(), "inspector.run")
 	defer span.Finish()
@@ -270,6 +275,11 @@ func (mgr *VolumeInspectMgr) getStartVid(ctx context.Context) proto.Vid {
 	return zeroVid
 }
 
+/*
+tạo các inspect task các volume theo batch (default: 1000)
+- gọi clusterMgrCli.ListVolume() để list các volume bắt đầu từ `startVid`
+- với mỗi volume: sinh inspectTask và lưu vào mgr.tasks
+*/
 func (mgr *VolumeInspectMgr) prepare(ctx context.Context) {
 	span := trace.SpanFromContextSafe(ctx)
 
@@ -373,6 +383,9 @@ func (mgr *VolumeInspectMgr) CompleteInspect(ctx context.Context, ret *proto.Vol
 	span.Debugf("inspect complete: task_id[%s]", taskID)
 }
 
+/*
+mỗi timeout_ms mili giây thì kiểm tra tất cả các task đã completed chưa. Nếu có thì return
+*/
 func (mgr *VolumeInspectMgr) waitCompleted(ctx context.Context) {
 	span := trace.SpanFromContextSafe(ctx)
 	span.Infof("start wait completed...")
