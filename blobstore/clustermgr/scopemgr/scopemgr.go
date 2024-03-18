@@ -65,7 +65,7 @@ func (s *ScopeMgr) SetRaftServer(raftServer raftserver.RaftServer) {
 }
 
 /*
-cấp thêm `count` Bid
+cấp thêm `count` id cho `name`(bid, vid)
 - s.scopeItems[name] += uint64(count): tăng scope lên count
 - raftServer.Propose(): update rocksdb raftly
 */

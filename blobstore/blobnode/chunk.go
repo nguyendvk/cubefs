@@ -28,6 +28,7 @@ import (
  *  url:            /chunk/create/diskid/{diskid}/vuid/{vuid}?chunksize={chunksize}
  *  request body:   json.Marshal(bnapi.ChunkCreateArgs)
  */
+// gọi DiskAPI.CreateChunk()
 func (s *Service) ChunkCreate(c *rpc.Context) {
 	args := new(bnapi.CreateChunkArgs)
 	if err := c.ParseArgs(args); err != nil {

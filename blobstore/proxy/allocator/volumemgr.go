@@ -558,6 +558,10 @@ func (v *volumeMgr) allocVolume(ctx context.Context, args *clustermgr.AllocVolum
 	return ret, err
 }
 
+/*
+if there is request allocvolume in channle v.allocChs, send request to clustermgr to allocate amount of volumes
+endpoint handler: blobstore/clustermgr/volume.go: func (s *Service) VolumeAlloc
+*/
 func (v *volumeMgr) allocVolumeLoop(mode codemode.CodeMode) {
 	for {
 		args := <-v.allocChs[mode]

@@ -162,6 +162,9 @@ func initConfig(args []string) (*cmd.Config, error) {
 	return &conf.Config, nil
 }
 
+/*
+booting clustermgr
+*/
 func setUp() (*rpc.Router, []rpc.ProgressHandler) {
 	var err error
 	service, err = New(&conf)

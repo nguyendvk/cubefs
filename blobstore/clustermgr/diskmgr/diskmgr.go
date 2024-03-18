@@ -418,6 +418,11 @@ func (d *DiskMgr) ListDroppingDisk(ctx context.Context) ([]*blobnode.DiskInfo, e
 }
 
 // AllocChunk return available chunks in data center
+/*
+- gọi allocator.alloc(): để xin các diskID phù hợp cho các chunks
+- gọi blobNodeClient.CreateChunk() để khởi tạo chunk trên blobnode:
+	endpoint handler: blobstore/blobnode/chunk.go: func (s *Service) ChunkCreate
+*/
 func (d *DiskMgr) AllocChunks(ctx context.Context, policy *AllocPolicy) (ret []proto.DiskID, err error) {
 	span, ctx := trace.StartSpanFromContextWithTraceID(ctx, "AllocChunks", trace.SpanFromContextSafe(ctx).TraceID()+"/"+policy.Idc)
 	v := d.allocators[policy.Idc].Load()
