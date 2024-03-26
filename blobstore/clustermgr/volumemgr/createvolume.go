@@ -107,11 +107,11 @@ func (v *VolumeMgr) finishLastCreateJob(ctx context.Context) error {
 	return nil
 }
 
-// 1. alloc vid
+// 1. v.scopeMgr.Alloc(): alloc vid
 // 2. initial volume unit basic info
-// 3. save volume and unit info into transited table(raft propose)
-// 4. alloc chunks for volume, return if failed (the rest jobs will be finished by finishLastCreateJob)
-// 5. raft propose apply create volume if 4 step success
+// 3. raftly op = OperTypeInitCreateVolume: save volume and unit info into transited table(raft propose)
+// 4. allocChunkForAllUnits(): alloc chunks for volume, return if failed (the rest jobs will be finished by finishLastCreateJob)
+// 5. raftly op = OperTypeCreateVolume: raft propose apply create volume if 4 step success
 // 6. success and return
 func (v *VolumeMgr) createVolume(ctx context.Context, mode codemode.CodeMode) error {
 	span := trace.SpanFromContextSafe(ctx)

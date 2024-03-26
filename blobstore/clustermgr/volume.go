@@ -89,7 +89,14 @@ func (s *Service) VolumeList(c *rpc.Context) {
 	}
 }
 
-// transport to primary and params check
+/*
+	transport to primary and params check
+
+nếu IsInit:
+- gọi VolumeMgr.ListAllocatedVolume(): lấy các active volume sẵn có
+else:
+- gọi VolumeMgr.AllocVolume(): active một số idle volume
+*/
 func (s *Service) VolumeAlloc(c *rpc.Context) {
 	ctx := c.Request.Context()
 	span := trace.SpanFromContextSafe(ctx)

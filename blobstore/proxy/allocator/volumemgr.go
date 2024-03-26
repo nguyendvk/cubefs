@@ -62,8 +62,9 @@ type VolConfig struct {
 //======================modeInfo======================================
 
 type modeInfo struct {
-	current        *volumes
-	backup         *volumes
+	current *volumes
+	backup  *volumes
+	// nếu current.totalFree <= totalThreshold thì ko xài current nữa
 	totalThreshold uint64
 
 	lock sync.RWMutex
@@ -138,6 +139,16 @@ func (m *modeInfo) TotalFree() int64 {
 	return totalFree
 }
 
+/*
+kiểm tra có phải sử dụng backup volume cho fsize hay ko
+- current.totalFree -= fSize
+- nếu current.totalFree <= totalThreshold -> ko xài current lúc này được
+  - current.totalFree += fSize: trả lại space
+  - backup = true: cần sử dụng backup
+
+- else:
+  - backup = false: ko cần sử dụng backup
+*/
 func (m *modeInfo) needSwitchToBackup(fSize int64) (bool, error) {
 	m.lock.RLock()
 	totalFree := m.current.UpdateTotalFree(-fSize)
@@ -154,6 +165,18 @@ func (m *modeInfo) needSwitchToBackup(fSize int64) (bool, error) {
 	return false, nil
 }
 
+/*
+lấy list các volume mà còn đủ chỗ để lưu fsize
+  - nếu !switchable:
+    -- trả về m.current
+  - nếu switchable và m.current ko đủ space cho fsize -> backup thành current
+    -- m.current = m.backup
+    -- m.backup = {empty}
+    -- m.current.UpdateTotalFree(-fsize): giảm totalfree của fsize
+    -- return m.current
+  - else: dù đã xài backup nhưng vẫn ko đủ cho cho fsize
+    -- return nil
+*/
 func (m *modeInfo) getAvailableList(fsize int64, switchable bool) []*volume {
 	if !switchable {
 		return m.List(false)
@@ -164,6 +187,7 @@ func (m *modeInfo) getAvailableList(fsize int64, switchable bool) []*volume {
 		m.current = m.backup
 		m.backup = &volumes{}
 	}
+	// dù đã dùng backup nhưng vẫn ko đủ cho fsize
 	if m.current.TotalFree() < fsize {
 		m.lock.Unlock()
 		return nil
@@ -339,6 +363,9 @@ func (v *volumeMgr) initModeInfo(ctx context.Context) (err error) {
 		}
 
 		go v.allocVolumeLoop(mode)
+		/* mỗi mode, khởi tạo v.InitVolumeNum (default: 4) volume
+		handler at: func (v *volumeMgr) allocVolumeLoop
+		*/
 		v.allocChs[mode] <- applyArg
 
 	}
@@ -408,7 +435,8 @@ choose next available VolumeID:
   - duyệt 1 vòng các vols bắt đầu từ curIdx: nếu modifySpace(vols[i]) = true -> vols[i] vẫn còn available: return vols[i].Vid
 
 NOTES:
-  - ??? preIdx dùng chung cho nhiều codemode. Vậy cũng ko có tác dụng phân tán lựa chọn
+  - preIdx dùng chung cho nhiều codemode.
+  - phương pháp phân tán req vid: nếu gọi liên tiếp nhau cùng codemode thì vid sau sẽ được tìm từ ngay sau vid trước
 */
 func (v *volumeMgr) getNextVid(ctx context.Context, vols []*volume, modeInfo *modeInfo, args *proxy.AllocVolsArgs) (proto.Vid, error) {
 	curIdx := int(atomic.AddUint64(&v.preIdx, uint64(1)) % uint64(len(vols)))
@@ -494,6 +522,13 @@ func (v *volumeMgr) allocVid(ctx context.Context, args *proxy.AllocVolsArgs) (pr
 
 /*
 lấy các available volumes thuộc args.CodeMode
+- info.needSwitchToBackup(): kiểm tra có cần sử dụng backup ko
+- info.getAvailableList(): lấy ra các volumes đủ space để đẩy Fsize
+- nếu ko tìm đc vols đủ space để đẩy Fsize: gọi allocNotify() đê xin volume cho current từ clustermgr
+- nếu backup == {empty}: gọi allocNotify() để xin volume cho backup từ clustermgr
+
+NOTE:
+ko tìm đc vols đủ space để đẩy Fsize có thể do Fsize quá lớn thì cấp mới cũng đâu giải quyết được gì.
 */
 func (v *volumeMgr) getAvailableVols(ctx context.Context, args *proxy.AllocVolsArgs) (vols []*volume, err error) {
 	span := trace.SpanFromContextSafe(ctx)
@@ -532,6 +567,9 @@ func (v *volumeMgr) allocNotify(ctx context.Context, mode codemode.CodeMode, cou
 		count:    count,
 		isBackup: isBackup,
 	}
+	/*
+		send request to clustermgr to alloc volume with configurable `isBackup`
+	*/
 	if _, ok := v.allocChs[mode]; ok {
 		select {
 		case v.allocChs[mode] <- applyArg:
@@ -544,6 +582,10 @@ func (v *volumeMgr) allocNotify(ctx context.Context, mode codemode.CodeMode, cou
 	span.Panicf("the codeMode %v not exist", mode)
 }
 
+/*
+gọi clusterMgr.AllocVolume(): gửi request đến clustermgr để allocVolume
+endpoint handler: blobstore/clustermgr/volume.go: func (s *Service) VolumeAlloc
+*/
 func (v *volumeMgr) allocVolume(ctx context.Context, args *clustermgr.AllocVolumeArgs) (ret []clustermgr.AllocVolumeInfo,
 	err error) {
 	span := trace.SpanFromContextSafe(ctx)
@@ -559,8 +601,10 @@ func (v *volumeMgr) allocVolume(ctx context.Context, args *clustermgr.AllocVolum
 }
 
 /*
-if there is request allocvolume in channle v.allocChs, send request to clustermgr to allocate amount of volumes
-endpoint handler: blobstore/clustermgr/volume.go: func (s *Service) VolumeAlloc
+if there is request allocvolume in channle v.allocChs, send request to clustermgr to allocate an amount of volumes
+  - gọi allocVolume(): gửi request đến clustermgr để alloc volume
+    -- nếu isInit = true thì sẽ chỉ lấy các volume đã được active
+    -- nêu isInit = false thì sẽ active các idle volume
 */
 func (v *volumeMgr) allocVolumeLoop(mode codemode.CodeMode) {
 	for {
@@ -585,6 +629,11 @@ func (v *volumeMgr) allocVolumeLoop(mode codemode.CodeMode) {
 				allocVolInfo := &volume{
 					AllocVolumeInfo: vol,
 				}
+				/*
+					nếu IsInit == 1 và số volume mà host này đã active trên clustermgr >= 2 * v.InitVolumeNum và index >= v.InitVolume:
+						chắn chắn lưu vào backup
+					-> nếu có nhiều volume và ở mode lưu vào current thì lưu phần sau vào backup
+				*/
 				if allocArg.IsInit && len(volumeRets) >= 2*v.InitVolumeNum && index >= v.InitVolumeNum {
 					v.modeInfos[allocArg.CodeMode].Put(allocVolInfo, true)
 					continue
@@ -592,10 +641,11 @@ func (v *volumeMgr) allocVolumeLoop(mode codemode.CodeMode) {
 				v.modeInfos[allocArg.CodeMode].Put(allocVolInfo, args.isBackup)
 			}
 			if len(volumeRets) < requireCount {
+				/* chưa đủ thì request thêm */
 				span.Warnf("clusterMgr volume num not enough, codeMode: %v, need: %v, got: %v", allocArg.CodeMode,
 					requireCount, len(volumeRets))
 				requireCount -= len(volumeRets)
-				args.isInit = false
+				args.isInit = false // isInit = false thì sẽ lấy từ idle
 				continue
 			}
 			break

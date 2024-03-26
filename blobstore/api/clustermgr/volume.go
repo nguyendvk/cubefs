@@ -63,14 +63,15 @@ func (v *VolumeInfo) Equal(expected *VolumeInfo) bool {
 }
 
 type VolumeInfoBase struct {
-	Vid            proto.Vid          `json:"vid"`
-	CodeMode       codemode.CodeMode  `json:"code_mode"`
-	Status         proto.VolumeStatus `json:"status"`
-	HealthScore    int                `json:"health_score"`
-	Total          uint64             `json:"total"`
-	Free           uint64             `json:"free"`
-	Used           uint64             `json:"used"`
-	CreateByNodeID uint64             `json:"create_by_node_id"`
+	Vid      proto.Vid          `json:"vid"`
+	CodeMode codemode.CodeMode  `json:"code_mode"`
+	Status   proto.VolumeStatus `json:"status"`
+	// health score = 0 - (số lượng đĩa ko writable) -> healthiest score = 0
+	HealthScore    int    `json:"health_score"`
+	Total          uint64 `json:"total"`
+	Free           uint64 `json:"free"`
+	Used           uint64 `json:"used"`
+	CreateByNodeID uint64 `json:"create_by_node_id"`
 }
 
 type AllocVolumeInfo struct {

@@ -235,6 +235,19 @@ func (a *volumeAllocator) Insert(v *volume, mode codemode.CodeMode) {
 // 2. when EnableDiskLoad=true, if do not hash enough volumes to alloc ,
 //      1) first add disk's load and retry, each time add one until disk's load equal to diskLoadThreshold will set EnableDiskLoad=false
 //      2) second minus volume score and retry , each time minus one until volume's score equal to scoreThreshold
+/*
+Chọn ra các volume có thể alloc thỏa 2 tiêu chí sau:
+- là idle volume
+- free space > a.allocatableSize (default: 1 Mib)
+
+Các tiêu chí để ưu tiên chọn volume lần lượt là:
+1. health cao
+2. disk load thấp
+	- disk load của 1 disk vật lý: là số lượng các chunk được lưu trên 1 disk vật lý
+	- disk load của volume: max diskload của các disk chứa các chunk của volume
+
+list volume đầu ra được sort lần lượt theo diskload, health
+*/
 func (a *volumeAllocator) PreAlloc(ctx context.Context, mode codemode.CodeMode, count int) ([]proto.Vid, int) {
 	span := trace.SpanFromContextSafe(ctx)
 	idleVolumes := a.idles[mode]
@@ -335,6 +348,9 @@ func (a *volumeAllocator) GetExpiredVolumes() (expiredVids []proto.Vid) {
 	return
 }
 
+/*
+trả về các active volumes đã được active bởi host
+*/
 func (a *volumeAllocator) LisAllocatedVolumesByHost(host string) (ret []*volume) {
 	a.actives.RLock()
 	volM, ok := a.actives.allocatorVols[host]

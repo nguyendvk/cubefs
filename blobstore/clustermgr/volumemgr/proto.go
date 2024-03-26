@@ -99,6 +99,12 @@ func (vol *volume) canInsert() bool {
 	return vol.volInfoBase.Status == proto.VolumeStatusIdle
 }
 
+/*
+true khi:
+- volume là idle;
+- free > val1
+- healthScore >= val2
+*/
 func (vol *volume) canAlloc(allocatableSize uint64, allocatableScoreThreshold int) bool {
 	if vol.canInsert() && vol.volInfoBase.Free > allocatableSize && vol.volInfoBase.HealthScore >= allocatableScoreThreshold {
 		return true
@@ -106,6 +112,13 @@ func (vol *volume) canAlloc(allocatableSize uint64, allocatableScoreThreshold in
 	return false
 }
 
+/*
+kiểm tra volume:
+- chưa bị freeze (free space đủ lớn)
+- healthscore > retain threshold
+- chưa expire
+- active
+*/
 func (vol *volume) canRetain(freezeThreshold uint64, retainThreshold int) bool {
 	if vol.volInfoBase.Free > freezeThreshold &&
 		vol.volInfoBase.HealthScore >= retainThreshold &&

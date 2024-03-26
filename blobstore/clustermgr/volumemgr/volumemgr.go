@@ -200,6 +200,11 @@ func (v *VolumeMgr) ListVolumeInfoV2(ctx context.Context, status proto.VolumeSta
 	return ret, nil
 }
 
+/*
+list các volume đã được allocated bởi host mà còn available:
+- gọi LisAllocatedVolumesByHost(): trả về các active volume đã được active bởi host
+- foreach volume: kiểm tra EC mode và volume.canRetain()
+*/
 func (v *VolumeMgr) ListAllocatedVolume(ctx context.Context, host string, mode codemode.CodeMode) (ret *cm.AllocatedVolumeInfos) {
 	span := trace.SpanFromContextSafe(ctx)
 	span.Debugf("head allocated volume,host is %s", host)
@@ -278,6 +283,15 @@ func (v *VolumeMgr) PreRetainVolume(ctx context.Context, tokens []string, host s
 	return &cm.RetainVolumes{RetainVolTokens: retainVolumes}, nil
 }
 
+/*
+alloc `count` volume của `mode`
+- gọi v.allocator.PreAlloc: chọn `count` idle volumes, ưu tiên disk load và health score
+- raftly update thông tin vào volumetbl với op OperTypeAllocVolume
+
+NOTE:
+- nếu PreAlloc ko trả về được volume nào hoặc gặp lỗi sau PreAlloc: không thể Alloc -> gửi request đến create volume channel
+- số lượng volume trả về có thể nhỏ hơn `count`
+*/
 func (v *VolumeMgr) AllocVolume(ctx context.Context, mode codemode.CodeMode, count int, host string) (ret *cm.AllocatedVolumeInfos, err error) {
 	if _, ok := v.codeMode[mode]; !ok {
 		return nil, ErrInvalidCodeMode
@@ -302,9 +316,10 @@ func (v *VolumeMgr) AllocVolume(ctx context.Context, mode codemode.CodeMode, cou
 				}
 				volume.lock.RUnlock()
 			}
-			// send create volume channel when alloc failed
+			// send create volume channel when alloc failed (errors or len(preAllocAvids))
 			select {
 			case v.createVolChan <- struct{}{}:
+				// handler at: blobstore/clustermgr/volumemgr/volumemgr.go: func (v *VolumeMgr) loop()
 				span.Debug("apply alloc volume finish, notify to if need create volume")
 			default:
 			}
@@ -556,6 +571,12 @@ func (v *VolumeMgr) applyRetainVolume(ctx context.Context, retainVolTokens []cm.
 	return nil
 }
 
+/*
+- kiểm tra các thông tin
+- set active status cho volume
+- update thông tin lên volume table
+- gửi request create volume vào channel createVolChan
+*/
 func (v *VolumeMgr) applyAllocVolume(ctx context.Context, vid proto.Vid, host string, expireTime int64) (ret cm.AllocVolumeInfo, err error) {
 	span := trace.SpanFromContextSafe(ctx)
 	span.Debugf("start apply alloc volume,vid is %d", vid)
@@ -717,6 +738,7 @@ func (v *VolumeMgr) loop() {
 
 	span, ctx := trace.StartSpanFromContext(context.Background(), "")
 
+	// firstly, create as much as posible volume
 	if v.raftServer.IsLeader() {
 		select {
 		case v.createVolChan <- struct{}{}:
@@ -758,6 +780,7 @@ func (v *VolumeMgr) loop() {
 				count := v.getModeUnitCount(modeConfig.mode)
 				minVolCount := int(float64(diskNums) * modeConfig.sizeRatio / float64(count))
 				if minVolCount < v.MinAllocableVolumeCount {
+					// bugable: minVolCount có thể vượt modeConfig.sizeRatio
 					minVolCount = v.MinAllocableVolumeCount
 				}
 
